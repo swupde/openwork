@@ -1082,6 +1082,7 @@ export const auth = betterAuth({
       provisionUserOnEveryLogin: true,
       domainVerification: {
         enabled: true,
+        tokenPrefix: "ow",
       },
       organizationProvisioning: {
         disabled: false,
