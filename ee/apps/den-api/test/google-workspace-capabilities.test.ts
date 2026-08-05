@@ -215,6 +215,10 @@ const fakeGoogleServer = Bun.serve({
       return json({ id: "draft_1", message: { id: "draft_msg_1", threadId: "thread_1" } })
     }
 
+    if (url.pathname === "/calendar/v3/users/me/calendarList/primary") {
+      return json({ timeZone: "Europe/Berlin" })
+    }
+
     if (url.pathname === "/calendar/v3/calendars/primary/events" && request.method === "GET") {
       return json({
         items: [
@@ -556,6 +560,32 @@ test("calendar list returns mapped events and sends the member token", async () 
       },
     ],
   })
+})
+
+test("calendar agenda resolves the calling member's calendar timezone and never accepts client timestamps", async () => {
+  const response = await request("/v1/capabilities/google-workspace/calendar-agenda?period=next_7_days&maxResults=5")
+
+  expect(response.status).toBe(200)
+  expect(lastAuthorization).toBe("Bearer gws-token")
+  expect(googleCallCount).toBe(2)
+
+  const timezoneUrl = new URL(expectString(googleCallUrls[0], "calendar timezone URL"))
+  expect(timezoneUrl.pathname).toBe("/calendar/v3/users/me/calendarList/primary")
+
+  const eventsUrl = new URL(expectString(googleCallUrls[1], "calendar agenda events URL"))
+  expect(eventsUrl.pathname).toBe("/calendar/v3/calendars/primary/events")
+  expect(eventsUrl.searchParams.get("timeMin")).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/)
+  expect(eventsUrl.searchParams.get("timeMax")).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/)
+  expect(eventsUrl.searchParams.get("singleEvents")).toBe("true")
+  expect(eventsUrl.searchParams.get("orderBy")).toBe("startTime")
+  expect(eventsUrl.searchParams.get("maxResults")).toBe("5")
+
+  const body: unknown = await response.json()
+  const responseBody = expectRecord(body, "calendar agenda response")
+  expect(responseBody.ok).toBe(true)
+  expect(responseBody.period).toBe("next_7_days")
+  expect(responseBody.timeZone).toBe("Europe/Berlin")
+  expect(Array.isArray(responseBody.events)).toBe(true)
 })
 
 test("calendar create requests a Google Meet link when asked", async () => {
@@ -1128,6 +1158,9 @@ test("Google Workspace capability tools are discoverable and keep readable names
   const calendarMatch = searchCapabilities(catalog, "calendar events list", 10)[0]
   expect(calendarMatch?.name).toBe("getCapabilitiesGoogleWorkspaceCalendarEvents")
   expect(calendarMatch?.queryParams).toEqual(["timeMin", "timeMax", "maxResults"])
+  const agendaMatch = searchCapabilities(catalog, "calendar agenda today next meeting", 10)[0]
+  expect(agendaMatch?.name).toBe("getCapabilitiesGoogleWorkspaceCalendarAgenda")
+  expect(agendaMatch?.queryParams).toEqual(["period", "maxResults"])
   expect(searchCapabilities(catalog, "add meet link existing event", 10)[0]?.name).toBe("patchCapabilitiesGoogleWorkspaceCalendarEvent")
   const driveMatch = searchCapabilities(catalog, "drive files", 10)[0]
   expect(driveMatch?.name).toBe("getCapabilitiesGoogleWorkspaceDriveFiles")
@@ -1149,6 +1182,7 @@ test("Google Workspace capability tools are discoverable and keep readable names
     "getCapabilitiesGoogleWorkspaceGmailMessage",
     "getCapabilitiesGoogleWorkspaceGmailAttachment",
     "getCapabilitiesGoogleWorkspaceCalendarEvents",
+    "getCapabilitiesGoogleWorkspaceCalendarAgenda",
     "postCapabilitiesGoogleWorkspaceCalendarEvents",
     "patchCapabilitiesGoogleWorkspaceCalendarEvent",
     "getCapabilitiesGoogleWorkspaceDriveFiles",
