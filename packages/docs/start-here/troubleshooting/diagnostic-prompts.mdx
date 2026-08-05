@@ -50,7 +50,7 @@ My expected cloud web URL: https://app.openworklabs.com (replace with your self-
 ## Phase 3 — Probe through your own MCP tools (in-band ground truth)
 
 6. Call search_capabilities with {"query":"google workspace","limit":10} and report the match names.
-7. Call execute_capability with {"name":"getCapabilitiesGoogleWorkspaceCalendarEvents"} and report the exact error or result shape.
+7. Call execute_capability with {"name":"getCapabilitiesGoogleWorkspaceCalendarAgenda","query":{"period":"today"}} and report the exact error or result shape.
 
 ## Phase 4 — Diagnose
 
@@ -72,7 +72,7 @@ State which world you are in:
 ## Phase 6 — Verify (run in the NEW session)
 
 11. search_capabilities {"query":"google workspace","limit":10} → PASS = the full current capability set (calendar, drive, and gmail capabilities ranked on top), not just drafts.
-12. execute_capability {"name":"getCapabilitiesGoogleWorkspaceCalendarEvents","query":{"timeMin":"<today ISO>","timeMax":"<+3 days ISO>"}} → PASS = real events, or a clean needs_connection / missing-permission message — NOT unknown_capability.
+12. execute_capability {"name":"getCapabilitiesGoogleWorkspaceCalendarAgenda","query":{"period":"today"}} → PASS = real events, or a clean needs_connection / missing-permission message — NOT unknown_capability. This capability resolves the current time and the member's primary-calendar timezone on the server; do not generate `timeMin`/`timeMax` for a relative agenda request.
 13. Print a final report: root cause, what changed, and the before/after of probes 6/7 vs 11/12.
 ````
 
