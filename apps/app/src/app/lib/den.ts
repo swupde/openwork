@@ -2,6 +2,16 @@ import {
   normalizeDesktopConfig,
   type DesktopConfig as SharedDesktopConfig,
 } from "@openwork/types/den/desktop-policies";
+import type {
+  AutomationDetail,
+  AutomationDesktopRunnerRegistration,
+  AutomationList,
+  AutomationRun,
+  AutomationRunReceipt,
+  AutomationRunnerTokenResponse,
+  CreateAutomation,
+  UpdateAutomation,
+} from "@openwork/types/automations";
 
 // Re-export the shared schema under the local alias so React consumers
 // (e.g. the cloud domain's desktop-config provider) can import it alongside
@@ -37,12 +47,19 @@ import type {
   OpenWorkExtensionSourceFormat,
 } from "../extensions";
 
+declare global {
+  interface Window {
+    __openworkOrgDropWarnings?: string[];
+  }
+}
+
 export const STORAGE_BASE_URL = "openwork.den.baseUrl";
 const LEGACY_STORAGE_API_BASE_URL = "openwork.den.apiBaseUrl";
 const STORAGE_AUTH_TOKEN = "openwork.den.authToken";
 const STORAGE_ACTIVE_ORG_ID = "openwork.den.activeOrgId";
 const STORAGE_ACTIVE_ORG_SLUG = "openwork.den.activeOrgSlug";
 const STORAGE_ACTIVE_ORG_NAME = "openwork.den.activeOrgName";
+const DESKTOP_CONFIG_CACHE_PREFIX = "openwork.den.desktopConfig:";
 export const CLOUD_MCP_SYNC_MARKER_STORAGE_KEY = "openwork.den.mcp.sync";
 const ORG_PROXY_HEADER = "x-openwork-legacy-org-id";
 const DEFAULT_DEN_TIMEOUT_MS = 12_000;
@@ -293,6 +310,8 @@ export type DenExternalMcpConnection = {
   externalAccountId?: string | null;
   grantedScopes?: string[];
   tenantId?: string | null;
+  /** Which service a native connector fronts (e.g. "google-workspace"); null/absent for external MCP connections. */
+  nativeProviderKey?: string | null;
 };
 
 export type DenMcpConnectionConnectStart = {
@@ -364,9 +383,17 @@ type DenAuthResult = {
   token: string | null;
 };
 
+export type DenDesktopHandoffExchangeOrganization = {
+  id: string;
+  slug: string | null;
+  name: string | null;
+};
+
 export type DenDesktopHandoffExchange = {
   user: DenUser | null;
   token: string | null;
+  organization: DenDesktopHandoffExchangeOrganization | null;
+  connectEnabled: boolean | null;
 };
 
 const defaultBootstrapBaseUrls = resolveDenBaseUrls({
@@ -948,6 +975,54 @@ export function readDenSettings(): DenSettings {
   };
 }
 
+export function getDenDesktopConfigCacheKey(): string {
+  const settings = readDenSettings();
+  const baseUrl = settings.baseUrl.trim();
+  const activeOrgId = settings.activeOrgId?.trim() ?? "";
+  if (!baseUrl) return "";
+  return `${DESKTOP_CONFIG_CACHE_PREFIX}${baseUrl}::${activeOrgId}`;
+}
+
+export function readCachedDenDesktopConfig(key: string): DenDesktopConfig | null {
+  if (typeof window === "undefined" || !key) return null;
+
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (!raw) return null;
+    return normalizeDenDesktopConfig(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+export function writeCachedDenDesktopConfig(key: string, config: DenDesktopConfig) {
+  if (typeof window === "undefined" || !key) return;
+  try {
+    window.localStorage.setItem(
+      key,
+      JSON.stringify(normalizeDenDesktopConfig(config)),
+    );
+  } catch {
+    // Quota / private-browsing failures are non-fatal — we just miss the cache next boot.
+  }
+}
+
+export function seedDenDesktopConfigConnectPolicy(input: {
+  organizationId: string;
+  connectEnabled: boolean | null;
+}): boolean {
+  if (input.connectEnabled === null) return false;
+
+  const organizationId = input.organizationId.trim();
+  const activeOrgId = readDenSettings().activeOrgId?.trim() ?? "";
+  if (!organizationId || activeOrgId !== organizationId) return false;
+
+  const key = getDenDesktopConfigCacheKey();
+  const cached = readCachedDenDesktopConfig(key) ?? {};
+  writeCachedDenDesktopConfig(key, { ...cached, connectEnabled: input.connectEnabled });
+  return true;
+}
+
 function mergePassiveDenField(
   current: string | null | undefined,
   next: string | null | undefined,
@@ -976,7 +1051,34 @@ export function mergePassiveDenSettings(current: DenSettings, next: DenSettings)
   };
 }
 
-export function writeDenSettings(next: DenSettings, options?: { persistBootstrap?: boolean }) {
+function warnOnUnexpectedActiveOrgDrop(input: {
+  previousActiveOrgId: string | null | undefined;
+  nextActiveOrgId: string | null | undefined;
+  intentionalActiveOrgClear?: boolean;
+}) {
+  if (!import.meta.env.DEV || typeof window === "undefined" || input.intentionalActiveOrgClear) {
+    return;
+  }
+
+  const previousActiveOrgId = input.previousActiveOrgId?.trim() ?? "";
+  const nextActiveOrgId = input.nextActiveOrgId?.trim() ?? "";
+  if (!previousActiveOrgId || nextActiveOrgId) return;
+
+  const message = `[den-settings] activeOrgId dropped unexpectedly from ${previousActiveOrgId}`;
+  const stack = new Error(message).stack ?? message;
+  try {
+    window.__openworkOrgDropWarnings ??= [];
+    window.__openworkOrgDropWarnings.push(stack);
+    console.warn(stack);
+  } catch {
+    // Diagnostics must never block the settings write they observe.
+  }
+}
+
+export function writeDenSettings(
+  next: DenSettings,
+  options?: { persistBootstrap?: boolean; intentionalActiveOrgClear?: boolean },
+) {
   if (typeof window === "undefined") {
     return;
   }
@@ -1001,6 +1103,12 @@ export function writeDenSettings(next: DenSettings, options?: { persistBootstrap
   ) {
     return;
   }
+
+  warnOnUnexpectedActiveOrgDrop({
+    previousActiveOrgId: previous.activeOrgId,
+    nextActiveOrgId: activeOrgId,
+    intentionalActiveOrgClear: options?.intentionalActiveOrgClear,
+  });
 
   if (isDesktopRuntime()) {
     window.localStorage.removeItem(STORAGE_BASE_URL);
@@ -1061,6 +1169,14 @@ export function clearDenSession(options?: { includeBaseUrls?: boolean }) {
     return;
   }
 
+  if (import.meta.env.DEV) {
+    warnOnUnexpectedActiveOrgDrop({
+      previousActiveOrgId: readDenSettings().activeOrgId,
+      nextActiveOrgId: null,
+      intentionalActiveOrgClear: true,
+    });
+  }
+
   if (options?.includeBaseUrls) {
     window.localStorage.removeItem(STORAGE_BASE_URL);
     window.localStorage.removeItem(LEGACY_STORAGE_API_BASE_URL);
@@ -1101,12 +1217,6 @@ export async function ensureDenActiveOrganization(options?: { forceServerSync?: 
     null;
 
   if (!targetOrg) {
-    writeDenSettings({
-      ...settings,
-      activeOrgId: null,
-      activeOrgSlug: null,
-      activeOrgName: null,
-    }, { persistBootstrap: false });
     return null;
   }
 
@@ -1169,6 +1279,31 @@ function getToken(payload: unknown): string | null {
     return null;
   }
   return payload.token.trim() || null;
+}
+
+function getExchangeOrganization(payload: unknown): DenDesktopHandoffExchangeOrganization | null {
+  if (!isRecord(payload) || !isRecord(payload.organization)) {
+    return null;
+  }
+
+  const organization = payload.organization;
+  const id = typeof organization.id === "string" ? organization.id.trim() : "";
+  if (!id) {
+    return null;
+  }
+
+  return {
+    id,
+    slug: typeof organization.slug === "string" && organization.slug.trim() ? organization.slug.trim() : null,
+    name: typeof organization.name === "string" && organization.name.trim() ? organization.name.trim() : null,
+  };
+}
+
+function getExchangeConnectEnabled(payload: unknown): boolean | null {
+  if (!isRecord(payload) || typeof payload.connectEnabled !== "boolean") {
+    return null;
+  }
+  return payload.connectEnabled;
 }
 
 function getOrgList(payload: unknown): DenOrgSummary[] {
@@ -1430,6 +1565,7 @@ function parseDenExternalMcpConnection(value: unknown): DenExternalMcpConnection
     ...(typeof value.externalAccountId === "string" || value.externalAccountId === null ? { externalAccountId: value.externalAccountId } : {}),
     ...(Array.isArray(value.grantedScopes) ? { grantedScopes: readStringArray(value.grantedScopes) } : {}),
     ...(typeof value.tenantId === "string" || value.tenantId === null ? { tenantId: value.tenantId } : {}),
+    ...(typeof value.nativeProviderKey === "string" || value.nativeProviderKey === null ? { nativeProviderKey: value.nativeProviderKey } : {}),
   };
 }
 
@@ -1920,7 +2056,7 @@ function getAssignedMarketplaceCapabilities(payload: unknown): DenAssignedMarket
     if (
       !isRecord(item)
       || typeof item.configObjectId !== "string"
-      || typeof item.marketplaceId !== "string"
+      || (item.marketplaceId !== null && typeof item.marketplaceId !== "string")
       || typeof item.objectType !== "string"
       || typeof item.pluginId !== "string"
     ) {
@@ -2246,7 +2382,12 @@ export function createDenClient(options: { baseUrl: string; token?: string | nul
         method: "POST",
         body: { grant },
       });
-      return { user: getUser(payload), token: getToken(payload) };
+      return {
+        user: getUser(payload),
+        token: getToken(payload),
+        organization: getExchangeOrganization(payload),
+        connectEnabled: getExchangeConnectEnabled(payload),
+      };
     },
 
     async listOrgs(): Promise<{ orgs: DenOrgSummary[]; activeOrgId: string | null; activeOrgSlug: string | null; defaultOrgId: string | null }> {
@@ -2366,6 +2507,125 @@ export function createDenClient(options: { baseUrl: string; token?: string | nul
         organizationId: orgId,
       });
       return getDenOrgLlmProviders(payload);
+    },
+
+    async listAutomations(
+      orgId: string,
+      options: { cursor?: string; limit?: number } = {},
+    ): Promise<AutomationList> {
+      const params = new URLSearchParams();
+      if (options.cursor) params.set("cursor", options.cursor);
+      if (options.limit) params.set("limit", String(options.limit));
+      const query = params.size > 0 ? `?${params.toString()}` : "";
+      return requestJson<AutomationList>(baseUrls, `/v1/automations${query}`, {
+        method: "GET",
+        token,
+        organizationId: orgId,
+      });
+    },
+
+    async mintAutomationRunnerToken(orgId: string, registration: AutomationDesktopRunnerRegistration): Promise<AutomationRunnerTokenResponse> {
+      return requestJson<AutomationRunnerTokenResponse>(baseUrls, "/v1/automation-runners/token", {
+        method: "POST",
+        token,
+        organizationId: orgId,
+        body: registration,
+      });
+    },
+
+    async createAutomation(orgId: string, input: CreateAutomation): Promise<AutomationDetail> {
+      return requestJson<AutomationDetail>(baseUrls, "/v1/automations", {
+        method: "POST",
+        token,
+        organizationId: orgId,
+        body: input,
+      });
+    },
+
+    async getAutomation(orgId: string, automationId: string): Promise<AutomationDetail> {
+      return requestJson<AutomationDetail>(
+        baseUrls,
+        `/v1/automations/${encodeURIComponent(automationId)}`,
+        { method: "GET", token, organizationId: orgId },
+      );
+    },
+
+    async updateAutomation(
+      orgId: string,
+      automationId: string,
+      input: UpdateAutomation,
+    ): Promise<AutomationDetail> {
+      return requestJson<AutomationDetail>(
+        baseUrls,
+        `/v1/automations/${encodeURIComponent(automationId)}`,
+        { method: "PATCH", token, organizationId: orgId, body: input },
+      );
+    },
+
+    async activateAutomation(orgId: string, automationId: string): Promise<AutomationDetail> {
+      return requestJson<AutomationDetail>(
+        baseUrls,
+        `/v1/automations/${encodeURIComponent(automationId)}/activate`,
+        { method: "POST", token, organizationId: orgId, body: {} },
+      );
+    },
+
+    async deactivateAutomation(orgId: string, automationId: string): Promise<AutomationDetail> {
+      return requestJson<AutomationDetail>(
+        baseUrls,
+        `/v1/automations/${encodeURIComponent(automationId)}/deactivate`,
+        { method: "POST", token, organizationId: orgId, body: {} },
+      );
+    },
+
+    async archiveAutomation(orgId: string, automationId: string): Promise<AutomationDetail> {
+      return requestJson<AutomationDetail>(
+        baseUrls,
+        `/v1/automations/${encodeURIComponent(automationId)}`,
+        { method: "DELETE", token, organizationId: orgId },
+      );
+    },
+
+    async runAutomationNow(orgId: string, automationId: string): Promise<AutomationRun> {
+      const payload = await requestJson<{ run: AutomationRun }>(
+        baseUrls,
+        `/v1/automations/${encodeURIComponent(automationId)}/run`,
+        { method: "POST", token, organizationId: orgId, body: {} },
+      );
+      return payload.run;
+    },
+
+    async listAutomationRuns(
+      orgId: string,
+      automationId: string,
+      options: { cursor?: string; limit?: number } = {},
+    ): Promise<{ items: AutomationRun[]; nextCursor: string | null }> {
+      const params = new URLSearchParams();
+      if (options.cursor) params.set("cursor", options.cursor);
+      if (options.limit) params.set("limit", String(options.limit));
+      const query = params.size > 0 ? `?${params.toString()}` : "";
+      return requestJson<{ items: AutomationRun[]; nextCursor: string | null }>(
+        baseUrls,
+        `/v1/automations/${encodeURIComponent(automationId)}/runs${query}`,
+        { method: "GET", token, organizationId: orgId },
+      );
+    },
+
+    async getAutomationRun(orgId: string, runId: string): Promise<AutomationRunReceipt> {
+      return requestJson<AutomationRunReceipt>(
+        baseUrls,
+        `/v1/automation-runs/${encodeURIComponent(runId)}`,
+        { method: "GET", token, organizationId: orgId },
+      );
+    },
+
+    async cancelAutomationRun(orgId: string, runId: string): Promise<AutomationRun> {
+      const payload = await requestJson<{ run: AutomationRun }>(
+        baseUrls,
+        `/v1/automation-runs/${encodeURIComponent(runId)}/cancel`,
+        { method: "POST", token, organizationId: orgId, body: {} },
+      );
+      return payload.run;
     },
 
     async getOrgLlmProviderConnection(orgId: string, llmProviderId: string): Promise<DenOrgLlmProviderConnection> {

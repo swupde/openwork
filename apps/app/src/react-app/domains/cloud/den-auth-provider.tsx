@@ -21,6 +21,7 @@ import {
   resolveDenBaseUrls,
   setDenBootstrapConfig,
   type DenBootstrapConfig,
+  type DenOrgSummary,
   type DenUser,
 } from "../../../app/lib/den";
 import { exchangeHandoffAndSignIn } from "../../../app/lib/den-handoff";
@@ -54,6 +55,27 @@ export type DenAuthStatus =
 
 export const DEN_AUTH_SIGNAL_RETRY_COOLDOWN_MS = 5_000;
 export const DEN_AUTH_UNAVAILABLE_RETRY_INTERVAL_MS = 30_000;
+export const DEN_AUTH_ORG_REPAIR_INTERVAL_MS = 30_000;
+const DEN_ORG_RESOLUTION_RETRY_DELAYS_MS = [0, 200, 600];
+
+export async function resolveDenActiveOrganizationWithRetry(
+  resolve: () => Promise<DenOrgSummary | null>,
+  wait: (delayMs: number) => Promise<void> = (delayMs) =>
+    new Promise((resolveWait) => window.setTimeout(resolveWait, delayMs)),
+) {
+  for (const delayMs of DEN_ORG_RESOLUTION_RETRY_DELAYS_MS) {
+    if (delayMs > 0) await wait(delayMs);
+
+    try {
+      const organization = await resolve();
+      if (organization) return organization;
+    } catch {
+      // A newly accepted membership can take a moment to become visible.
+    }
+  }
+
+  return null;
+}
 
 export function resolveDenAuthFailureStatus(
   error: unknown,
@@ -191,10 +213,12 @@ export function DenAuthProvider({ children }: DenAuthProviderProps) {
 
       if (currentRun !== refreshTokenRef.current) return;
 
-      await ensureDenActiveOrganization({
-        forceServerSync:
-          !settings.activeOrgId?.trim() || !settings.activeOrgSlug?.trim(),
-      }).catch(() => null);
+      await resolveDenActiveOrganizationWithRetry(() =>
+        ensureDenActiveOrganization({
+          forceServerSync:
+            !settings.activeOrgId?.trim() || !settings.activeOrgSlug?.trim(),
+        })
+      );
 
       if (currentRun !== refreshTokenRef.current) return;
 
@@ -266,10 +290,26 @@ export function DenAuthProvider({ children }: DenAuthProviderProps) {
       retryUnavailableSession,
       DEN_AUTH_UNAVAILABLE_RETRY_INTERVAL_MS,
     );
+    // A signed-in session without an organization is a stranded first
+    // sign-in (e.g. org discovery was rate limited during a handoff). Keep
+    // repairing in the background until an organization resolves.
+    const repairMissingOrganization = () => {
+      if (statusRef.current !== "signed_in") return;
+      const settings = readDenSettings();
+      if (!settings.authToken?.trim() || settings.activeOrgId?.trim()) return;
+      void resolveDenActiveOrganizationWithRetry(() =>
+        ensureDenActiveOrganization({ forceServerSync: true })
+      );
+    };
+    const orgRepairInterval = window.setInterval(
+      repairMissingOrganization,
+      DEN_AUTH_ORG_REPAIR_INTERVAL_MS,
+    );
     return () => {
       window.removeEventListener("online", retryUnavailableSession);
       window.removeEventListener("focus", retryUnavailableSession);
       window.clearInterval(retryInterval);
+      window.clearInterval(orgRepairInterval);
     };
   }, [refresh]);
 

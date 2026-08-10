@@ -1,6 +1,6 @@
 {
   "name": "openwork-server",
-  "version": "0.18.12",
+  "version": "0.18.16",
   "description": "Filesystem-backed API for OpenWork remote clients",
   "type": "module",
   "bin": {
@@ -48,11 +48,11 @@
   },
   "dependencies": {
     "@opencode-ai/sdk": "^1.17.11",
-    "better-sqlite3": "^11.10.0",
-    "drizzle-orm": "^0.45.1",
+    "better-sqlite3": "^13.0.2",
+    "drizzle-orm": "^0.45.2",
     "jsonc-parser": "^3.2.1",
-    "minimatch": "^10.0.1",
-    "yaml": "^2.6.1",
+    "minimatch": "^10.2.5",
+    "yaml": "^2.9.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {

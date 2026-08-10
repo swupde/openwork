@@ -9,6 +9,7 @@ import {
   OrganizationRoleTable,
   OrganizationTable,
   SsoConnectionTable,
+  SsoProviderTable,
   TeamMemberTable,
   TeamTable,
 } from "@openwork-ee/den-db/schema"
@@ -40,8 +41,9 @@ import {
   type OrganizationPermissionRecord,
 } from "./organization-access.js"
 import { ensureDefaultDesktopPolicyForOrganization } from "./desktop-policies.js"
-import { isProtectedOrganizationRoleName } from "./organization-role-hierarchy.js"
+import { isProtectedOrganizationRoleName, shouldRevokeSessionsForRoleChange } from "./organization-role-hierarchy.js"
 import { isSingleOrgOwnerEmailEligible, resolveSingleOrgMembershipRole } from "./single-org-policy.js"
+import { isOrganizationSsoReady } from "./sso-readiness.js"
 
 type UserId = typeof AuthUserTable.$inferSelect.id
 type SessionId = typeof AuthSessionTable.$inferSelect.id
@@ -1071,14 +1073,27 @@ export async function getSingletonSsoStatus() {
   }
 
   const rows = await db
-    .select({ signInPath: SsoConnectionTable.signInPath })
+    .select({
+      signInPath: SsoConnectionTable.signInPath,
+      status: SsoConnectionTable.status,
+      domainVerified: SsoProviderTable.domainVerified,
+    })
     .from(SsoConnectionTable)
+    .innerJoin(SsoProviderTable, and(
+      eq(SsoConnectionTable.providerId, SsoProviderTable.providerId),
+      eq(SsoConnectionTable.organizationId, SsoProviderTable.organizationId),
+    ))
     .where(eq(SsoConnectionTable.organizationId, organization.id))
     .limit(1)
-  const signInPath = rows[0]?.signInPath || fallbackSignInPath
+  const connection = rows[0]
+  const configured = isOrganizationSsoReady({
+    connection: connection ? { status: connection.status } : null,
+    provider: connection ? { domainVerified: connection.domainVerified } : null,
+  })
+  const signInPath = connection?.signInPath || fallbackSignInPath
 
   return {
-    configured: Boolean(rows[0]),
+    configured,
     organizationSlug,
     signInPath,
   }
@@ -1774,10 +1789,14 @@ export async function updateOrganizationMemberRole(input: {
       orgMembershipId: updated.member.id,
       userId: updated.member.userId,
     })
-    await revokeMembershipSessionCredentials({
-      organizationId: input.organizationId,
-      userId: updated.member.userId,
-    })
+    // Revocation prevents a live session from retaining access it just lost.
+    // An upgrade removes no access, so there is nothing to revoke.
+    if (shouldRevokeSessionsForRoleChange(updated.previousRole, updated.nextRole)) {
+      await revokeMembershipSessionCredentials({
+        organizationId: input.organizationId,
+        userId: updated.member.userId,
+      })
+    }
   }
 
   return updated

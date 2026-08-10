@@ -1,5 +1,6 @@
-import { and, asc, count, desc, eq, inArray, isNull } from "@openwork-ee/den-db/drizzle"
+import { and, asc, count, desc, eq, inArray, isNull, or } from "@openwork-ee/den-db/drizzle"
 import {
+  AuthUserTable,
   ConfigObjectAccessGrantTable,
   ConfigObjectTable,
   ConfigObjectVersionTable,
@@ -27,7 +28,7 @@ import {
 import { createDenTypeId, normalizeDenTypeId } from "@openwork-ee/utils/typeid"
 import { hasSkillFrontmatterName, parseSkillMarkdown } from "@openwork-ee/utils"
 import type { PluginArchActorContext, PluginArchResourceKind, PluginArchRole } from "./access.js"
-import { requirePluginArchResourceRole, resolvePluginArchResourceRole } from "./access.js"
+import { isPluginArchOrgAdmin, PluginArchAuthorizationError, requirePluginArchResourceRole, resolvePluginArchGrantRole, resolvePluginArchResourceRole } from "./access.js"
 import {
   buildGithubAppInstallUrl,
   createGithubInstallStateToken,
@@ -100,6 +101,7 @@ import {
   resolveGithubPluginMcpImportAuthType,
   type PluginMcpAuthType,
 } from "../../../capability-sources/external-mcp-auth-policy.js"
+import type { MemberUsableConnectionFacts } from "../mcp-connections.js"
 
 type OrganizationId = PluginArchActorContext["organizationContext"]["organization"]["id"]
 const logger = appLogger.child({ component: "plugin_system_store" })
@@ -938,6 +940,7 @@ function serializePlugin(row: PluginRow, memberCount?: number, marketplaces: Plu
     memberCount,
     name: row.name,
     organizationId: row.organizationId,
+    sourceRepositoryUrl: row.sourceRepositoryUrl,
     status: row.status,
     updatedAt: row.updatedAt.toISOString(),
   }
@@ -1075,6 +1078,7 @@ function serializeConnectorMapping(row: ConnectorMappingRow) {
 
 function serializeConnectorSyncEvent(row: ConnectorSyncEventRow) {
   return {
+    attemptCount: row.attemptCount,
     completedAt: row.completedAt ? row.completedAt.toISOString() : null,
     connectorInstanceId: row.connectorInstanceId,
     connectorTargetId: row.connectorTargetId,
@@ -1082,6 +1086,7 @@ function serializeConnectorSyncEvent(row: ConnectorSyncEventRow) {
     eventType: row.eventType,
     externalEventRef: row.externalEventRef,
     id: row.id,
+    nextAttemptAt: row.nextAttemptAt ? row.nextAttemptAt.toISOString() : null,
     remoteId: row.remoteId,
     sourceRevisionRef: row.sourceRevisionRef,
     startedAt: row.startedAt.toISOString(),
@@ -1876,9 +1881,582 @@ export async function listResourceAccess(input: { context: PluginArchActorContex
   return { items: rows.map((row) => serializeAccessGrant(row)), nextCursor: null }
 }
 
+type TeamPluginAccessEdge = "direct_team" | "via_catalog" | "org_wide"
+
+type TeamPluginAccessCandidate = {
+  createdAt: Date
+  createdByOrgMembershipId: MemberId
+  edge: TeamPluginAccessEdge
+  grantId: PluginAccessGrantId | null
+  marketplace: { id: MarketplaceId; name: string } | null
+  pluginId: PluginId
+  pluginName: string
+  role: PluginArchRole
+}
+
+const teamPluginAccessEdgeOrder: Record<TeamPluginAccessEdge, number> = {
+  direct_team: 1,
+  via_catalog: 2,
+  org_wide: 3,
+}
+
+const pluginAccessRolePriority: Record<PluginArchRole, number> = {
+  viewer: 1,
+  editor: 2,
+  manager: 3,
+}
+
+export async function listTeamEffectivePluginAccess(input: { context: PluginArchActorContext; teamId: TeamId }) {
+  const organizationId = input.context.organizationContext.organization.id
+  const teams = await db
+    .select({ id: TeamTable.id })
+    .from(TeamTable)
+    .where(and(eq(TeamTable.id, input.teamId), eq(TeamTable.organizationId, organizationId)))
+    .limit(1)
+
+  if (!teams[0]) {
+    throw new PluginArchRouteFailure(404, "team_not_found", "Team not found.")
+  }
+  if (!isPluginArchOrgAdmin(input.context) && !input.context.memberTeams.some((team) => team.id === input.teamId)) {
+    throw new PluginArchAuthorizationError(403, "forbidden", "Only organization admins and team members can view this team's plugin access.")
+  }
+
+  const [directRows, marketplaceRows, orgWideRows] = await Promise.all([
+    db
+      .select({
+        createdAt: PluginAccessGrantTable.createdAt,
+        createdByOrgMembershipId: PluginAccessGrantTable.createdByOrgMembershipId,
+        grantId: PluginAccessGrantTable.id,
+        pluginId: PluginTable.id,
+        pluginName: PluginTable.name,
+        role: PluginAccessGrantTable.role,
+      })
+      .from(PluginAccessGrantTable)
+      .innerJoin(PluginTable, eq(PluginAccessGrantTable.pluginId, PluginTable.id))
+      .where(and(
+        eq(PluginAccessGrantTable.organizationId, organizationId),
+        eq(PluginAccessGrantTable.teamId, input.teamId),
+        isNull(PluginAccessGrantTable.removedAt),
+        eq(PluginTable.organizationId, organizationId),
+        eq(PluginTable.status, "active"),
+        isNull(PluginTable.deletedAt),
+      ))
+      .orderBy(asc(PluginAccessGrantTable.createdAt), asc(PluginAccessGrantTable.id)),
+    db
+      .select({
+        createdAt: MarketplaceAccessGrantTable.createdAt,
+        createdByOrgMembershipId: MarketplaceAccessGrantTable.createdByOrgMembershipId,
+        marketplaceId: MarketplaceTable.id,
+        marketplaceName: MarketplaceTable.name,
+        pluginId: PluginTable.id,
+        pluginName: PluginTable.name,
+        role: MarketplaceAccessGrantTable.role,
+      })
+      .from(MarketplaceAccessGrantTable)
+      .innerJoin(MarketplaceTable, eq(MarketplaceAccessGrantTable.marketplaceId, MarketplaceTable.id))
+      .innerJoin(MarketplacePluginTable, eq(MarketplacePluginTable.marketplaceId, MarketplaceTable.id))
+      .innerJoin(PluginTable, eq(MarketplacePluginTable.pluginId, PluginTable.id))
+      .where(and(
+        eq(MarketplaceAccessGrantTable.organizationId, organizationId),
+        eq(MarketplaceAccessGrantTable.teamId, input.teamId),
+        isNull(MarketplaceAccessGrantTable.removedAt),
+        eq(MarketplaceTable.organizationId, organizationId),
+        eq(MarketplaceTable.status, "active"),
+        isNull(MarketplaceTable.deletedAt),
+        eq(MarketplacePluginTable.organizationId, organizationId),
+        isNull(MarketplacePluginTable.removedAt),
+        eq(PluginTable.organizationId, organizationId),
+        eq(PluginTable.status, "active"),
+        isNull(PluginTable.deletedAt),
+      ))
+      .orderBy(asc(MarketplaceAccessGrantTable.createdAt), asc(MarketplaceAccessGrantTable.id), asc(MarketplaceTable.name)),
+    db
+      .select({
+        createdAt: PluginAccessGrantTable.createdAt,
+        createdByOrgMembershipId: PluginAccessGrantTable.createdByOrgMembershipId,
+        pluginId: PluginTable.id,
+        pluginName: PluginTable.name,
+        role: PluginAccessGrantTable.role,
+      })
+      .from(PluginAccessGrantTable)
+      .innerJoin(PluginTable, eq(PluginAccessGrantTable.pluginId, PluginTable.id))
+      .where(and(
+        eq(PluginAccessGrantTable.organizationId, organizationId),
+        eq(PluginAccessGrantTable.orgWide, true),
+        isNull(PluginAccessGrantTable.removedAt),
+        eq(PluginTable.organizationId, organizationId),
+        eq(PluginTable.status, "active"),
+        isNull(PluginTable.deletedAt),
+      ))
+      .orderBy(asc(PluginAccessGrantTable.createdAt), asc(PluginAccessGrantTable.id)),
+  ])
+
+  const candidates: TeamPluginAccessCandidate[] = []
+  for (const row of directRows) {
+    candidates.push({
+      ...row,
+      edge: "direct_team",
+      marketplace: null,
+    })
+  }
+  for (const row of marketplaceRows) {
+    candidates.push({
+      createdAt: row.createdAt,
+      createdByOrgMembershipId: row.createdByOrgMembershipId,
+      edge: "via_catalog",
+      grantId: null,
+      marketplace: { id: row.marketplaceId, name: row.marketplaceName },
+      pluginId: row.pluginId,
+      pluginName: row.pluginName,
+      role: row.role,
+    })
+  }
+  for (const row of orgWideRows) {
+    candidates.push({
+      ...row,
+      edge: "org_wide",
+      grantId: null,
+      marketplace: null,
+    })
+  }
+
+  const effectiveByPluginEdge = new Map<string, TeamPluginAccessCandidate>()
+  for (const candidate of candidates) {
+    const key = `${candidate.pluginId}:${candidate.edge}`
+    const current = effectiveByPluginEdge.get(key)
+    if (!current || pluginAccessRolePriority[candidate.role] > pluginAccessRolePriority[current.role]) {
+      effectiveByPluginEdge.set(key, candidate)
+    }
+  }
+
+  const effective = [...effectiveByPluginEdge.values()]
+  const pluginIds = uniqueIds(effective.map((candidate) => candidate.pluginId))
+  const creatorIds = uniqueIds(effective.map((candidate) => candidate.createdByOrgMembershipId))
+  const componentCountRows = pluginIds.length === 0
+    ? []
+    : await db
+      .select({ pluginId: PluginConfigObjectTable.pluginId, componentCount: count() })
+      .from(PluginConfigObjectTable)
+      .where(and(
+        eq(PluginConfigObjectTable.organizationId, organizationId),
+        inArray(PluginConfigObjectTable.pluginId, pluginIds),
+        isNull(PluginConfigObjectTable.removedAt),
+      ))
+      .groupBy(PluginConfigObjectTable.pluginId)
+  const creatorRows = creatorIds.length === 0
+    ? []
+    : await db
+      .select({ orgMembershipId: MemberTable.id, name: AuthUserTable.name })
+      .from(MemberTable)
+      .leftJoin(AuthUserTable, eq(MemberTable.userId, AuthUserTable.id))
+      .where(and(eq(MemberTable.organizationId, organizationId), inArray(MemberTable.id, creatorIds)))
+
+  const componentCounts = new Map(componentCountRows.map((row) => [row.pluginId, row.componentCount]))
+  const creatorNames = new Map(creatorRows.flatMap((row) => row.name === null ? [] : [[row.orgMembershipId, row.name]]))
+
+  effective.sort((left, right) => {
+    const byName = left.pluginName.localeCompare(right.pluginName)
+    if (byName !== 0) return byName
+    const byEdge = teamPluginAccessEdgeOrder[left.edge] - teamPluginAccessEdgeOrder[right.edge]
+    if (byEdge !== 0) return byEdge
+    return left.pluginId.localeCompare(right.pluginId)
+  })
+
+  return {
+    items: effective.map((candidate) => {
+      const creatorName = creatorNames.get(candidate.createdByOrgMembershipId)
+      return {
+        plugin: {
+          id: candidate.pluginId,
+          name: candidate.pluginName,
+          componentCount: componentCounts.get(candidate.pluginId) ?? 0,
+        },
+        edge: candidate.edge,
+        marketplace: candidate.marketplace,
+        role: candidate.role,
+        grantedBy: creatorName
+          ? { orgMembershipId: candidate.createdByOrgMembershipId, name: creatorName }
+          : null,
+        grantedAt: candidate.createdAt.toISOString(),
+        grantId: candidate.grantId,
+      }
+    }),
+  }
+}
+
+type MePluginAccessEdge =
+  | { kind: "mine" }
+  | { kind: "person"; sharedBy: { orgMembershipId: MemberId; name: string } | null; grantedAt: string }
+  | { kind: "team"; team: { id: TeamId; name: string } }
+  | { kind: "org_wide" }
+  | { kind: "catalog"; marketplace: { id: MarketplaceId; name: string } }
+
+type MePluginAccessCandidate = {
+  edge: MePluginAccessEdge
+  edgeKey: string
+  role: PluginArchRole
+}
+
+const mePluginAccessEdgeOrder: Record<MePluginAccessEdge["kind"], number> = {
+  mine: 1,
+  person: 2,
+  team: 3,
+  org_wide: 4,
+  catalog: 5,
+}
+
+async function listMeEffectivePluginAccessWithComponentKinds(input: { context: PluginArchActorContext }) {
+  const organizationId = input.context.organizationContext.organization.id
+  const memberId = input.context.organizationContext.currentMember.id
+  const teamIds = input.context.memberTeams.map((team) => team.id)
+  const activePlugins = await db
+    .select()
+    .from(PluginTable)
+    .where(and(
+      eq(PluginTable.organizationId, organizationId),
+      eq(PluginTable.status, "active"),
+      isNull(PluginTable.deletedAt),
+    ))
+
+  if (activePlugins.length === 0) return { items: [] }
+
+  const pluginIds = activePlugins.map((plugin) => plugin.id)
+  const applicablePluginGrant = teamIds.length > 0
+    ? or(
+        eq(PluginAccessGrantTable.orgWide, true),
+        eq(PluginAccessGrantTable.orgMembershipId, memberId),
+        inArray(PluginAccessGrantTable.teamId, teamIds),
+      )
+    : or(
+        eq(PluginAccessGrantTable.orgWide, true),
+        eq(PluginAccessGrantTable.orgMembershipId, memberId),
+      )
+  const applicableMarketplaceGrant = teamIds.length > 0
+    ? or(
+        eq(MarketplaceAccessGrantTable.orgWide, true),
+        eq(MarketplaceAccessGrantTable.orgMembershipId, memberId),
+        inArray(MarketplaceAccessGrantTable.teamId, teamIds),
+      )
+    : or(
+        eq(MarketplaceAccessGrantTable.orgWide, true),
+        eq(MarketplaceAccessGrantTable.orgMembershipId, memberId),
+      )
+
+  const [pluginGrants, marketplaceMemberships, marketplaceGrants, componentRows] = await Promise.all([
+    db
+      .select()
+      .from(PluginAccessGrantTable)
+      .where(and(
+        eq(PluginAccessGrantTable.organizationId, organizationId),
+        inArray(PluginAccessGrantTable.pluginId, pluginIds),
+        isNull(PluginAccessGrantTable.removedAt),
+        applicablePluginGrant,
+      ))
+      .orderBy(asc(PluginAccessGrantTable.createdAt), asc(PluginAccessGrantTable.id)),
+    db
+      .select({
+        marketplaceId: MarketplaceTable.id,
+        marketplaceName: MarketplaceTable.name,
+        pluginId: MarketplacePluginTable.pluginId,
+      })
+      .from(MarketplacePluginTable)
+      .innerJoin(MarketplaceTable, eq(MarketplacePluginTable.marketplaceId, MarketplaceTable.id))
+      .where(and(
+        eq(MarketplacePluginTable.organizationId, organizationId),
+        inArray(MarketplacePluginTable.pluginId, pluginIds),
+        isNull(MarketplacePluginTable.removedAt),
+        eq(MarketplaceTable.organizationId, organizationId),
+        eq(MarketplaceTable.status, "active"),
+        isNull(MarketplaceTable.deletedAt),
+      )),
+    db
+      .select()
+      .from(MarketplaceAccessGrantTable)
+      .where(and(
+        eq(MarketplaceAccessGrantTable.organizationId, organizationId),
+        isNull(MarketplaceAccessGrantTable.removedAt),
+        applicableMarketplaceGrant,
+      )),
+    db
+      .select({
+        pluginId: PluginConfigObjectTable.pluginId,
+        objectType: ConfigObjectTable.objectType,
+        componentCount: count(),
+      })
+      .from(PluginConfigObjectTable)
+      .innerJoin(ConfigObjectTable, and(
+        eq(PluginConfigObjectTable.organizationId, ConfigObjectTable.organizationId),
+        eq(PluginConfigObjectTable.configObjectId, ConfigObjectTable.id),
+      ))
+      .where(and(
+        eq(PluginConfigObjectTable.organizationId, organizationId),
+        inArray(PluginConfigObjectTable.pluginId, pluginIds),
+        isNull(PluginConfigObjectTable.removedAt),
+      ))
+      .groupBy(PluginConfigObjectTable.pluginId, ConfigObjectTable.objectType),
+  ])
+
+  const grantCreatorIds = uniqueIds(pluginGrants.flatMap((grant) =>
+    grant.orgMembershipId === memberId ? [grant.createdByOrgMembershipId] : []))
+  const grantCreatorRows = grantCreatorIds.length === 0
+    ? []
+    : await db
+      .select({ orgMembershipId: MemberTable.id, name: AuthUserTable.name })
+      .from(MemberTable)
+      .leftJoin(AuthUserTable, eq(MemberTable.userId, AuthUserTable.id))
+      .where(and(eq(MemberTable.organizationId, organizationId), inArray(MemberTable.id, grantCreatorIds)))
+  const grantCreatorNames = new Map(grantCreatorRows.map((row) => [row.orgMembershipId, row.name]))
+  const pluginsById = new Map(activePlugins.map((plugin) => [plugin.id, plugin]))
+  const teamsById = new Map(input.context.memberTeams.map((team) => [team.id, team]))
+  const marketplaceGrantsById = new Map<MarketplaceId, typeof marketplaceGrants>()
+  const componentsByPlugin = new Map<PluginId, { count: number; kinds: Set<string> }>()
+  for (const row of componentRows) {
+    const components = componentsByPlugin.get(row.pluginId) ?? { count: 0, kinds: new Set<string>() }
+    components.count += row.componentCount
+    components.kinds.add(row.objectType)
+    componentsByPlugin.set(row.pluginId, components)
+  }
+  const candidatesByPlugin = new Map<PluginId, Map<string, MePluginAccessCandidate>>()
+
+  const addCandidate = (pluginId: PluginId, candidate: MePluginAccessCandidate) => {
+    const existingCandidates = candidatesByPlugin.get(pluginId)
+    const candidates = existingCandidates ?? new Map<string, MePluginAccessCandidate>()
+    if (!existingCandidates) candidatesByPlugin.set(pluginId, candidates)
+    const current = candidates.get(candidate.edgeKey)
+    if (!current || pluginAccessRolePriority[candidate.role] > pluginAccessRolePriority[current.role]) {
+      candidates.set(candidate.edgeKey, candidate)
+    }
+  }
+
+  for (const plugin of activePlugins) {
+    if (plugin.createdByOrgMembershipId === memberId) {
+      addCandidate(plugin.id, { edge: { kind: "mine" }, edgeKey: "mine", role: "manager" })
+    }
+  }
+
+  for (const grant of pluginGrants) {
+    if (!pluginsById.has(grant.pluginId)) continue
+    if (grant.orgMembershipId === memberId) {
+      const creatorName = grantCreatorNames.get(grant.createdByOrgMembershipId)
+      addCandidate(grant.pluginId, {
+        edge: {
+          kind: "person",
+          sharedBy: creatorName ? { orgMembershipId: grant.createdByOrgMembershipId, name: creatorName } : null,
+          grantedAt: grant.createdAt.toISOString(),
+        },
+        edgeKey: "person",
+        role: grant.role,
+      })
+    }
+    if (grant.teamId) {
+      const team = teamsById.get(grant.teamId)
+      if (team) {
+        addCandidate(grant.pluginId, {
+          edge: { kind: "team", team: { id: team.id, name: team.name } },
+          edgeKey: `team:${team.id}`,
+          role: grant.role,
+        })
+      }
+    }
+    if (grant.orgWide) {
+      addCandidate(grant.pluginId, { edge: { kind: "org_wide" }, edgeKey: "org_wide", role: grant.role })
+    }
+  }
+
+  for (const grant of marketplaceGrants) {
+    const existing = marketplaceGrantsById.get(grant.marketplaceId) ?? []
+    existing.push(grant)
+    marketplaceGrantsById.set(grant.marketplaceId, existing)
+  }
+  for (const membership of marketplaceMemberships) {
+    const role = resolvePluginArchGrantRole({
+      grants: marketplaceGrantsById.get(membership.marketplaceId) ?? [],
+      memberId,
+      teamIds,
+    })
+    if (!role) continue
+    addCandidate(membership.pluginId, {
+      edge: {
+        kind: "catalog",
+        marketplace: { id: membership.marketplaceId, name: membership.marketplaceName },
+      },
+      edgeKey: `catalog:${membership.marketplaceId}`,
+      role: "viewer",
+    })
+  }
+
+  const items = activePlugins.flatMap((plugin) => {
+    const candidates = [...(candidatesByPlugin.get(plugin.id)?.values() ?? [])]
+    if (candidates.length === 0) return []
+    candidates.sort((left, right) => {
+      const byKind = mePluginAccessEdgeOrder[left.edge.kind] - mePluginAccessEdgeOrder[right.edge.kind]
+      return byKind !== 0 ? byKind : left.edgeKey.localeCompare(right.edgeKey)
+    })
+    let role: PluginArchRole = "viewer"
+    for (const candidate of candidates) {
+      if (pluginAccessRolePriority[candidate.role] > pluginAccessRolePriority[role]) role = candidate.role
+    }
+    return [{
+      plugin: {
+        id: plugin.id,
+        name: plugin.name,
+        description: plugin.description,
+        componentCount: componentsByPlugin.get(plugin.id)?.count ?? 0,
+        componentKinds: [...(componentsByPlugin.get(plugin.id)?.kinds ?? [])].sort(),
+        sourceRepositoryUrl: plugin.sourceRepositoryUrl,
+      },
+      edges: candidates.map((candidate) => candidate.edge),
+      role,
+    }]
+  })
+  items.sort((left, right) => {
+    const byName = left.plugin.name.localeCompare(right.plugin.name)
+    return byName !== 0 ? byName : left.plugin.id.localeCompare(right.plugin.id)
+  })
+  return { items }
+}
+
+export async function listMeEffectivePluginAccess(input: { context: PluginArchActorContext }) {
+  const result = await listMeEffectivePluginAccessWithComponentKinds(input)
+  return {
+    items: result.items.map((item) => ({
+      plugin: {
+        id: item.plugin.id,
+        name: item.plugin.name,
+        description: item.plugin.description,
+        componentCount: item.plugin.componentCount,
+        sourceRepositoryUrl: item.plugin.sourceRepositoryUrl,
+      },
+      edges: item.edges,
+      role: item.role,
+    })),
+  }
+}
+
+export async function listMeLibraryPluginItems(input: { context: PluginArchActorContext }) {
+  const result = await listMeEffectivePluginAccessWithComponentKinds(input)
+  return result.items.map((item) => ({
+    type: "plugin",
+    id: item.plugin.id,
+    name: item.plugin.name,
+    description: item.plugin.description,
+    componentCount: item.plugin.componentCount,
+    componentKinds: item.plugin.componentKinds,
+    sourceRepositoryUrl: item.plugin.sourceRepositoryUrl,
+    edges: item.edges,
+    role: item.role,
+  }))
+}
+
+function memberConnectionState(connection: MemberUsableConnectionFacts) {
+  if (
+    connection.setupRequired
+    || connection.issuerReviewRequired
+    || connection.reconnectActionOwner === "organization_admin"
+    || connection.authPolicyConfirmed === false
+    || connection.authTypeMismatch
+    || (connection.oauthClientRequired && !connection.oauthClientConfigured)
+    || (connection.credentialMode === "shared" && !connection.connectedForMe)
+  ) {
+    return "needs_admin_setup"
+  }
+  if (connection.credentialMode === "per_member" && (!connection.connectedForMe || connection.needsReconnect)) {
+    return "needs_signin"
+  }
+  if (connection.connectedForMe || (connection.credentialMode === "shared" && connection.connected)) {
+    return "connected"
+  }
+  return "available"
+}
+
+export async function listMeLibraryConnectionItems(input: {
+  connections: MemberUsableConnectionFacts[]
+  context: PluginArchActorContext
+}) {
+  if (input.connections.length === 0) return []
+
+  const organizationId = input.context.organizationContext.organization.id
+  const memberId = input.context.organizationContext.currentMember.id
+  const teamIds = input.context.memberTeams.map((team) => team.id)
+  const connectionIds = new Set(input.connections.map((connection) => connection.id))
+  const applicableGrant = teamIds.length > 0
+    ? or(
+        eq(ExternalMcpConnectionAccessGrantTable.orgWide, true),
+        eq(ExternalMcpConnectionAccessGrantTable.orgMembershipId, memberId),
+        inArray(ExternalMcpConnectionAccessGrantTable.teamId, teamIds),
+      )
+    : or(
+        eq(ExternalMcpConnectionAccessGrantTable.orgWide, true),
+        eq(ExternalMcpConnectionAccessGrantTable.orgMembershipId, memberId),
+      )
+  const grants = await db
+    .select()
+    .from(ExternalMcpConnectionAccessGrantTable)
+    .where(and(
+      eq(ExternalMcpConnectionAccessGrantTable.organizationId, organizationId),
+      applicableGrant,
+    ))
+    .orderBy(asc(ExternalMcpConnectionAccessGrantTable.createdAt), asc(ExternalMcpConnectionAccessGrantTable.id))
+  const creatorIds = uniqueIds(grants
+    .filter((grant) => connectionIds.has(grant.externalMcpConnectionId) && grant.orgMembershipId === memberId)
+    .map((grant) => grant.createdByOrgMembershipId))
+  const creators = creatorIds.length === 0
+    ? []
+    : await db
+      .select({ orgMembershipId: MemberTable.id, name: AuthUserTable.name })
+      .from(MemberTable)
+      .leftJoin(AuthUserTable, eq(MemberTable.userId, AuthUserTable.id))
+      .where(and(eq(MemberTable.organizationId, organizationId), inArray(MemberTable.id, creatorIds)))
+  const creatorNames = new Map(creators.map((creator) => [creator.orgMembershipId, creator.name]))
+  const teamsById = new Map(input.context.memberTeams.map((team) => [team.id, team]))
+  const edgesByConnection = new Map<string, Map<string, MePluginAccessEdge>>()
+  const addEdge = (connectionId: string, key: string, edge: MePluginAccessEdge) => {
+    if (!connectionIds.has(connectionId)) return
+    const edges = edgesByConnection.get(connectionId) ?? new Map<string, MePluginAccessEdge>()
+    if (!edgesByConnection.has(connectionId)) edgesByConnection.set(connectionId, edges)
+    if (!edges.has(key)) edges.set(key, edge)
+  }
+
+  for (const grant of grants) {
+    if (grant.orgWide) addEdge(grant.externalMcpConnectionId, "org_wide", { kind: "org_wide" })
+    if (grant.orgMembershipId === memberId) {
+      const creatorName = creatorNames.get(grant.createdByOrgMembershipId)
+      addEdge(grant.externalMcpConnectionId, "person", {
+        kind: "person",
+        sharedBy: creatorName ? { orgMembershipId: grant.createdByOrgMembershipId, name: creatorName } : null,
+        grantedAt: grant.createdAt.toISOString(),
+      })
+    }
+    if (grant.teamId) {
+      const team = teamsById.get(grant.teamId)
+      if (team) addEdge(grant.externalMcpConnectionId, `team:${team.id}`, { kind: "team", team: { id: team.id, name: team.name } })
+    }
+  }
+
+  return input.connections.map((connection) => {
+    const edges = [...(edgesByConnection.get(connection.id)?.values() ?? [{ kind: "org_wide" } satisfies MePluginAccessEdge])]
+    edges.sort((left, right) => mePluginAccessEdgeOrder[left.kind] - mePluginAccessEdgeOrder[right.kind])
+    return {
+      type: "connection",
+      id: connection.id,
+      name: connection.name,
+      url: connection.url,
+      description: null,
+      transport: connection.nativeProviderKey !== null ? "native" : "mcp",
+      provider: connection.nativeProviderKey,
+      state: memberConnectionState(connection),
+      connectedAt: connection.connectedAt,
+      edges,
+    }
+  })
+}
+
 export async function createResourceAccessGrant(input: { context: PluginArchActorContext; value: AccessGrantWrite } & ResourceTarget) {
   await ensureResourceInOrganization(input.context, input)
   await requirePluginArchResourceRole({ context: input.context, resourceId: input.resourceId, resourceKind: input.resourceKind, role: "manager" })
+  if (input.value.orgWide === true && !isPluginArchOrgAdmin(input.context)) {
+    throw new PluginArchAuthorizationError(403, "forbidden", "Only organization owners and admins can grant org-wide access.")
+  }
   await ensureGrantTargetsInOrganization(input.context, input.value)
   const grant = await upsertGrant(input)
   await syncPluginMcpRequirementAccessForResource(input)
@@ -1965,16 +2543,35 @@ export async function getPluginDetail(context: PluginArchActorContext, pluginId:
   return serializePlugin(row, memberships.length, marketplaceMembers.get(row.id) ?? [])
 }
 
-export async function createPlugin(input: { context: PluginArchActorContext; description?: string | null; name: string }) {
+export async function createPlugin(input: { context: PluginArchActorContext; description?: string | null; name: string; sourceRepositoryUrl?: string | null }) {
   const now = new Date()
+  const name = input.name.trim()
+  const existing = await db
+    .select({ id: PluginTable.id })
+    .from(PluginTable)
+    .where(and(
+      eq(PluginTable.organizationId, input.context.organizationContext.organization.id),
+      eq(PluginTable.createdByOrgMembershipId, input.context.organizationContext.currentMember.id),
+      eq(PluginTable.name, name),
+      eq(PluginTable.status, "active"),
+      isNull(PluginTable.deletedAt),
+    ))
+    .orderBy(asc(PluginTable.createdAt), asc(PluginTable.id))
+    .limit(1)
+
+  if (existing[0]) {
+    throw new PluginArchRouteFailure(409, "duplicate_plugin", `You already have an active plugin named "${name}" (${existing[0].id}). Update it instead of creating a duplicate.`)
+  }
+
   const row = {
     createdAt: now,
     createdByOrgMembershipId: input.context.organizationContext.currentMember.id,
     deletedAt: null,
     description: normalizeOptionalString(input.description ?? undefined),
     id: createDenTypeId("plugin"),
-    name: input.name.trim(),
+    name,
     organizationId: input.context.organizationContext.organization.id,
+    sourceRepositoryUrl: normalizeOptionalString(input.sourceRepositoryUrl ?? undefined),
     status: "active" as const,
     updatedAt: now,
   }
@@ -2004,7 +2601,12 @@ export async function createPluginBundle(input: {
   marketplaceId?: MarketplaceId
   name: string
   orgWide?: boolean
+  sourceRepositoryUrl?: string | null
 }) {
+  if (input.orgWide === true && !isPluginArchOrgAdmin(input.context)) {
+    throw new PluginArchAuthorizationError(403, "forbidden", "Only organization owners and admins can create org-wide plugins.")
+  }
+
   for (const component of input.components ?? []) {
     deriveProjection({ objectType: component.type, value: component.value })
   }
@@ -2014,7 +2616,7 @@ export async function createPluginBundle(input: {
     await ensureEditableMarketplace(input.context, input.marketplaceId)
   }
 
-  const plugin = await createPlugin({ context: input.context, description: input.description, name: input.name })
+  const plugin = await createPlugin({ context: input.context, description: input.description, name: input.name, sourceRepositoryUrl: input.sourceRepositoryUrl })
 
   for (const component of input.components ?? []) {
     const configObject = await createConfigObject({
@@ -2227,6 +2829,7 @@ async function ensureDefaultMarketplacePlugins(input: {
         id: createDenTypeId("plugin"),
         name: entry.name,
         organizationId,
+        sourceRepositoryUrl: null,
         status: "active" as const,
         updatedAt: input.createdAt,
       }
@@ -3462,8 +4065,54 @@ export async function retryConnectorSyncEvent(input: { connectorSyncEventId: Con
   const row = await getConnectorSyncEventRow(input.context.organizationContext.organization.id, input.connectorSyncEventId)
   if (!row) throw new PluginArchRouteFailure(404, "connector_sync_event_not_found", "Connector sync event not found.")
   await ensureEditableConnectorInstance(input.context, row.connectorInstanceId)
-  await db.update(ConnectorSyncEventTable).set({ completedAt: null, startedAt: new Date(), status: "queued" }).where(eq(ConnectorSyncEventTable.id, row.id))
+  await db.update(ConnectorSyncEventTable).set({
+    attemptCount: 0,
+    completedAt: null,
+    nextAttemptAt: null,
+    startedAt: new Date(),
+    status: "queued",
+  }).where(eq(ConnectorSyncEventTable.id, row.id))
   return { id: row.id }
+}
+
+export async function syncConnectorInstanceNow(input: { connectorInstanceId: ConnectorInstanceId; context: PluginArchActorContext }) {
+  const instance = await ensureEditableConnectorInstance(input.context, input.connectorInstanceId)
+  const targets = await db
+    .select()
+    .from(ConnectorTargetTable)
+    .where(eq(ConnectorTargetTable.connectorInstanceId, instance.id))
+    .orderBy(asc(ConnectorTargetTable.createdAt), asc(ConnectorTargetTable.id))
+
+  let enqueuedCount = 0
+  for (const target of targets) {
+    const activeEvents = await db
+      .select({ id: ConnectorSyncEventTable.id })
+      .from(ConnectorSyncEventTable)
+      .where(and(
+        eq(ConnectorSyncEventTable.connectorTargetId, target.id),
+        inArray(ConnectorSyncEventTable.status, ["queued", "running"]),
+      ))
+      .limit(1)
+    if (activeEvents[0]) continue
+
+    await db.insert(ConnectorSyncEventTable).values({
+      connectorInstanceId: instance.id,
+      connectorTargetId: target.id,
+      connectorType: target.connectorType,
+      eventType: "manual_resync",
+      externalEventRef: null,
+      id: createDenTypeId("connectorSyncEvent"),
+      organizationId: instance.organizationId,
+      remoteId: target.remoteId,
+      sourceRevisionRef: null,
+      startedAt: new Date(),
+      status: "queued",
+      summaryJson: { trigger: "manual" },
+    })
+    enqueuedCount += 1
+  }
+
+  return { enqueuedCount }
 }
 
 function githubConnectorAppConfig() {
@@ -4201,6 +4850,7 @@ async function connectionCompatibleWithRequirement(input: {
   organizationId: OrganizationId
   url: string
 }) {
+  if (input.connection.kind !== "external_mcp") return false
   const baseCompatible = comparablePluginMcpRequirementUrl(input.connection.url) === comparablePluginMcpRequirementUrl(input.url)
     && input.connection.authType === input.authType
     && input.connection.credentialMode === input.credentialMode
@@ -4268,6 +4918,9 @@ async function validateConfiguredPluginMcpConnection(input: {
   authType: PluginMcpRequirementAuthType
   connection: ExternalMcpConnectionRow
 }) {
+  if (input.connection.kind !== "external_mcp") {
+    throw new PluginArchRouteFailure(400, "invalid_mcp_connection", "Native provider connectors cannot satisfy plugin MCP requirements.")
+  }
   if (input.authType === "oauth") return
   try {
     await connectExternalMcp(
@@ -4332,7 +4985,7 @@ async function ensureImportedExternalMcpConnection(input: {
   await assertPublicUrl(serverUrl)
   const organizationId = input.context.organizationContext.organization.id
   const existing = (await listExternalMcpConnections(organizationId))
-    .find((connection) => comparablePluginMcpRequirementUrl(connection.url) === comparablePluginMcpRequirementUrl(serverUrl))
+    .find((connection) => connection.kind === "external_mcp" && comparablePluginMcpRequirementUrl(connection.url) === comparablePluginMcpRequirementUrl(serverUrl))
 
   if (existing) {
     await requireExistingExternalMcpConnectionMatchesImport({
@@ -4587,6 +5240,10 @@ export async function importGithubPluginMcps(input: {
   selectedServerKeys?: string[]
   selectedServerNames?: string[]
 }) {
+  if (!isPluginArchOrgAdmin(input.context)) {
+    throw new PluginArchAuthorizationError(403, "forbidden", "Only organization owners and admins can import plugins from GitHub.")
+  }
+
   if (input.marketplaceId) {
     await ensureEditableMarketplace(input.context, input.marketplaceId)
   }
@@ -4622,6 +5279,7 @@ export async function importGithubPluginMcps(input: {
       ? `Plugin components imported from ${plan.repositoryFullName}${plan.rootPath ? `/${plan.rootPath}` : ""}.`
       : input.description,
     name: input.name ?? importedPluginName(plan),
+    sourceRepositoryUrl: `https://github.com/${plan.repositoryFullName}`,
   })
 
   const importedOwnedConnectionIds = new Set<ExternalMcpConnectionRow["id"]>()
@@ -4890,6 +5548,7 @@ async function buildConnectorAutomationContext(input: { connectorInstance: Conne
   }
 
   return {
+    automation: true,
     memberTeams: [],
     session: null,
     organizationContext: {
@@ -4988,6 +5647,73 @@ async function maybeAutoImportGithubConnectorInstance(input: {
     })),
     sourceRevisionRef: applied.sourceRevisionRef,
   }
+}
+
+export async function executeGithubConnectorSyncEvent(input: { connectorSyncEventId: ConnectorSyncEventId }) {
+  const eventRows = await db
+    .select()
+    .from(ConnectorSyncEventTable)
+    .where(eq(ConnectorSyncEventTable.id, input.connectorSyncEventId))
+    .limit(1)
+  const event = eventRows[0]
+  if (!event || event.connectorType !== "github") {
+    throw new Error("GitHub connector sync event not found.")
+  }
+
+  const connectorInstance = await getConnectorInstanceRow(event.organizationId, event.connectorInstanceId)
+  if (!connectorInstance || connectorInstance.connectorType !== "github") {
+    throw new Error("GitHub connector instance not found for sync event.")
+  }
+  if (!event.connectorTargetId) {
+    throw new Error("GitHub connector target is missing from sync event.")
+  }
+  const connectorTarget = await getConnectorTargetRow(event.organizationId, event.connectorTargetId)
+  if (!connectorTarget || connectorTarget.connectorType !== "github") {
+    throw new Error("GitHub connector target not found for sync event.")
+  }
+
+  const startedAt = new Date()
+  const autoImportSummary = await maybeAutoImportGithubConnectorInstance({
+    connectorInstance,
+    connectorSyncEventId: event.id,
+    connectorTarget,
+  })
+  const completedAt = new Date()
+  const eventStatus: ConnectorSyncEventRow["status"] = !autoImportSummary.autoImported
+    ? "ignored"
+    : autoImportSummary.materializedConfigObjectCount > 0
+      ? "completed"
+      : "partial"
+  const summaryJson = {
+    ...(event.summaryJson ?? {}),
+    outcome: eventStatus,
+    error: null,
+    autoImportApplied: autoImportSummary.autoImported,
+    autoImportNewPlugins: autoImportSummary.autoImportNewPlugins,
+    classification: autoImportSummary.classification,
+    resolvedSourceRevisionRef: autoImportSummary.sourceRevisionRef,
+    discoveredPluginCount: autoImportSummary.discoveredPluginCount,
+    createdMarketplace: autoImportSummary.createdMarketplace,
+    createdPluginCount: autoImportSummary.createdPluginCount,
+    createdPlugins: autoImportSummary.createdPlugins,
+    materializedConfigObjectCount: autoImportSummary.materializedConfigObjectCount,
+    materializedConfigObjects: autoImportSummary.materializedConfigObjects,
+    startedAt: startedAt.toISOString(),
+    completedAt: completedAt.toISOString(),
+    durationMs: completedAt.getTime() - startedAt.getTime(),
+  }
+
+  await db.update(ConnectorSyncEventTable).set({
+    completedAt,
+    nextAttemptAt: null,
+    status: eventStatus,
+    summaryJson,
+  }).where(and(
+    eq(ConnectorSyncEventTable.id, event.id),
+    eq(ConnectorSyncEventTable.status, "running"),
+  ))
+
+  return { status: eventStatus }
 }
 
 async function getGithubDiscoveryFileTexts(input: {
@@ -5305,6 +6031,31 @@ function importedObjectMetadata(input: { objectType: ConnectorMappingRow["object
   }
 }
 
+export function deriveGithubImportedObjectProjection(input: { objectType: ConnectorMappingRow["objectType"]; path: string; rawSourceText: string }) {
+  const metadata = importedObjectMetadata({ objectType: input.objectType, path: input.path, rawSourceText: input.rawSourceText })
+  const frontmatterRecord = metadata.metadata && typeof metadata.metadata.frontmatter === "object"
+    ? metadata.metadata.frontmatter as Record<string, unknown>
+    : null
+  const hasFrontmatter = frontmatterRecord && Object.keys(frontmatterRecord).length > 0
+  // Skill projections need the full SKILL.md: deriveSkillProjection parses and
+  // validates the frontmatter itself, so stripping it here made every GitHub
+  // connector skill import fail with invalid_skill_frontmatter.
+  const projectionRawSource = input.objectType !== "skill" && hasFrontmatter
+    ? parseMarkdownFrontmatter(input.rawSourceText).body
+    : input.rawSourceText
+  return {
+    metadata,
+    projection: deriveProjection({
+      objectType: input.objectType,
+      value: {
+        metadata: metadata.metadata,
+        normalizedPayloadJson: metadata.normalizedPayloadJson,
+        rawSourceText: projectionRawSource,
+      },
+    }),
+  }
+}
+
 async function findActiveConnectorSourceBinding(input: {
   connectorMappingId: ConnectorMappingId
   externalLocator: string
@@ -5337,25 +6088,10 @@ async function materializeGithubImportedObject(input: {
   const organizationId = input.context.organizationContext.organization.id
   const createdByOrgMembershipId = input.context.organizationContext.currentMember.id
   const now = new Date()
-  const metadata = importedObjectMetadata({
+  const { metadata, projection } = deriveGithubImportedObjectProjection({
     objectType: input.connectorMapping.objectType,
     path: input.externalLocator,
     rawSourceText: input.rawSourceText,
-  })
-  const frontmatterRecord = metadata.metadata && typeof metadata.metadata.frontmatter === "object"
-    ? metadata.metadata.frontmatter as Record<string, unknown>
-    : null
-  const hasFrontmatter = frontmatterRecord && Object.keys(frontmatterRecord).length > 0
-  const projectionRawSource = hasFrontmatter
-    ? parseMarkdownFrontmatter(input.rawSourceText).body
-    : input.rawSourceText
-  const projection = deriveProjection({
-    objectType: input.connectorMapping.objectType,
-    value: {
-      metadata: metadata.metadata,
-      normalizedPayloadJson: metadata.normalizedPayloadJson,
-      rawSourceText: projectionRawSource,
-    },
   })
   const fileName = input.externalLocator.split("/").filter(Boolean).at(-1) ?? input.externalLocator
   const fileExtension = fileName.includes(".") ? fileName.split(".").at(-1) ?? null : null
@@ -5619,7 +6355,7 @@ async function materializeGithubImportPlans(input: {
   return materializedConfigObjects
 }
 
-async function ensureDiscoveryPlugin(input: { context: PluginArchActorContext; description: string | null; name: string }) {
+async function ensureDiscoveryPlugin(input: { context: PluginArchActorContext; description: string | null; name: string; sourceRepositoryUrl: string }) {
   const existing = await db
     .select()
     .from(PluginTable)
@@ -5632,13 +6368,17 @@ async function ensureDiscoveryPlugin(input: { context: PluginArchActorContext; d
     .limit(1)
 
   if (existing[0]) {
-    return serializePlugin(existing[0], 0)
+    if (existing[0].sourceRepositoryUrl !== input.sourceRepositoryUrl) {
+      await db.update(PluginTable).set({ sourceRepositoryUrl: input.sourceRepositoryUrl }).where(eq(PluginTable.id, existing[0].id))
+    }
+    return serializePlugin({ ...existing[0], sourceRepositoryUrl: input.sourceRepositoryUrl }, 0)
   }
 
   return createPlugin({
     context: input.context,
     description: input.description,
     name: input.name,
+    sourceRepositoryUrl: input.sourceRepositoryUrl,
   })
 }
 
@@ -5848,6 +6588,10 @@ export async function getGithubConnectorDiscoveryTree(input: { connectorInstance
 }
 
 export async function applyGithubConnectorDiscovery(input: { autoImportNewPlugins: boolean; connectorInstanceId: ConnectorInstanceId; connectorSyncEventId?: ConnectorSyncEventId; context: PluginArchActorContext; forceRefresh?: boolean; selectedKeys: string[] }) {
+  if (!isPluginArchOrgAdmin(input.context)) {
+    throw new PluginArchAuthorizationError(403, "forbidden", "Only organization owners and admins can apply connector discovery.")
+  }
+
   const discovery = await resolveGithubConnectorDiscovery({ connectorInstanceId: input.connectorInstanceId, context: input.context, forceRefresh: input.forceRefresh })
   const selectedKeySet = new Set(input.selectedKeys.map((key) => key.trim()).filter(Boolean))
   const selectedPlugins = discovery.cache.discoveredPlugins.filter((plugin) => plugin.supported && selectedKeySet.has(plugin.key))
@@ -5881,6 +6625,7 @@ export async function applyGithubConnectorDiscovery(input: { autoImportNewPlugin
       context: input.context,
       description: discoveredPlugin.description,
       name: discoveredPlugin.displayName,
+      sourceRepositoryUrl: `https://github.com/${discovery.cache.repositoryFullName}`,
     })
     plugins.push(plugin)
 
@@ -6131,6 +6876,199 @@ export async function githubSetup(input: {
   }
 }
 
+type GithubWebhookTargetRow = {
+  instance: ConnectorInstanceRow
+  target: ConnectorTargetRow
+}
+
+async function listActiveGithubWebhookTargets(installationId: number) {
+  return db
+    .select({ instance: ConnectorInstanceTable, target: ConnectorTargetTable })
+    .from(ConnectorTargetTable)
+    .innerJoin(ConnectorInstanceTable, eq(ConnectorTargetTable.connectorInstanceId, ConnectorInstanceTable.id))
+    .innerJoin(ConnectorAccountTable, eq(ConnectorInstanceTable.connectorAccountId, ConnectorAccountTable.id))
+    .where(and(
+      eq(ConnectorTargetTable.connectorType, "github"),
+      eq(ConnectorTargetTable.organizationId, ConnectorInstanceTable.organizationId),
+      eq(ConnectorAccountTable.organizationId, ConnectorInstanceTable.organizationId),
+      eq(ConnectorAccountTable.connectorType, "github"),
+      eq(ConnectorAccountTable.remoteId, String(installationId)),
+      eq(ConnectorAccountTable.status, "active"),
+      eq(ConnectorInstanceTable.status, "active"),
+    ))
+}
+
+function githubWebhookTargetMatchesRepository(input: {
+  repositoryFullName: string
+  repositoryId: number
+  row: GithubWebhookTargetRow
+}) {
+  const targetConfig = input.row.target.targetConfigJson
+  const storedRepositoryId = targetConfig.repositoryId
+  return typeof storedRepositoryId === "number"
+    ? storedRepositoryId === input.repositoryId
+    : input.row.target.remoteId === input.repositoryFullName
+}
+
+function renamedRepositoryPreviousFullName(payload: Record<string, unknown>, repositoryFullName: string) {
+  const changes = isRecord(payload.changes) ? payload.changes : null
+  const repositoryChange = changes && isRecord(changes.repository) ? changes.repository : null
+  const nameChange = repositoryChange && isRecord(repositoryChange.name) ? repositoryChange.name : null
+  const previousName = nameChange && typeof nameChange.from === "string" ? nameChange.from.trim() : ""
+  if (!previousName) return ""
+  if (previousName.includes("/")) return previousName
+  const owner = repositoryFullName.split("/")[0]?.trim() ?? ""
+  return owner ? `${owner}/${previousName}` : previousName
+}
+
+async function handleGithubRepositoryRenamed(input: {
+  deliveryId: string
+  installationId: number
+  payload: Record<string, unknown>
+  repositoryFullName?: string
+  repositoryId?: number
+}) {
+  const repositoryFullName = input.repositoryFullName
+  const repositoryId = input.repositoryId
+  if (!repositoryFullName || !repositoryId) {
+    return 0
+  }
+  const previousFullName = renamedRepositoryPreviousFullName(input.payload, repositoryFullName)
+  if (!previousFullName) {
+    return 0
+  }
+
+  const rows = await listActiveGithubWebhookTargets(input.installationId)
+  const matches = rows.filter((row) => githubWebhookTargetMatchesRepository({
+    repositoryFullName: previousFullName,
+    repositoryId,
+    row,
+  }))
+  for (const row of matches) {
+    const now = new Date()
+    await db.update(ConnectorTargetTable).set({
+      remoteId: repositoryFullName,
+      targetConfigJson: {
+        ...row.target.targetConfigJson,
+        repositoryFullName,
+      },
+      updatedAt: now,
+    }).where(eq(ConnectorTargetTable.id, row.target.id))
+    await db.update(ConnectorInstanceTable).set({
+      remoteId: repositoryFullName,
+      updatedAt: now,
+    }).where(eq(ConnectorInstanceTable.id, row.instance.id))
+
+    await db.insert(ConnectorSyncEventTable).values({
+      completedAt: now,
+      connectorInstanceId: row.instance.id,
+      connectorTargetId: row.target.id,
+      connectorType: "github",
+      eventType: "repository",
+      externalEventRef: input.deliveryId,
+      id: createDenTypeId("connectorSyncEvent"),
+      organizationId: row.instance.organizationId,
+      remoteId: repositoryFullName,
+      sourceRevisionRef: null,
+      startedAt: now,
+      status: "completed",
+      summaryJson: {
+        action: "renamed",
+        deliveryId: input.deliveryId,
+        from: previousFullName,
+        to: repositoryFullName,
+        trigger: "webhook",
+      },
+    })
+
+    const activeEvents = await db
+      .select({ id: ConnectorSyncEventTable.id })
+      .from(ConnectorSyncEventTable)
+      .where(and(
+        eq(ConnectorSyncEventTable.connectorTargetId, row.target.id),
+        inArray(ConnectorSyncEventTable.status, ["queued", "running"]),
+      ))
+      .limit(1)
+    if (!activeEvents[0]) {
+      await db.insert(ConnectorSyncEventTable).values({
+        connectorInstanceId: row.instance.id,
+        connectorTargetId: row.target.id,
+        connectorType: "github",
+        eventType: "manual_resync",
+        externalEventRef: input.deliveryId,
+        id: createDenTypeId("connectorSyncEvent"),
+        organizationId: row.instance.organizationId,
+        remoteId: repositoryFullName,
+        sourceRevisionRef: null,
+        startedAt: now,
+        status: "queued",
+        summaryJson: { trigger: "webhook" },
+      })
+    }
+  }
+  return matches.length
+}
+
+function removedGithubRepositories(payload: Record<string, unknown>) {
+  return Array.isArray(payload.repositories_removed)
+    ? payload.repositories_removed.flatMap((entry) => {
+        if (!isRecord(entry) || typeof entry.id !== "number" || typeof entry.full_name !== "string") return []
+        const repositoryFullName = entry.full_name.trim()
+        return repositoryFullName ? [{ repositoryFullName, repositoryId: entry.id }] : []
+      })
+    : []
+}
+
+async function handleGithubInstallationRepositoriesRemoved(input: {
+  deliveryId: string
+  installationId: number
+  payload: Record<string, unknown>
+}) {
+  const removed = removedGithubRepositories(input.payload)
+  if (removed.length === 0) return 0
+  const rows = await listActiveGithubWebhookTargets(input.installationId)
+  let matchedCount = 0
+  for (const row of rows) {
+    const repository = removed.find((entry) => githubWebhookTargetMatchesRepository({ ...entry, row }))
+    if (!repository) continue
+    matchedCount += 1
+    const now = new Date()
+    await db.update(ConnectorTargetTable).set({
+      targetConfigJson: {
+        ...row.target.targetConfigJson,
+        status: "disabled",
+      },
+      updatedAt: now,
+    }).where(eq(ConnectorTargetTable.id, row.target.id))
+    await db.update(ConnectorInstanceTable).set({
+      status: "disabled",
+      updatedAt: now,
+    }).where(eq(ConnectorInstanceTable.id, row.instance.id))
+    await db.insert(ConnectorSyncEventTable).values({
+      completedAt: now,
+      connectorInstanceId: row.instance.id,
+      connectorTargetId: row.target.id,
+      connectorType: "github",
+      eventType: "installation_repositories",
+      externalEventRef: input.deliveryId,
+      id: createDenTypeId("connectorSyncEvent"),
+      organizationId: row.instance.organizationId,
+      remoteId: row.target.remoteId,
+      sourceRevisionRef: null,
+      startedAt: now,
+      status: "completed",
+      summaryJson: {
+        action: "removed",
+        deliveryId: input.deliveryId,
+        repositoryFullName: repository.repositoryFullName,
+        repositoryId: repository.repositoryId,
+        trigger: "webhook",
+      },
+    })
+  }
+  return matchedCount
+}
+
 export async function enqueueGithubWebhookSync(input: {
   deliveryId: string
   event: "installation" | "installation_repositories" | "push" | "repository"
@@ -6159,6 +7097,28 @@ export async function enqueueGithubWebhookSync(input: {
         }
         return { accepted: true as const, queued: false as const }
       }
+    }
+    if (input.event === "repository" && input.payload.action === "renamed") {
+      const matchedCount = await handleGithubRepositoryRenamed({
+        deliveryId: input.deliveryId,
+        installationId: input.installationId,
+        payload: input.payload,
+        repositoryFullName: input.repositoryFullName,
+        repositoryId: input.repositoryId,
+      })
+      return matchedCount > 0
+        ? { accepted: true as const, queued: true as const }
+        : { accepted: false as const, reason: "event ignored" }
+    }
+    if (input.event === "installation_repositories" && input.payload.action === "removed") {
+      const matchedCount = await handleGithubInstallationRepositoriesRemoved({
+        deliveryId: input.deliveryId,
+        installationId: input.installationId,
+        payload: input.payload,
+      })
+      return matchedCount > 0
+        ? { accepted: true as const, queued: false as const }
+        : { accepted: false as const, reason: "event ignored" }
     }
     return { accepted: false as const, reason: "event ignored" }
   }
@@ -6201,94 +7161,30 @@ export async function enqueueGithubWebhookSync(input: {
       ))
       .limit(1)
 
-    // Generate the sync event id up front so config object versions created during auto-import
-    // can be linked back to the triggering sync event.
-    const id = existing[0]?.id ?? createDenTypeId("connectorSyncEvent")
+    if (existing[0]) continue
 
-    type AutoImportSummary = Awaited<ReturnType<typeof maybeAutoImportGithubConnectorInstance>>
-    const startedAt = new Date()
-    let autoImportSummary: AutoImportSummary | null = null
-    let autoImportError: string | null = null
-    try {
-      autoImportSummary = await maybeAutoImportGithubConnectorInstance({
-        connectorInstance: row.instance,
-        connectorSyncEventId: id,
-        connectorTarget: row.target,
-      })
-    } catch (error) {
-      autoImportError = error instanceof Error ? error.message : String(error)
-      // Surface the failure instead of swallowing it silently so a sync that records an event
-      // but never creates a version is diagnosable.
-      logger.error("github connector auto-import failed", {
-        connector_target_id: row.target.id,
-        delivery_id: input.deliveryId,
-        error: autoImportError,
-      })
-    }
-
-    const completedAt = new Date()
-    const eventStatus = autoImportError
-      ? "failed" as const
-      : !autoImportSummary
-        ? "queued" as const
-        : !autoImportSummary.autoImported
-          ? "ignored" as const
-          : autoImportSummary.materializedConfigObjectCount > 0
-            ? "completed" as const
-            : "partial" as const
-
-    const summaryJson = {
-      // Inputs
-      deliveryId: input.deliveryId,
-      headSha: input.headSha,
-      installationId: input.installationId,
-      ref: input.ref,
-      repositoryFullName: input.repositoryFullName,
-      repositoryId: input.repositoryId,
-      // Outcome
-      outcome: eventStatus,
-      error: autoImportError,
-      autoImportApplied: autoImportSummary?.autoImported ?? false,
-      autoImportNewPlugins: autoImportSummary?.autoImportNewPlugins ?? null,
-      classification: autoImportSummary?.classification ?? null,
-      resolvedSourceRevisionRef: autoImportSummary?.sourceRevisionRef ?? null,
-      discoveredPluginCount: autoImportSummary?.discoveredPluginCount ?? 0,
-      createdMarketplace: autoImportSummary?.createdMarketplace ?? null,
-      createdPluginCount: autoImportSummary?.createdPluginCount ?? 0,
-      createdPlugins: autoImportSummary?.createdPlugins ?? [],
-      materializedConfigObjectCount: autoImportSummary?.materializedConfigObjectCount ?? 0,
-      materializedConfigObjects: autoImportSummary?.materializedConfigObjects ?? [],
-      // Timing
-      startedAt: startedAt.toISOString(),
-      completedAt: completedAt.toISOString(),
-      durationMs: completedAt.getTime() - startedAt.getTime(),
-    }
-
-    if (existing[0]) {
-      await db.update(ConnectorSyncEventTable).set({
-        completedAt,
-        externalEventRef: input.deliveryId,
-        startedAt,
-        status: eventStatus,
-        summaryJson,
-      }).where(eq(ConnectorSyncEventTable.id, id))
-    } else {
-      await db.insert(ConnectorSyncEventTable).values({
-        completedAt,
-        connectorInstanceId: row.instance.id,
-        connectorTargetId: row.target.id,
-        connectorType: "github",
-        eventType: "push",
-        externalEventRef: input.deliveryId,
-        id,
-        organizationId: row.instance.organizationId,
-        remoteId: input.repositoryFullName,
-        sourceRevisionRef: input.headSha,
-        startedAt,
-        status: eventStatus,
-        summaryJson,
-      })
-    }
+    const id = createDenTypeId("connectorSyncEvent")
+    await db.insert(ConnectorSyncEventTable).values({
+      connectorInstanceId: row.instance.id,
+      connectorTargetId: row.target.id,
+      connectorType: "github",
+      eventType: "push",
+      externalEventRef: input.deliveryId,
+      id,
+      organizationId: row.instance.organizationId,
+      remoteId: input.repositoryFullName,
+      sourceRevisionRef: input.headSha,
+      startedAt: new Date(),
+      status: "queued",
+      summaryJson: {
+        deliveryId: input.deliveryId,
+        headSha: input.headSha,
+        installationId: input.installationId,
+        ref: input.ref,
+        repositoryFullName: input.repositoryFullName,
+        repositoryId: input.repositoryId,
+      },
+    })
     queuedIds.push(id)
   }
 

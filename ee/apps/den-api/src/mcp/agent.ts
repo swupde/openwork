@@ -6,6 +6,7 @@ import { OrganizationTable } from "@openwork-ee/den-db/schema"
 import { normalizeDenTypeId } from "@openwork-ee/utils/typeid"
 import { openworkCloudMcpConnectionActionSchema } from "@openwork/types/den/mcp-connection-action"
 import type { Hono } from "hono"
+import type { RequestIdVariables } from "hono/request-id"
 import { z } from "zod"
 import { memberFacingMcpConnectionsEnabled } from "../capability-sources/external-mcp-rollout.js"
 import { publicRoute, tokenRoute } from "../middleware/index.js"
@@ -18,6 +19,8 @@ import { compareCapabilityMatches, SEARCH_CAPABILITIES_TOOL_NAME, searchCapabili
 import { executeExternalCapability, externalMcpSearchCoverageHint, parseExternalCapabilityName, resolveMcpMemberIdentity, searchExternalCapabilities, type ExternalCapabilityExecuteResult } from "./external-capabilities.js"
 import { executeMarketplaceCapability, listAccessibleMarketplaceSkillDescriptors, parseMarketplaceCapabilityName, searchMarketplaceCapabilities, type MarketplaceCapabilityObjectType, type RemoteSkillDescriptor } from "./marketplace-capabilities.js"
 import { resolvePublicOrigin } from "../capability-sources/generic-oauth.js"
+import { automationService } from "../automations/service.js"
+import { AGENT_AUTOMATION_INDEX_LIMIT, registerAgentAutomationResources } from "./automation-index.js"
 import { env } from "../env.js"
 import { isPlatformAdminUserId } from "../middleware/admin.js"
 import { executeAvailableAdminCapability, parseAdminCapabilityName, searchAvailableAdminCapabilities } from "./admin-capabilities.js"
@@ -26,6 +29,10 @@ import {
   listBuiltinSkillDescriptors,
   searchBuiltinSkillCapabilities,
 } from "./builtin-skills.js"
+import { executeNativeCapability, searchNativeCapabilities } from "./native-capabilities.js"
+import { externalToolContent, type AgentToolContentPart } from "./tool-content.js"
+
+export { externalToolContent } from "./tool-content.js"
 
 export const EXECUTE_CAPABILITY_TOOL_NAME = "execute_capability"
 const searchCapabilityTypeSchema = z.enum(["all", "api", "admin", "mcp", "marketplace", "skills"])
@@ -114,7 +121,7 @@ export const AGENT_MCP_INSTRUCTIONS = [
   "Capabilities include native Google Workspace operations (Gmail read/search, Calendar list/create, Drive search/read, and Gmail draft creation) executed with the signed-in member's organization credentials, plus any MCP connections the organization has added.",
   "Allowlisted platform admins can also discover namespaced OpenWork Admin capabilities through this same connection; other members cannot discover or execute them.",
   "Always call search_capabilities first with 2-4 keyword variants before concluding something is unavailable. Use execute_capability only with exact names returned by search_capabilities.",
-  "Built-in remote skills create-skill, add-to-marketplace, and add-user-to-marketplace are always listed in the skill index. Retrieve and follow the matching one by executing its exact capability; do not invent a local copy to access them.",
+  "Built-in remote skills create-skill, share-plugin, add-to-marketplace, and add-user-to-marketplace are always listed in the skill index. Retrieve and follow the matching one by executing its exact capability; do not invent a local copy to access them.",
   "For a request to add a public GitHub plugin to an organization marketplace, search for the marketplace list, GitHub plugin import preview, GitHub plugin marketplace import, and resolved marketplace detail capabilities. Preview first; do not recreate the plugin by hand.",
   "Before importing, confirm the target marketplace, selected skill/server keys, and who can use them. Do not choose one authentication type for every server: the import route resolves known presets and plugin declarations, while the request authType is only a fallback for unknown servers.",
   "After importing, retrieve the resolved marketplace detail and report each plugin's cloudReadiness. An import or plugin binding is not proof that an MCP connection is usable. Relay needs_admin_setup or needs_signin as the next human action instead of claiming the connection is ready.",
@@ -166,7 +173,7 @@ const EXECUTE_CAPABILITY_TIMEOUT_MESSAGE = `The capability call exceeded ${EXECU
 
 export type ExecuteCapabilityToolResult = {
   isError?: boolean
-  content: { text: string; type: "text" }[]
+  content: AgentToolContentPart[]
 }
 
 function textContent(text: string): { text: string; type: "text" }[] {
@@ -213,22 +220,6 @@ function unknownCapabilityText(name: string): string {
     error: "unknown_capability",
     message: `No capability named "${name}". Call search_capabilities to find a valid name.`,
   })
-}
-
-function isTextContent(value: unknown): value is { type: "text"; text: string } {
-  return typeof value === "object"
-    && value !== null
-    && "type" in value
-    && value.type === "text"
-    && "text" in value
-    && typeof value.text === "string"
-}
-
-function externalToolContent(result: unknown): { type: "text"; text: string }[] {
-  if (typeof result === "object" && result !== null && "content" in result && Array.isArray(result.content) && result.content.every(isTextContent)) {
-    return result.content
-  }
-  return textContent(JSON.stringify(result))
 }
 
 export function externalCapabilitySuccessToolResult(
@@ -364,7 +355,7 @@ export function registerAgentSkillResources(input: {
  * these two tools; the other ~127 operations are not individually callable
  * on this endpoint.
  */
-export function registerAgentMcpRoutes<T extends { Variables: Record<string, unknown> }>(app: Hono<T>) {
+export function registerAgentMcpRoutes<T extends { Variables: RequestIdVariables & Record<string, unknown> }>(app: Hono<T>) {
   app.get("/.well-known/oauth-protected-resource/mcp/agent", publicRoute, (c) =>
     c.json(protectedResourceMetadata(c.req.raw, "agent")))
   app.get("/mcp/agent/.well-known/oauth-protected-resource", publicRoute, (c) =>
@@ -430,6 +421,20 @@ export function registerAgentMcpRoutes<T extends { Variables: Record<string, unk
         member: memberIdentity,
         marketplaceEnabled: externalMcpConnectionsEnabled,
       })
+      // Owner-scoped: the index only ever carries this member's own
+      // Automations. Without a resolved member there is no owner to scope to,
+      // and a failure here must not take the whole connection down.
+      const automations = memberIdentity
+        ? await automationService.list({
+          organizationId: principal.organizationId,
+          ownerMemberId: memberIdentity.orgMembershipId,
+        }, { limit: AGENT_AUTOMATION_INDEX_LIMIT }).catch(() => null)
+        : null
+      registerAgentAutomationResources({
+        server,
+        items: automations?.items ?? [],
+        fetchedAt: Date.now(),
+      })
     }
 
     server.registerTool(
@@ -441,7 +446,7 @@ export function registerAgentMcpRoutes<T extends { Variables: Record<string, unk
           "there is no list of individually-named tools to browse. Always search first.",
           "Search covers native Google Workspace capabilities (Gmail, Calendar, Drive, Gmail drafts), org-connected external MCPs, and namespaced OpenWork Admin tools for allowlisted platform admins.",
           "Try 2-4 keyword variants before deciding a capability is unavailable.",
-          "Native API matches include pathParams, queryParams, hasBody, and bodySchema. External MCP matches include argumentsSchema, schemaDigest, and invocation.argumentsField.",
+          "Native API matches include a connector-namespaced name, pathParams, queryParams, hasBody, and bodySchema. External MCP matches include argumentsSchema, schemaDigest, and invocation.argumentsField.",
           "Built-in and marketplace skill matches return SKILL.md content when executed.",
         ].join(" "),
         annotations: SEARCH_CAPABILITIES_ANNOTATIONS,
@@ -457,6 +462,15 @@ export function registerAgentMcpRoutes<T extends { Variables: Record<string, unk
         const sourceFilter = searchCapabilitySourceFilter(type)
         const marketplaceObjectTypes = type === "skills" ? skillMarketplaceObjectTypes : undefined
         const restMatches = sourceFilter.api ? searchCapabilities(catalog, query, boundedLimit) : []
+        const nativeMatches = sourceFilter.api
+          ? await searchNativeCapabilities({
+            organizationId,
+            member: memberIdentity,
+            query,
+            catalog,
+            limit: boundedLimit,
+          })
+          : []
         const adminMatches = sourceFilter.admin
           ? await searchAvailableAdminCapabilities(await resolvePlatformAdmin(), query, boundedLimit)
           : []
@@ -490,7 +504,7 @@ export function registerAgentMcpRoutes<T extends { Variables: Record<string, unk
             enabled: externalMcpConnectionsEnabled,
           })
           : []
-        const matches = [...restMatches, ...adminMatches, ...builtinSkillMatches, ...externalMatches, ...marketplaceMatches]
+        const matches = [...restMatches, ...nativeMatches, ...adminMatches, ...builtinSkillMatches, ...externalMatches, ...marketplaceMatches]
           .sort(compareCapabilityMatches)
           .slice(0, boundedLimit)
         return capabilitySearchToolResult(matches, externalCoverageHint)
@@ -559,6 +573,20 @@ export function registerAgentMcpRoutes<T extends { Variables: Record<string, unk
               // what McpServer's own tool callback contract requires.
               return externalCapabilitySuccessToolResult(result)
             }
+
+            const nativeResult = await executeNativeCapability({
+              app: app as unknown as Hono,
+              env: c.env,
+              name,
+              organizationId,
+              member: memberIdentity,
+              catalog,
+              principal,
+              path,
+              query,
+              body,
+            })
+            if (nativeResult) return nativeResult
 
             const marketplace = parseMarketplaceCapabilityName(name)
             if (marketplace) {

@@ -1,7 +1,9 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 
 import {
+  clearDenSession,
   DenApiError,
+  ensureDenActiveOrganization,
   isDenSessionRevokedError,
   mergePassiveDenSettings,
   readDenSettings,
@@ -10,6 +12,8 @@ import {
 import { resolveDenAuthFailureStatus } from "../src/react-app/domains/cloud/den-auth-provider";
 
 const originalWindow = globalThis.window;
+const originalFetch = globalThis.fetch;
+const originalDev = process.env.DEV;
 
 function memoryStorage(): Storage {
   const map = new Map<string, string>();
@@ -39,6 +43,85 @@ afterEach(() => {
   Object.defineProperty(globalThis, "window", {
     configurable: true,
     value: originalWindow,
+  });
+  Object.defineProperty(globalThis, "fetch", {
+    configurable: true,
+    value: originalFetch,
+  });
+  if (originalDev === undefined) {
+    delete process.env.DEV;
+  } else {
+    process.env.DEV = originalDev;
+  }
+});
+
+function stubWindow() {
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: {
+      localStorage: memoryStorage(),
+      dispatchEvent: () => true,
+    },
+  });
+}
+
+describe("active organization drop tripwire", () => {
+  test("warns with a recorded stack for an unflagged drop", () => {
+    process.env.DEV = "true";
+    stubWindow();
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+
+    writeDenSettings({ baseUrl: "https://den.test", activeOrgId: "org_stored" }, { persistBootstrap: false });
+    writeDenSettings({ baseUrl: "https://den.test", activeOrgId: null }, { persistBootstrap: false });
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(window.__openworkOrgDropWarnings).toHaveLength(1);
+    expect(window.__openworkOrgDropWarnings?.[0]).toContain("activeOrgId dropped unexpectedly from org_stored");
+    expect(window.__openworkOrgDropWarnings?.[0]).toContain("\n");
+    warn.mockRestore();
+  });
+
+  test("stays silent for opted-out clears and sign-out", () => {
+    process.env.DEV = "true";
+    stubWindow();
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+
+    writeDenSettings({ baseUrl: "https://den.test", activeOrgId: "org_stored" }, { persistBootstrap: false });
+    writeDenSettings(
+      { baseUrl: "https://den.test", activeOrgId: null },
+      { persistBootstrap: false, intentionalActiveOrgClear: true },
+    );
+    writeDenSettings({ baseUrl: "https://den.test", activeOrgId: "org_stored" }, { persistBootstrap: false });
+    clearDenSession();
+
+    expect(warn).not.toHaveBeenCalled();
+    expect(window.__openworkOrgDropWarnings).toBeUndefined();
+    warn.mockRestore();
+  });
+
+  test("stays silent when no organization was set", () => {
+    process.env.DEV = "true";
+    stubWindow();
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+
+    writeDenSettings({ baseUrl: "https://den.test", activeOrgId: null }, { persistBootstrap: false });
+
+    expect(warn).not.toHaveBeenCalled();
+    expect(window.__openworkOrgDropWarnings).toBeUndefined();
+    warn.mockRestore();
+  });
+
+  test("is inert outside development builds", () => {
+    delete process.env.DEV;
+    stubWindow();
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+
+    writeDenSettings({ baseUrl: "https://den.test", activeOrgId: "org_stored" }, { persistBootstrap: false });
+    writeDenSettings({ baseUrl: "https://den.test", activeOrgId: null }, { persistBootstrap: false });
+
+    expect(warn).not.toHaveBeenCalled();
+    expect(window.__openworkOrgDropWarnings).toBeUndefined();
+    warn.mockRestore();
   });
 });
 
@@ -147,6 +230,43 @@ describe("mergePassiveDenSettings", () => {
     expect(window.localStorage.getItem("openwork.den.activeOrgId")).toBe("org_stored");
     expect(window.localStorage.getItem("openwork.den.activeOrgSlug")).toBe("stored-org");
     expect(window.localStorage.getItem("openwork.den.activeOrgName")).toBe("Stored Org");
+  });
+});
+
+describe("ensureDenActiveOrganization", () => {
+  test("preserves the selected organization when the server temporarily returns none", async () => {
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        localStorage: memoryStorage(),
+        dispatchEvent: () => true,
+      },
+    });
+    writeDenSettings({
+      baseUrl: "https://den.test",
+      authToken: "tok_stored",
+      activeOrgId: "org_stored",
+      activeOrgSlug: "stored-org",
+      activeOrgName: "Stored Org",
+    });
+    Object.defineProperty(globalThis, "fetch", {
+      configurable: true,
+      value: (async () => new Response(JSON.stringify({
+        orgs: [],
+        activeOrgId: null,
+        activeOrgSlug: null,
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })) satisfies typeof fetch,
+    });
+
+    await expect(ensureDenActiveOrganization()).resolves.toBeNull();
+    expect(readDenSettings()).toMatchObject({
+      activeOrgId: "org_stored",
+      activeOrgSlug: "stored-org",
+      activeOrgName: "Stored Org",
+    });
   });
 });
 

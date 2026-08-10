@@ -10,6 +10,7 @@ import {
   FileText,
   Globe,
   Home,
+  LibraryBig,
   LogOut,
   Menu,
   MessageSquare,
@@ -19,6 +20,7 @@ import {
   Sparkles,
   type LucideIcon,
   Users,
+  Wrench,
   X,
 } from "lucide-react";
 import { useDenFlow } from "../../_providers/den-flow-provider";
@@ -36,9 +38,11 @@ import {
   getOrgAccessFlags,
   getIntegrationsRoute,
   getInferenceRoute,
+  getLibraryRoute,
   getMcpConnectionsRoute,
   getManagedBrandIconUrl,
   getMembersRoute,
+  getToolTesterRoute,
   getYourConnectionsRoute,
   getOrgDashboardRoute,
   getOrgSettingsRoute,
@@ -267,6 +271,9 @@ function getDashboardPageTitle(pathname: string, orgSlug: string | null) {
   if (pathname.startsWith(getWebRoute(orgSlug))) {
     return "Web";
   }
+  if (pathname.startsWith(getLibraryRoute(orgSlug))) {
+    return "Library";
+  }
   if (pathname.startsWith(getPluginsRoute(orgSlug))) {
     return "Plugins";
   }
@@ -281,6 +288,9 @@ function getDashboardPageTitle(pathname: string, orgSlug: string | null) {
   }
   if (pathname.startsWith(getYourConnectionsRoute(orgSlug))) {
     return "Your Connections";
+  }
+  if (pathname.startsWith(getToolTesterRoute(orgSlug))) {
+    return "Tool Tester";
   }
   if (pathname.startsWith(getBillingRoute(orgSlug))) {
     return "Billing";
@@ -359,7 +369,7 @@ export function OrgDashboardShell({ children }: { children: React.ReactNode }) {
   // both config and org context load.
   const showWeb = runtimeConfigLoaded && orgContext?.capabilities.cloud === true;
 
-  // Top-level rows: Dashboard, optional Your Connections, Extensions, Models,
+  // Top-level rows: Dashboard, Library, optional Your Connections, Extensions, Models,
   // Members, Analytics, Settings. Everything tool-shaped groups under
   // Extensions starts with the Marketplace, followed by its source and
   // management surfaces; model config groups under
@@ -427,6 +437,11 @@ export function OrgDashboardShell({ children }: { children: React.ReactNode }) {
       label: "Dashboard",
       icon: Home,
     },
+    {
+      href: activeOrg ? getLibraryRoute(activeOrg.slug) : "#",
+      label: "Library",
+      icon: LibraryBig,
+    },
     ...(mcpConnectionsEnabled
       ? [{
           // Member-visible (not admin-gated): where each person connects their
@@ -435,6 +450,13 @@ export function OrgDashboardShell({ children }: { children: React.ReactNode }) {
           label: "Your Connections",
           icon: Plug,
           badge: "Beta",
+        }]
+      : []),
+    ...(mcpConnectionsEnabled && access.isAdmin && activeOrg
+      ? [{
+          href: getToolTesterRoute(activeOrg.slug),
+          label: "Tool Tester",
+          icon: Wrench,
         }]
       : []),
     ...(showWeb

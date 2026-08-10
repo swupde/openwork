@@ -27,6 +27,10 @@ import {
   type ExternalMcpDiagnostic,
 } from "../capability-sources/external-mcp-diagnostics.js"
 import { getConnectedAccount } from "../capability-sources/oauth-credentials.js"
+import {
+  evaluateToolPolicy,
+  isToolDisabled,
+} from "../capability-sources/external-mcp-tool-policy.js"
 import { db } from "../db.js"
 import { listTeamsForMember } from "../orgs.js"
 import { openworkOrganizationConnectionsUrl, openworkYourConnectionsUrl } from "./connection-navigation.js"
@@ -190,6 +194,13 @@ export type ExternalConnectionStatus = {
     retry: "search_capabilities"
     url?: string
   }
+}
+
+type ConnectionStatusIdentity = {
+  id: string
+  name: string
+  authType: ExternalConnectionStatus["authType"]
+  credentialMode: ExternalConnectionStatus["credentialMode"]
 }
 
 const ERROR_MESSAGE_LIMIT = 300
@@ -413,7 +424,7 @@ function providerAuthorizationConnectionStatus(input: {
 }
 
 export function buildExternalConnectionStatus(input: {
-  connection: Pick<ExternalMcpConnectionRow, "id" | "name" | "authType" | "credentialMode">
+  connection: ConnectionStatusIdentity
   state: ExternalConnectionStatus["state"]
   errorCode: ExternalConnectionStatus["errorCode"]
   message: string
@@ -624,6 +635,7 @@ async function probeExternalMcpConnection(input: {
     mergeBoundedExternalCapabilityMatches(matches, [match], input.limit)
   }
   const connection = input.connection
+  if (connection.toolPolicy?.allDisabled) return matches
   if (connection.oauthIssuerReviewRequiredAt) {
     const nameTokens = tokenize(connection.name)
     const score = scoreText(nameTokens, nameTokens, input.queryTokens)
@@ -735,6 +747,7 @@ async function probeExternalMcpConnection(input: {
   }
 
   for (const tool of tools) {
+    if (isToolDisabled(connection.toolPolicy, tool.name)) continue
     const summary = tool.description ?? tool.title ?? tool.name
     const nameTokens = tokenize(`${connection.name} ${tool.name}`)
     const summaryTokens = tokenize(summary)
@@ -847,6 +860,7 @@ export type ExternalCapabilityExecuteResult =
         | "connection_failed"
         | "provider_error"
         | "invalid_capability_arguments"
+        | "policy_blocked"
       message: string
       referenceId?: string
       retryable?: boolean
@@ -971,6 +985,9 @@ export async function executeExternalCapability(input: {
   if (!connection) {
     return { ok: false, error: "unknown_capability", message: `No external MCP connection "${input.connectionId}" in this organization.` }
   }
+  if (connection.kind !== "external_mcp") {
+    return { ok: false, error: "unknown_capability", message: `Connection "${input.connectionId}" is a native provider connector and does not expose MCP tools.` }
+  }
 
   const canUse = await memberCanUseExternalMcpConnection({
     connectionId,
@@ -979,6 +996,18 @@ export async function executeExternalCapability(input: {
   })
   if (!canUse) {
     return { ok: false, error: "forbidden", message: `You have not been granted access to "${connection.name}".` }
+  }
+
+  const policyDecision = evaluateToolPolicy(connection.toolPolicy, input.toolName)
+  if (policyDecision.blocked) {
+    return {
+      ok: false,
+      error: "policy_blocked",
+      capability: buildExternalCapabilityName(connectionId, input.toolName),
+      message: `${input.toolName} is disabled for your organization${policyDecision.disabledBy ? ` by ${policyDecision.disabledBy}` : ""}.`,
+      sameArgumentsRetryable: false,
+      retry: { action: "search_capabilities", searchRequired: true },
+    }
   }
 
   if (connection.oauthIssuerReviewRequiredAt) {
