@@ -418,13 +418,35 @@ export function McpConnectionsScreen() {
   }
 
   function pollUntilConnected(connectionId: string) {
+    stopPolling();
     setPollingConnectionId(connectionId);
     const startedAt = Date.now();
+    let requestInFlight = false;
     pollTimer.current = setInterval(async () => {
-      const result = await refetch();
-      const connection = result.data?.find((entry) => entry.id === connectionId);
-      if (connection?.connected || Date.now() - startedAt > OAUTH_POLL_TIMEOUT_MS) {
+      if (requestInFlight) return;
+      requestInFlight = true;
+      try {
+        const result = await refetch();
+        const connection = result.data?.find((entry) => entry.id === connectionId);
+        if (connection?.connectedForMe) {
+          stopPolling();
+          return;
+        }
+        if (Date.now() - startedAt > OAUTH_POLL_TIMEOUT_MS) {
+          setConnectionActionError({
+            connectionId,
+            message: "Authorization did not finish. Return to the browser window, complete the sign-in, then select Connect again.",
+          });
+          stopPolling();
+        }
+      } catch {
+        setConnectionActionError({
+          connectionId,
+          message: "Couldn't confirm the connection. Check your network, then select Connect again.",
+        });
         stopPolling();
+      } finally {
+        requestInFlight = false;
       }
     }, OAUTH_POLL_INTERVAL_MS);
   }

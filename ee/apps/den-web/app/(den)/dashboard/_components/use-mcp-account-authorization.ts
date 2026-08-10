@@ -10,6 +10,8 @@ import {
 
 const OAUTH_POLL_INTERVAL_MS = 2000;
 const OAUTH_POLL_TIMEOUT_MS = 90_000;
+const OAUTH_POLL_TIMEOUT_MESSAGE = "Authorization did not finish. Return to the browser window, complete the sign-in, then select Connect again.";
+const OAUTH_POLL_REQUEST_FAILED_MESSAGE = "Couldn't confirm the connection. Check your network, then select Connect again.";
 
 export function useMcpAccountAuthorization(onConnected?: () => void) {
   const { refetch } = useMcpConnections("usable");
@@ -46,15 +48,26 @@ export function useMcpAccountAuthorization(onConnected?: () => void) {
     stopPolling();
     setPollingConnectionId(connectionId);
     const startedAt = Date.now();
+    let requestInFlight = false;
     pollTimer.current = setInterval(async () => {
-      const result = await refetch();
-      const connection = result.data?.find((entry) => entry.id === connectionId);
-      if (connection?.connectedForMe && connection.needsReconnect !== true) {
-        finishConnected();
-        return;
-      }
-      if (Date.now() - startedAt > OAUTH_POLL_TIMEOUT_MS) {
+      if (requestInFlight) return;
+      requestInFlight = true;
+      try {
+        const result = await refetch();
+        const connection = result.data?.find((entry) => entry.id === connectionId);
+        if (connection?.connectedForMe && connection.needsReconnect !== true) {
+          finishConnected();
+          return;
+        }
+        if (Date.now() - startedAt > OAUTH_POLL_TIMEOUT_MS) {
+          stopPolling();
+          setError({ connectionId, message: OAUTH_POLL_TIMEOUT_MESSAGE });
+        }
+      } catch {
         stopPolling();
+        setError({ connectionId, message: OAUTH_POLL_REQUEST_FAILED_MESSAGE });
+      } finally {
+        requestInFlight = false;
       }
     }, OAUTH_POLL_INTERVAL_MS);
   }

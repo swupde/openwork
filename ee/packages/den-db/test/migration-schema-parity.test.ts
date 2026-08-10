@@ -317,7 +317,7 @@ async function applyStatements(connection: mysql.Connection, statements: string[
 async function schemaColumnLines(connection: mysql.Connection) {
   const rows = await queryRecords(
     connection,
-    `SELECT table_name AS table_name, column_name AS column_name, column_type AS column_type, is_nullable AS is_nullable
+    `SELECT table_name AS table_name, column_name AS column_name, column_type AS column_type, is_nullable AS is_nullable, column_default AS column_default
      FROM information_schema.COLUMNS
      WHERE table_schema = DATABASE() AND table_name <> '__drizzle_migrations'
      ORDER BY table_name, ordinal_position`,
@@ -328,7 +328,10 @@ async function schemaColumnLines(connection: mysql.Connection) {
     const columnName = stringField(row, "column_name")
     const columnType = stringField(row, "column_type")
     const isNullable = stringField(row, "is_nullable")
-    return `${tableName}.${columnName}: ${columnType} ${isNullable}`
+    // Drizzle exports `now()` while MySQL introspection returns CURRENT_TIMESTAMP(3).
+    // Parity needs to assert whether a default exists, not vendor-specific spelling.
+    const hasDefault = row.column_default !== null && row.column_default !== undefined
+    return `${tableName}.${columnName}: ${columnType} ${isNullable} DEFAULT ${hasDefault ? "SET" : "NONE"}`
   })
 }
 

@@ -8,6 +8,9 @@ const screenPath = fileURLToPath(
 const dataPath = fileURLToPath(
   new URL("../app/(den)/dashboard/_components/mcp-connections-data.tsx", import.meta.url),
 )
+const accountAuthorizationPath = fileURLToPath(
+  new URL("../app/(den)/dashboard/_components/use-mcp-account-authorization.ts", import.meta.url),
+)
 
 describe("MCP OAuth callback compatibility UI contract", () => {
   test("keeps callback compatibility out of connection rows", () => {
@@ -28,7 +31,7 @@ describe("MCP OAuth callback compatibility UI contract", () => {
   test("keeps connection rows focused on connect, disconnect, and a compact actions menu", () => {
     const screen = readFileSync(screenPath, "utf8")
 
-    expect(screen).toContain('const canConnectOAuth = !needsAdminSetup && !connection.issuerReviewRequired && connection.authType === "oauth"')
+    expect(screen).toContain('const canConnectOAuth = !isLegacyGoogleConnection && !setupRequired && !connection.issuerReviewRequired && connection.authType === "oauth"')
     expect(screen).toContain('isPerMember ? !connection.connectedForMe : !connection.connected')
     expect(screen).toContain('aria-haspopup="menu"')
     expect(screen).toContain('role="menu"')
@@ -70,5 +73,14 @@ describe("MCP OAuth callback compatibility UI contract", () => {
     expect(screen).not.toContain("DEN_ENABLE_ENTERPRISE_MCP_CLIENT")
     expect(data).not.toContain("DEN_ENABLE_ENTERPRISE_MCP_CLIENT")
     expect(data).not.toContain("enterpriseRuntime")
+  })
+
+  test("ends an incomplete member OAuth flow with an actionable recovery message", () => {
+    const accountAuthorization = readFileSync(accountAuthorizationPath, "utf8")
+    const screen = readFileSync(screenPath, "utf8")
+
+    expect(accountAuthorization).toContain("Authorization did not finish. Return to the browser window, complete the sign-in, then select Connect again.")
+    expect(screen).toContain("connection?.connectedForMe")
+    expect(screen).toContain("Couldn't confirm the connection. Check your network, then select Connect again.")
   })
 })

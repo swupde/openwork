@@ -1628,6 +1628,7 @@ export type ExternalMcpConnectedAccountChanges = {
   tokenType?: string | null
   expiresAt?: Date | null
   pendingCodeVerifier?: string | null
+  connectedAt?: Date | null
 }
 
 function connectedAccountChanges(input: ExternalMcpConnectedAccountChanges) {
@@ -1639,6 +1640,7 @@ function connectedAccountChanges(input: ExternalMcpConnectedAccountChanges) {
     ...(input.tokenType !== undefined ? { tokenType: input.tokenType } : {}),
     ...(input.expiresAt !== undefined ? { expiresAt: input.expiresAt } : {}),
     ...(input.pendingCodeVerifier !== undefined ? { pendingCodeVerifier: input.pendingCodeVerifier } : {}),
+    ...(input.connectedAt !== undefined ? { connectedAt: input.connectedAt } : {}),
   }
 }
 
@@ -1708,6 +1710,7 @@ export async function upsertConnectedAccountForExternalMcpIdentity(input: {
       tokenType: input.changes.tokenType ?? null,
       expiresAt: input.changes.expiresAt ?? null,
       pendingCodeVerifier: input.changes.pendingCodeVerifier ?? null,
+      connectedAt: input.changes.connectedAt ?? null,
     })
     return true
   })

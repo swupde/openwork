@@ -920,6 +920,48 @@ test("per-member OAuth reads JSON scopes returned as text by MySQL", async () =>
   })
 })
 
+test("per-member OAuth marks the account connected only after the token exchange", async () => {
+  const { ExternalMcpOAuthProvider } = await import("../src/capability-sources/external-mcp-client.js")
+  const { ExternalMcpDiagnosticTracker } = await import("../src/capability-sources/external-mcp-diagnostics.js")
+  const seed = await seedOrganization("per-member-pending-oauth")
+  const connection = await createGrantedConnection(seed, {
+    name: "Per-member pending OAuth",
+    authType: "oauth",
+    credentialMode: "per_member",
+    url: "https://mcp.example.test/mcp",
+  })
+  const provider = new ExternalMcpOAuthProvider(
+    connection,
+    `${redirectUriBase}/callback`,
+    "signed-state",
+    { orgMembershipId: seed.memberId },
+    new ExternalMcpDiagnosticTracker("req_per_member_pending_oauth"),
+  )
+
+  await provider.saveCodeVerifier("pending-code-verifier")
+  let account = (await db
+    .select()
+    .from(schema.ConnectedAccountTable)
+    .where(eq(schema.ConnectedAccountTable.orgMembershipId, seed.memberId)))[0]
+  expect(account).toMatchObject({
+    accessToken: null,
+    pendingCodeVerifier: "pending-code-verifier",
+    connectedAt: null,
+  })
+
+  await provider.codeVerifier()
+  await provider.saveTokens({ access_token: "member-access-token", token_type: "Bearer" })
+  account = (await db
+    .select()
+    .from(schema.ConnectedAccountTable)
+    .where(eq(schema.ConnectedAccountTable.orgMembershipId, seed.memberId)))[0]
+  expect(account).toMatchObject({
+    accessToken: "member-access-token",
+    pendingCodeVerifier: null,
+    connectedAt: expect.any(Date),
+  })
+})
+
 test("the 16-connection fanout reports incomplete coverage when the only match is connection 17", async () => {
   if (!slackServer || !needleServer) throw new Error("Coverage MCP servers were not started")
   const { externalMcpSearchCoverageHint } = await import("../src/mcp/external-capabilities.js")
