@@ -88,7 +88,7 @@ jobs:
 
   den-connection-contracts:
     name: Verify Den connection contracts
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: ubuntu-latest
     services:
       mysql:
         image: mysql:8
