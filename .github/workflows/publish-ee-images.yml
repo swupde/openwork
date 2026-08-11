@@ -86,10 +86,72 @@ jobs:
           echo "chart_version=$chart_version" >> "$GITHUB_OUTPUT"
           echo "publish=$publish" >> "$GITHUB_OUTPUT"
 
+  den-connection-contracts:
+    name: Verify Den connection contracts
+    runs-on: blacksmith-4vcpu-ubuntu-2204
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: repro
+          MYSQL_DATABASE: openwork_connection_contracts
+        ports:
+          - 33062:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -prepro"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      DATABASE_URL: mysql://root:repro@127.0.0.1:33062/openwork_connection_contracts
+      DEN_DB_ENCRYPTION_KEY: ci-den-db-encryption-key-value-123456
+      DEN_DB_MYSQL_TEST_URL: mysql://root:repro@127.0.0.1:33062/mysql
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.4.0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.10
+
+      - name: Install focused dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts --filter @openwork-ee/den-api...
+
+      - name: Verify migration and schema contracts
+        run: pnpm --filter @openwork-ee/den-db test
+
+      - name: Bootstrap the Den API contract database
+        # Mirror the empty-production install path. db:push is intentionally
+        # development-only and can mask some Drizzle index errors.
+        run: pnpm --filter @openwork-ee/den-db db:bootstrap
+
+      - name: Verify member OAuth persistence and recovery
+        run: |
+          # These suites seed process-level OAuth endpoints. Keep them in
+          # separate Bun processes so their fake providers cannot race while
+          # the Den environment module is initialized.
+          bun test ee/apps/den-api/test/native-provider-connections.test.ts
+          bun test ee/apps/den-api/test/enterprise-mcp-oauth-persistence.test.ts
+          bun test \
+            ee/apps/den-api/test/external-capabilities-search-divergence.test.ts \
+            --test-name-pattern "per-member OAuth marks the account connected only after the token exchange"
+          bun test ee/apps/den-web/tests/mcp-oauth-callback-migration.test.ts
+
   helm-chart:
     name: Validate Helm chart
     runs-on: ubuntu-latest
-    needs: artifact-version
+    needs: [artifact-version, den-connection-contracts]
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -131,7 +193,7 @@ jobs:
   ee-images:
     name: Build ${{ matrix.image }}
     runs-on: ubuntu-latest
-    needs: artifact-version
+    needs: [artifact-version, den-connection-contracts]
     strategy:
       fail-fast: false
       matrix:
