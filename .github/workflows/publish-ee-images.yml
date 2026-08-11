@@ -128,13 +128,13 @@ jobs:
       - name: Install focused dependencies
         run: pnpm install --frozen-lockfile --ignore-scripts --filter @openwork-ee/den-api...
 
-      - name: Verify migration and schema contracts
-        run: pnpm --filter @openwork-ee/den-db test
-
       - name: Bootstrap the Den API contract database
         # Mirror the empty-production install path. db:push is intentionally
         # development-only and can mask some Drizzle index errors.
         run: pnpm --filter @openwork-ee/den-db db:bootstrap
+
+      - name: Verify migration and schema contracts
+        run: pnpm --filter @openwork-ee/den-db test
 
       - name: Verify member OAuth persistence and recovery
         run: |
