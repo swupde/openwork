@@ -40,6 +40,7 @@ const EnvSchema = z.object({
   DEN_SINGLE_ORG_SLUG: z.string().optional(),
   DEN_SINGLE_ORG_OWNER_EMAILS: z.string().optional(),
   DEN_SINGLE_ORG_ALLOW_PUBLIC_SIGNUP: z.string().optional(),
+  DEN_DEFAULT_INVITEE_TEAM_NAME: z.string().optional(),
   DEN_REQUIRE_EMAIL_VERIFICATION: z.string().optional(),
   DEN_PASSWORD_BREACH_SCREENING_ENABLED: z.string().optional(),
   RESEND_API_KEY: z.string().optional(),
@@ -518,6 +519,7 @@ export const env = {
     ownerEmails: splitCsv(parsed.DEN_SINGLE_ORG_OWNER_EMAILS)
       .map((email) => email.toLowerCase()),
   },
+  defaultInviteeTeamName: optionalString(parsed.DEN_DEFAULT_INVITEE_TEAM_NAME),
   port,
   workerProxyPort: Number(parsed.WORKER_PROXY_PORT ?? "8789"),
   corsOrigins,

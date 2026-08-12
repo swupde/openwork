@@ -11,6 +11,7 @@ function seedRequiredEnv() {
   process.env.BETTER_AUTH_URL = process.env.BETTER_AUTH_URL ?? API_ORIGIN
   process.env.CORS_ORIGINS = process.env.CORS_ORIGINS ?? API_ORIGIN
   process.env.OPENWORK_DEV_MODE = "1"
+  process.env.DEN_DEFAULT_INVITEE_TEAM_NAME = "Invitation Lifecycle Team"
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -87,6 +88,11 @@ beforeAll(async () => {
     name: "Invitation Lifecycle Hardening",
     slug: `invitation-lifecycle-${organizationId}`,
   })
+  await db.insert(schema.TeamTable).values({
+    id: teamId,
+    organizationId,
+    name: "Invitation Lifecycle Team",
+  })
   await db.insert(schema.MemberTable).values([
     {
       id: ownerMemberId,
@@ -130,11 +136,6 @@ beforeAll(async () => {
     orgMemberId: ownerMemberId,
     inviteToken: originalInviteToken,
     expiresAt: new Date(Date.now() - 60_000),
-  })
-  await db.insert(schema.TeamTable).values({
-    id: teamId,
-    organizationId,
-    name: "Invitation Lifecycle Team",
   })
   await db.insert(schema.TeamMemberTable).values({
     id: teamMemberId,
@@ -204,6 +205,7 @@ test("resending an expired invite refreshes its pending member and assignments i
   expect(invitations[0]?.id).toBe(invitationId)
   expect(invitations[0]?.inviteToken).not.toBe(originalInviteToken)
   expect(invitations[0]?.expiresAt.getTime()).toBeGreaterThan(Date.now())
+  expect(invitations[0]?.teamId).toBe(teamId)
 
   const pendingMembers = await db
     .select()
@@ -223,6 +225,135 @@ test("resending an expired invite refreshes its pending member and assignments i
     .where(drizzle.eq(schema.TeamMemberTable.orgMembershipId, invitedMemberId))
   expect(teamMembers).toHaveLength(1)
   expect(teamMembers[0]?.id).toBe(teamMemberId)
+})
+
+test("a new invitation joins the configured default team when accepted", async () => {
+  const email = `default-team-${organizationId}@test.local`
+  const userId = createDenTypeId("user")
+  const sessionId = createDenTypeId("session")
+  const sessionToken = `default-team-${sessionId}`
+
+  await db.insert(schema.AuthUserTable).values({
+    id: userId,
+    name: "Default Team Member",
+    email,
+    emailVerified: true,
+  })
+  await db.insert(schema.AuthSessionTable).values({
+    id: sessionId,
+    userId,
+    activeOrganizationId: null,
+    token: sessionToken,
+    expiresAt: new Date(Date.now() + 60_000),
+  })
+
+  const betterAuthSecret = process.env.BETTER_AUTH_SECRET
+  if (!betterAuthSecret) {
+    throw new Error("BETTER_AUTH_SECRET is required")
+  }
+  const cookie = await serializeSignedCookie(
+    "better-auth.session_token",
+    sessionToken,
+    betterAuthSecret,
+  )
+
+  const inviteResponse = await app.fetch(new Request(`${API_ORIGIN}/v1/invitations`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      cookie: ownerCookie,
+      origin: API_ORIGIN,
+    },
+    body: JSON.stringify({ email, role: "member" }),
+  }))
+  const invitePayload: unknown = await inviteResponse.json()
+
+  expect(inviteResponse.status).toBe(201)
+  expect(isRecord(invitePayload) && typeof invitePayload.inviteToken === "string").toBe(true)
+  if (!isRecord(invitePayload) || typeof invitePayload.inviteToken !== "string") {
+    throw new Error("Invitation response did not contain an invite token")
+  }
+
+  const invitations = await db
+    .select()
+    .from(schema.InvitationTable)
+    .where(drizzle.eq(schema.InvitationTable.email, email))
+  expect(invitations).toHaveLength(1)
+  expect(invitations[0]?.teamId).toBe(teamId)
+
+  const acceptResponse = await app.fetch(new Request(`${API_ORIGIN}/v1/orgs/invitations/accept`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      cookie,
+      origin: API_ORIGIN,
+    },
+    body: JSON.stringify({ id: invitePayload.inviteToken }),
+  }))
+  expect(acceptResponse.status).toBe(200)
+
+  const members = await db
+    .select({ id: schema.MemberTable.id })
+    .from(schema.MemberTable)
+    .where(drizzle.and(
+      drizzle.eq(schema.MemberTable.organizationId, organizationId),
+      drizzle.eq(schema.MemberTable.userId, userId),
+      drizzle.isNull(schema.MemberTable.removedAt),
+    ))
+  expect(members).toHaveLength(1)
+
+  const teamMembers = await db
+    .select()
+    .from(schema.TeamMemberTable)
+    .where(drizzle.and(
+      drizzle.eq(schema.TeamMemberTable.teamId, teamId),
+      drizzle.eq(schema.TeamMemberTable.orgMembershipId, members[0]!.id),
+    ))
+  expect(teamMembers).toHaveLength(1)
+
+  await db.delete(schema.TeamMemberTable).where(drizzle.eq(schema.TeamMemberTable.orgMembershipId, members[0]!.id))
+  await db.delete(schema.AuthSessionTable).where(drizzle.eq(schema.AuthSessionTable.id, sessionId))
+  await db.delete(schema.MemberTable).where(drizzle.eq(schema.MemberTable.id, members[0]!.id))
+  await db.delete(schema.InvitationTable).where(drizzle.eq(schema.InvitationTable.email, email))
+  await db.delete(schema.AuthUserTable).where(drizzle.eq(schema.AuthUserTable.id, userId))
+})
+
+test("a missing configured default team blocks the invitation instead of silently omitting access", async () => {
+  const email = `missing-default-team-${organizationId}@test.local`
+  await db
+    .update(schema.TeamTable)
+    .set({ name: "Temporarily Renamed Invitation Team" })
+    .where(drizzle.eq(schema.TeamTable.id, teamId))
+
+  try {
+    const response = await app.fetch(new Request(`${API_ORIGIN}/v1/invitations`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        cookie: ownerCookie,
+        origin: API_ORIGIN,
+      },
+      body: JSON.stringify({ email, role: "member" }),
+    }))
+    const payload: unknown = await response.json()
+
+    expect(response.status).toBe(503)
+    expect(payload).toEqual({
+      error: "default_invitee_team_unavailable",
+      message: "The configured default invitee team 'Invitation Lifecycle Team' was not found in this organization.",
+    })
+
+    const invitations = await db
+      .select({ id: schema.InvitationTable.id })
+      .from(schema.InvitationTable)
+      .where(drizzle.eq(schema.InvitationTable.email, email))
+    expect(invitations).toHaveLength(0)
+  } finally {
+    await db
+      .update(schema.TeamTable)
+      .set({ name: "Invitation Lifecycle Team" })
+      .where(drizzle.eq(schema.TeamTable.id, teamId))
+  }
 })
 
 test("concurrent invite requests converge on one pending invitation and one usable token", async () => {

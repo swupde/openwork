@@ -1,11 +1,12 @@
 import { and, desc, eq, isNull } from "@openwork-ee/den-db/drizzle"
-import { AuthUserTable, InvitationTable, MemberTable, OrganizationTable } from "@openwork-ee/den-db/schema"
+import { AuthUserTable, InvitationTable, MemberTable, OrganizationTable, TeamTable } from "@openwork-ee/den-db/schema"
 import { createDenTypeId, normalizeDenTypeId } from "@openwork-ee/utils/typeid"
 import type { Hono } from "hono"
 import { describeRoute } from "hono-openapi"
 import { z } from "zod"
 import { ORGANIZATION_AUDIT_ACTIONS, recordOrganizationAuditEvent } from "../../audit-events.js"
 import { db } from "../../db.js"
+import { env } from "../../env.js"
 import { jsonValidator, orgRoleRoute, paramValidator } from "../../middleware/index.js"
 import { denTypeIdSchema, forbiddenSchema, invalidRequestSchema, jsonResponse, notFoundSchema, successSchema, unauthorizedSchema } from "../../openapi.js"
 import { appLogger } from "../../observability/logger.js"
@@ -60,6 +61,11 @@ const invitationNotPendingSchema = z.object({
   status: z.string(),
 }).meta({ ref: "InvitationNotPendingError" })
 
+const defaultInviteeTeamUnavailableSchema = z.object({
+  error: z.literal("default_invitee_team_unavailable"),
+  message: z.string(),
+}).meta({ ref: "DefaultInviteeTeamUnavailableError" })
+
 type InvitationId = typeof InvitationTable.$inferSelect.id
 
 const orgInvitationParamsSchema = idParamSchema("invitationId", "invitation")
@@ -97,6 +103,7 @@ export function registerOrgInvitationRoutes<T extends { Variables: OrgRouteVaria
         403: jsonResponse("Only workspace owners and admins can create invitations. Admins can only invite members.", forbiddenSchema),
         404: jsonResponse("The organization could not be found.", notFoundSchema),
         409: jsonResponse("The email address is outside this workspace's allowed domains.", inviteEmailDomainNotAllowedSchema),
+        503: jsonResponse("The configured default invitee team is unavailable.", defaultInviteeTeamUnavailableSchema),
         502: jsonResponse("The invitation was saved but the email provider rejected or failed to deliver it. Retry by submitting the same email again.", invitationEmailFailedSchema),
       },
     }),
@@ -173,6 +180,22 @@ export function registerOrgInvitationRoutes<T extends { Variables: OrgRouteVaria
         return { status: "member_exists" as const }
       }
 
+      let defaultInviteeTeamId: typeof TeamTable.$inferSelect.id | null = null
+      if (env.defaultInviteeTeamName) {
+        const defaultInviteeTeams = await tx
+          .select({ id: TeamTable.id })
+          .from(TeamTable)
+          .where(and(
+            eq(TeamTable.organizationId, payload.organization.id),
+            eq(TeamTable.name, env.defaultInviteeTeamName),
+          ))
+          .limit(1)
+        defaultInviteeTeamId = defaultInviteeTeams[0]?.id ?? null
+        if (!defaultInviteeTeamId) {
+          return { status: "default_invitee_team_unavailable" as const }
+        }
+      }
+
       if (existingInvitation) {
         const refreshRole = validateInvitationRefreshRole({
           existingRole: existingInvitation.role,
@@ -202,7 +225,7 @@ export function registerOrgInvitationRoutes<T extends { Variables: OrgRouteVaria
       if (existingInvitation) {
         await tx
           .update(InvitationTable)
-          .set({ role: assignedRole, inviterId: normalizeDenTypeId("user", user.id), orgMemberId: payload.currentMember.id, inviteToken, expiresAt })
+          .set({ role: assignedRole, teamId: defaultInviteeTeamId, inviterId: normalizeDenTypeId("user", user.id), orgMemberId: payload.currentMember.id, inviteToken, expiresAt })
           .where(and(eq(InvitationTable.id, existingInvitation.id), eq(InvitationTable.status, "pending")))
 
         const invitedMemberRows = await tx
@@ -238,6 +261,7 @@ export function registerOrgInvitationRoutes<T extends { Variables: OrgRouteVaria
           email,
           role: assignedRole,
           status: "pending",
+          teamId: defaultInviteeTeamId,
           inviterId: normalizeDenTypeId("user", user.id),
           orgMemberId: payload.currentMember.id,
           inviteToken,
@@ -292,6 +316,12 @@ export function registerOrgInvitationRoutes<T extends { Variables: OrgRouteVaria
         freeSeatCount: seatEligibility.freeSeatCount,
         message: `This workspace includes ${seatEligibility.freeSeatCount} free members. Start seat billing before inviting another member.`,
       }, 402)
+    }
+    if (invitationWrite.status === "default_invitee_team_unavailable") {
+      return c.json({
+        error: "default_invitee_team_unavailable",
+        message: `The configured default invitee team '${env.defaultInviteeTeamName}' was not found in this organization.`,
+      }, 503)
     }
 
     const {
