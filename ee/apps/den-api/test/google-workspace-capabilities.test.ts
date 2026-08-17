@@ -1140,6 +1140,18 @@ test("Google Workspace capability tools are discoverable and keep readable names
   const gmailMatch = searchCapabilities(catalog, "gmail search read messages", 10)[0]
   expect(gmailMatch?.name).toBe("getCapabilitiesGoogleWorkspaceGmailMessages")
   expect(gmailMatch?.queryParams).toEqual(["q", "maxResults"])
+  expect(gmailMatch?.querySchema).toMatchObject({
+    type: "object",
+    properties: {
+      maxResults: {
+        type: "integer",
+        minimum: 1,
+        maximum: 25,
+        default: 10,
+      },
+    },
+    additionalProperties: false,
+  })
   expect(searchCapabilities(catalog, "outlook mail messages", 20).find((match) => match.name === "getCapabilitiesMicrosoft365MailMessages")?.queryParams).toEqual(["search", "maxResults"])
   const draftMatch = searchCapabilities(catalog, "gmail draft without attachments", 10)[0]
   expect(draftMatch?.name).toBe("postCapabilitiesGoogleWorkspaceGmailDrafts")
