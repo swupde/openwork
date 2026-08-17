@@ -20,7 +20,8 @@ import { createExecutor, type Executor } from "./db-executor.ts"
 
 const MIGRATIONS_TABLE = "__drizzle_migrations"
 const LEGACY_PRE_OAUTH_BASELINE_TAG = "0055_thick_chamber"
-const OAUTH_SCHEMA_MIGRATION_TAG = "0056_oauth_provider_17_schema_sync"
+const FIRST_POST_OAUTH_MIGRATION_TAG = "0057_codemode_scripts"
+const POST_OAUTH_SCHEMA_MARKERS = ["artifact_view_revision", "temp_file", "program_agent_selection", "remote_mcp_app"]
 
 const scriptPath = fileURLToPath(import.meta.url)
 const distDir = path.resolve(path.dirname(scriptPath), "..")
@@ -134,10 +135,130 @@ async function baselineCommittedMigrations(executor: Executor, throughMillis = N
   }
 }
 
-async function rewindMissingOauthMigration(executor: Executor) {
-  const oauthSchemaMigrationMillis = migrationMillis(OAUTH_SCHEMA_MIGRATION_TAG)
-  console.log("[den-db] OAuth schema is missing; rewinding its incorrect migration baseline")
-  await executor.query(`delete from \`${MIGRATIONS_TABLE}\` where created_at >= ?`, [oauthSchemaMigrationMillis])
+async function tableExists(executor: Executor, table: string) {
+  const rows = await executor.query(
+    "SELECT 1 AS present FROM information_schema.TABLES WHERE table_schema = DATABASE() AND table_name = ? LIMIT 1",
+    [table],
+  )
+  return rows.length > 0
+}
+
+async function columnExists(executor: Executor, table: string, column: string) {
+  const rows = await executor.query(
+    "SELECT 1 AS present FROM information_schema.COLUMNS WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ? LIMIT 1",
+    [table, column],
+  )
+  return rows.length > 0
+}
+
+async function indexExists(executor: Executor, table: string, index: string) {
+  const rows = await executor.query(
+    "SELECT 1 AS present FROM information_schema.STATISTICS WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ? LIMIT 1",
+    [table, index],
+  )
+  return rows.length > 0
+}
+
+async function ensureColumn(executor: Executor, table: string, column: string, definition: string) {
+  if (await columnExists(executor, table, column)) {
+    return
+  }
+  await executor.query(`ALTER TABLE \`${table}\` ADD \`${column}\` ${definition}`)
+}
+
+async function repairMissingOauthSchema(executor: Executor) {
+  // v0.18.16 installations could have a migration ledger that incorrectly
+  // recorded 0056 as complete. Apply only that migration's additive schema
+  // idempotently; later migrations may already have been deployed.
+  console.log("[den-db] OAuth schema is missing; repairing its additive schema")
+  await executor.query(`CREATE TABLE IF NOT EXISTS \`oauthClientAssertion\` (
+    \`id\` varchar(64) NOT NULL,
+    \`expires_at\` timestamp(3) NOT NULL,
+    CONSTRAINT \`oauthClientAssertion_id\` PRIMARY KEY(\`id\`)
+  )`)
+  await executor.query(`CREATE TABLE IF NOT EXISTS \`oauthClientResource\` (
+    \`id\` varchar(512) NOT NULL,
+    \`client_id\` varchar(255) NOT NULL,
+    \`resource_id\` varchar(255) NOT NULL,
+    \`metadata\` text,
+    \`created_at\` timestamp(3) NOT NULL DEFAULT (now()),
+    CONSTRAINT \`oauthClientResource_id\` PRIMARY KEY(\`id\`)
+  )`)
+  await executor.query(`CREATE TABLE IF NOT EXISTS \`oauthResource\` (
+    \`id\` varchar(64) NOT NULL,
+    \`identifier\` varchar(255) NOT NULL,
+    \`name\` varchar(255) NOT NULL,
+    \`access_token_ttl\` int,
+    \`refresh_token_ttl\` int,
+    \`signing_algorithm\` varchar(64),
+    \`signing_key_id\` varchar(255),
+    \`allowed_scopes\` text,
+    \`custom_claims\` text,
+    \`dpop_bound_access_tokens_required\` boolean,
+    \`disabled\` boolean,
+    \`policy_version\` int,
+    \`metadata\` text,
+    \`created_at\` timestamp(3) NOT NULL DEFAULT (now()),
+    \`updated_at\` timestamp(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+    CONSTRAINT \`oauthResource_id\` PRIMARY KEY(\`id\`),
+    CONSTRAINT \`oauth_resource_identifier\` UNIQUE(\`identifier\`)
+  )`)
+
+  for (const [table, column, definition] of [
+    ["oauthAccessToken", "authorization_code_id", "varchar(64)"],
+    ["oauthAccessToken", "resources", "text"],
+    ["oauthAccessToken", "requested_user_info_claims", "text"],
+    ["oauthAccessToken", "revoked", "timestamp(3)"],
+    ["oauthAccessToken", "confirmation", "text"],
+    ["oauthClient", "backchannel_logout_uri", "text"],
+    ["oauthClient", "backchannel_logout_session_required", "boolean"],
+    ["oauthClient", "jwks", "text"],
+    ["oauthClient", "jwks_uri", "text"],
+    ["oauthClient", "dpop_bound_access_tokens", "boolean"],
+    ["oauthConsent", "resources", "text"],
+    ["oauthConsent", "requested_user_info_claims", "text"],
+    ["oauthRefreshToken", "authorization_code_id", "varchar(64)"],
+    ["oauthRefreshToken", "resources", "text"],
+    ["oauthRefreshToken", "requested_user_info_claims", "text"],
+    ["oauthRefreshToken", "rotated_at", "timestamp(3)"],
+    ["oauthRefreshToken", "rotation_replay_response", "text"],
+    ["oauthRefreshToken", "rotation_replay_expires_at", "timestamp(3)"],
+    ["oauthRefreshToken", "confirmation", "text"],
+  ] as const) {
+    await ensureColumn(executor, table, column, definition)
+  }
+
+  if (!(await indexExists(executor, "oauthClientResource", "oauth_client_resource_client_id"))) {
+    await executor.query("CREATE INDEX `oauth_client_resource_client_id` ON `oauthClientResource` (`client_id`)")
+  }
+  if (!(await indexExists(executor, "oauthClientResource", "oauth_client_resource_resource_id"))) {
+    await executor.query("CREATE INDEX `oauth_client_resource_resource_id` ON `oauthClientResource` (`resource_id`)")
+  }
+}
+
+async function reconcilePostOauthBaseline(executor: Executor) {
+  const presentMarkers = [] as string[]
+  for (const table of POST_OAUTH_SCHEMA_MARKERS) {
+    if (await tableExists(executor, table)) {
+      presentMarkers.push(table)
+    }
+  }
+
+  if (presentMarkers.length === POST_OAUTH_SCHEMA_MARKERS.length) {
+    console.log("[den-db] later schema is already present; recording its migration baseline")
+    await baselineCommittedMigrations(executor)
+    return
+  }
+
+  if (presentMarkers.length === 0) {
+    console.log("[den-db] later schema is absent; replaying migrations after the repaired OAuth schema")
+    await executor.query(`delete from \`${MIGRATIONS_TABLE}\` where created_at >= ?`, [migrationMillis(FIRST_POST_OAUTH_MIGRATION_TAG)])
+    return
+  }
+
+  throw new Error(
+    `[den-db] Incomplete post-OAuth migration state: found ${presentMarkers.join(", ")}; expected all or none of ${POST_OAUTH_SCHEMA_MARKERS.join(", ")}.`,
+  )
 }
 
 async function runCommittedMigrations() {
@@ -168,8 +289,11 @@ export async function bootstrapDenDb() {
         console.log("[den-db] legacy pre-OAuth schema without migration ledger detected; recording its safe baseline")
         await baselineCommittedMigrations(executor, migrationMillis(LEGACY_PRE_OAUTH_BASELINE_TAG))
       }
-    } else if (!tables.includes("oauthResource")) {
-      await rewindMissingOauthMigration(executor)
+    } else {
+      if (!tables.includes("oauthResource")) {
+        await repairMissingOauthSchema(executor)
+      }
+      await reconcilePostOauthBaseline(executor)
     }
   } finally {
     await executor.close()

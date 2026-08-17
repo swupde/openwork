@@ -570,6 +570,89 @@ test("bootstrap repairs a legacy pre-oauth schema that was falsely marked curren
   }
 })
 
+async function removeOauthMigrationSchema(connection: mysql.Connection) {
+  await connection.query("DROP TABLE `oauthClientResource`")
+  await connection.query("DROP TABLE `oauthClientAssertion`")
+  await connection.query("DROP TABLE `oauthResource`")
+
+  for (const [table, column] of [
+    ["oauthAccessToken", "authorization_code_id"],
+    ["oauthAccessToken", "resources"],
+    ["oauthAccessToken", "requested_user_info_claims"],
+    ["oauthAccessToken", "revoked"],
+    ["oauthAccessToken", "confirmation"],
+    ["oauthClient", "backchannel_logout_uri"],
+    ["oauthClient", "backchannel_logout_session_required"],
+    ["oauthClient", "jwks"],
+    ["oauthClient", "jwks_uri"],
+    ["oauthClient", "dpop_bound_access_tokens"],
+    ["oauthConsent", "resources"],
+    ["oauthConsent", "requested_user_info_claims"],
+    ["oauthRefreshToken", "authorization_code_id"],
+    ["oauthRefreshToken", "resources"],
+    ["oauthRefreshToken", "requested_user_info_claims"],
+    ["oauthRefreshToken", "rotated_at"],
+    ["oauthRefreshToken", "rotation_replay_response"],
+    ["oauthRefreshToken", "rotation_replay_expires_at"],
+    ["oauthRefreshToken", "confirmation"],
+  ] as const) {
+    await connection.query(`ALTER TABLE \`${table}\` DROP COLUMN \`${column}\``)
+  }
+}
+
+test("bootstrap repairs OAuth without replaying already-present later migrations", { skip: !mysqlUrl, timeout: 300_000 }, async () => {
+  if (!mysqlUrl) return
+
+  const root = await mysql.createConnection(mysqlUrl)
+  const database = scratchDatabaseName()
+  let connection: mysql.Connection | undefined
+  const priorDatabaseUrl = process.env.DATABASE_URL
+
+  try {
+    await root.query(`CREATE DATABASE ${quoteIdentifier(database)}`)
+    connection = await mysql.createConnection(mysqlConnectionConfigFor(mysqlUrl, database))
+
+    const exportStatements = splitSqlStatements(await exportCurrentSchemaSql())
+    const ownedTables = await migrationOwnedTables()
+    const ownedIndexes = await migrationOwnedIndexes()
+    const nonMigrationOwnedTables = new Set(exportTableNames(exportStatements).filter((tableName) => !ownedTables.has(tableName)))
+    await seedNonMigrationOwnedTables(connection, exportStatements, nonMigrationOwnedTables, ownedIndexes)
+    await migrate(drizzle(connection), { migrationsFolder })
+    await removeOauthMigrationSchema(connection)
+
+    process.env.DATABASE_URL = databaseUrlFor(mysqlUrl, database)
+    await bootstrapDenDb()
+
+    const oauthResource = await queryRecords(connection, "SHOW TABLES LIKE 'oauthResource'")
+    assert.equal(oauthResource.length, 1, "bootstrap must restore the missing OAuth schema")
+    const artifactTable = await queryRecords(connection, "SHOW TABLES LIKE 'artifact_view_revision'")
+    assert.equal(artifactTable.length, 1, "bootstrap must retain the later schema without replaying it")
+
+    const artifactMigration = readMigrationFiles({ migrationsFolder }).find((migration) =>
+      migration.sql.some((statement) => statement.includes("CREATE TABLE `artifact_view_revision`")),
+    )
+    assert.ok(artifactMigration, "artifact migration must exist")
+    await connection.query("DELETE FROM `__drizzle_migrations` WHERE `created_at` >= ?", [artifactMigration.folderMillis])
+
+    await bootstrapDenDb()
+    const pending = await queryRecords(
+      connection,
+      "SELECT COUNT(*) AS pending FROM `__drizzle_migrations` WHERE `created_at` >= ?",
+      [artifactMigration.folderMillis],
+    )
+    assert.ok(Number(pending[0]?.pending) > 0, "bootstrap must restore the already-present later migration baseline")
+  } finally {
+    if (priorDatabaseUrl === undefined) {
+      delete process.env.DATABASE_URL
+    } else {
+      process.env.DATABASE_URL = priorDatabaseUrl
+    }
+    await connection?.end().catch(() => {})
+    await root.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(database)}`).catch(() => {})
+    await root.end()
+  }
+})
+
 async function recreateScenarioTables(connection: mysql.Connection) {
   await connection.query("DROP TABLE IF EXISTS `inference_org_limit_policies`")
   await connection.query("DROP TABLE IF EXISTS `config_object_version`")
