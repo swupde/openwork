@@ -80,6 +80,8 @@ type OpenApiParameter = {
     format?: unknown
     enum?: unknown[]
     default?: unknown
+    minimum?: unknown
+    maximum?: unknown
   }
 }
 

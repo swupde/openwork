@@ -116,6 +116,9 @@ describe("composeOpenWorkExtensionDiscoveryInstruction", () => {
   test("steers ready Connect users to verified openwork-cloud capabilities first", () => {
     expect(OPENWORK_CLOUD_CONNECTION_INSTRUCTION).toContain("verified ready for this exact workspace/model");
     expect(OPENWORK_CLOUD_CONNECTION_INSTRUCTION).toContain("use openwork-cloud_search_capabilities");
+    expect(OPENWORK_CLOUD_CONNECTION_INSTRUCTION).toContain("search once with one precise query");
+    expect(OPENWORK_CLOUD_CONNECTION_INSTRUCTION).toContain("batch independent reads");
+    expect(OPENWORK_CLOUD_CONNECTION_INSTRUCTION).not.toContain("2-4 keyword variants");
     expect(OPENWORK_CLOUD_CONNECTION_INSTRUCTION).toContain("available_skills");
     expect(OPENWORK_CLOUD_CONNECTION_INSTRUCTION).not.toContain("Skill creation:");
     expect(OPENWORK_CLOUD_CONNECTION_INSTRUCTION).not.toContain("Gmail");
