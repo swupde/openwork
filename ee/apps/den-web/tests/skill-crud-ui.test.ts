@@ -51,6 +51,12 @@ describe("Den plugin skill CRUD UI contract", () => {
     expect(data).toContain("pluginQueryKeys.detail(pluginId)");
   });
 
+  test("retries protected skill mutations after the dashboard reauthentication flow", () => {
+    expect(data).toContain('runSkillMutation(runReauthableAction, "create-skill"');
+    expect(data).toContain('runSkillMutation(runReauthableAction, "update-skill"');
+    expect(data).toContain('runSkillMutation(runReauthableAction, "delete-skill"');
+  });
+
   test("lets administrators edit and safely archive the owning plugin", () => {
     expect(pluginDetail).toContain('data-testid="plugin-actions-trigger"');
     expect(pluginDetail).toContain("Edit plugin");

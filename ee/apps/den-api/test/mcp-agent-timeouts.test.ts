@@ -118,6 +118,7 @@ test("agent MCP server exposes steering instructions during initialize", async (
   expect(client.getInstructions()).toBe(agentModule.AGENT_MCP_INSTRUCTIONS)
   expect(client.getInstructions()).toContain("search_capabilities and execute_capability")
   expect(client.getInstructions()).toContain("search once with one precise query")
+  expect(client.getInstructions()).toContain("loaded capability-specific skill")
   expect(client.getInstructions()).toContain("batch independent reads")
   expect(client.getInstructions()).not.toContain("2-4 keyword variants")
   expect(client.getInstructions()).toContain("create-skill")
@@ -146,6 +147,7 @@ test("capability-search tool description requires one exact search", () => {
   const searchDescription = (agentModule as unknown as { SEARCH_CAPABILITIES_DESCRIPTION?: string }).SEARCH_CAPABILITIES_DESCRIPTION
 
   expect(searchDescription).toContain("search once with one precise query")
+  expect(searchDescription).toContain("loaded capability-specific skill")
   expect(searchDescription).toContain("Reuse an exact capability already returned")
   expect(searchDescription).not.toContain("2-4 keyword variants")
 })
