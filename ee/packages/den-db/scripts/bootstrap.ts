@@ -19,6 +19,8 @@ import { ensureSchemaRepairs } from "../src/schema-repairs.ts"
 import { createExecutor, type Executor } from "./db-executor.ts"
 
 const MIGRATIONS_TABLE = "__drizzle_migrations"
+const LEGACY_PRE_OAUTH_BASELINE_TAG = "0055_thick_chamber"
+const OAUTH_SCHEMA_MIGRATION_TAG = "0056_oauth_provider_17_schema_sync"
 
 const scriptPath = fileURLToPath(import.meta.url)
 const distDir = path.resolve(path.dirname(scriptPath), "..")
@@ -96,7 +98,18 @@ function latestMigrationMillis(rows: Record<string, unknown>[]) {
   return 0
 }
 
-async function baselineCommittedMigrations(executor: Executor) {
+function migrationMillis(tag: string) {
+  const journal = JSON.parse(readFileSync(path.join(migrationsFolder, "meta", "_journal.json"), "utf8")) as {
+    entries: Array<{ tag: string; when: number }>
+  }
+  const migration = journal.entries.find((entry) => entry.tag === tag)
+  if (!migration) {
+    throw new Error(`Migration ${tag} is missing from the committed journal`)
+  }
+  return migration.when
+}
+
+async function baselineCommittedMigrations(executor: Executor, throughMillis = Number.POSITIVE_INFINITY) {
   const migrations = readMigrationFiles({ migrationsFolder }).sort((left, right) => left.folderMillis - right.folderMillis)
 
   await executor.query(
@@ -105,7 +118,7 @@ async function baselineCommittedMigrations(executor: Executor) {
 
   const rows = await executor.query(`select max(created_at) as latest from \`${MIGRATIONS_TABLE}\``)
   const latest = latestMigrationMillis(rows)
-  const pending = migrations.filter((migration) => migration.folderMillis > latest)
+  const pending = migrations.filter((migration) => migration.folderMillis > latest && migration.folderMillis <= throughMillis)
 
   if (pending.length === 0) {
     console.log("[den-db] migration baseline already current")
@@ -119,6 +132,12 @@ async function baselineCommittedMigrations(executor: Executor) {
       migration.folderMillis,
     ])
   }
+}
+
+async function rewindMissingOauthMigration(executor: Executor) {
+  const oauthSchemaMigrationMillis = migrationMillis(OAUTH_SCHEMA_MIGRATION_TAG)
+  console.log("[den-db] OAuth schema is missing; rewinding its incorrect migration baseline")
+  await executor.query(`delete from \`${MIGRATIONS_TABLE}\` where created_at >= ?`, [oauthSchemaMigrationMillis])
 }
 
 async function runCommittedMigrations() {
@@ -142,8 +161,15 @@ export async function bootstrapDenDb() {
       await applyCurrentSchema(executor)
       await baselineCommittedMigrations(executor)
     } else if (!tables.includes(MIGRATIONS_TABLE)) {
-      console.log("[den-db] existing schema without migration ledger detected; recording baseline")
-      await baselineCommittedMigrations(executor)
+      if (tables.includes("oauthResource")) {
+        console.log("[den-db] existing current schema without migration ledger detected; recording baseline")
+        await baselineCommittedMigrations(executor)
+      } else {
+        console.log("[den-db] legacy pre-OAuth schema without migration ledger detected; recording its safe baseline")
+        await baselineCommittedMigrations(executor, migrationMillis(LEGACY_PRE_OAUTH_BASELINE_TAG))
+      }
+    } else if (!tables.includes("oauthResource")) {
+      await rewindMissingOauthMigration(executor)
     }
   } finally {
     await executor.close()
