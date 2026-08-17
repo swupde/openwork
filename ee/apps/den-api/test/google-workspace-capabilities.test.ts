@@ -1130,6 +1130,15 @@ test("Google Workspace capability tools are discoverable and keep readable names
   const calendarMatch = searchCapabilities(catalog, "calendar events list", 10)[0]
   expect(calendarMatch?.name).toBe("getCapabilitiesGoogleWorkspaceCalendarEvents")
   expect(calendarMatch?.queryParams).toEqual(["timeMin", "timeMax", "maxResults"])
+  expect(calendarMatch?.querySchema).toMatchObject({
+    type: "object",
+    properties: {
+      timeMin: { type: "string", format: "date-time" },
+      timeMax: { type: "string", format: "date-time" },
+      maxResults: { type: "integer", minimum: 1, maximum: 100, default: 25 },
+    },
+    additionalProperties: false,
+  })
   expect(searchCapabilities(catalog, "add meet link existing event", 10)[0]?.name).toBe("patchCapabilitiesGoogleWorkspaceCalendarEvent")
   const driveMatch = searchCapabilities(catalog, "drive files", 10)[0]
   expect(driveMatch?.name).toBe("getCapabilitiesGoogleWorkspaceDriveFiles")

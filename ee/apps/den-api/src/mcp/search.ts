@@ -120,7 +120,7 @@ function scoreOperation(operation: McpToolOperation, queryTokens: string[]): num
   return scoreText(nameTokens, summaryTokens, queryTokens, pathTokens)
 }
 
-function querySchemaFor(parameters: ReturnType<typeof getParameters>): unknown {
+export function querySchemaFor(parameters: ReturnType<typeof getParameters>): unknown {
   const properties = Object.fromEntries(
     parameters.map((parameter) => [String(parameter.name), parameter.schema ?? {}]),
   )

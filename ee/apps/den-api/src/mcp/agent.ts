@@ -89,6 +89,14 @@ export const SEARCH_CAPABILITIES_ANNOTATIONS: ToolAnnotations = {
   idempotentHint: true,
   openWorldHint: true,
 }
+
+export const SEARCH_CAPABILITIES_DESCRIPTION = [
+  "Search for a capability by keyword. This connection exposes execute_capability for the exact result; there is no list of individually-named tools to browse.",
+  "For an org-connected service, search once with one precise query, then execute an exact returned capability. Reuse an exact capability already returned in this task instead of searching again. Search a second time only when the first search returned no usable match or the server reports unknown_capability.",
+  "Search covers native Google Workspace capabilities (Gmail, Calendar, Drive, Gmail drafts), org-connected external MCPs, and namespaced OpenWork Admin tools for allowlisted platform admins.",
+  "Native API matches include a connector-namespaced name, pathParams, queryParams, querySchema, hasBody, and bodySchema. External MCP matches include argumentsSchema, schemaDigest, and invocation.argumentsField.",
+  "Built-in and marketplace skill matches return SKILL.md content when executed.",
+].join(" ")
 export const EXECUTE_CAPABILITY_ANNOTATIONS: ToolAnnotations = {
   readOnlyHint: false,
   destructiveHint: true,
@@ -549,17 +557,9 @@ export function registerAgentMcpRoutes<T extends { Variables: RequestIdVariables
       SEARCH_CAPABILITIES_TOOL_NAME,
       {
         title: "Search capabilities",
-        description: [
-          codemodeEnabled
-            ? "Search for a capability by keyword. This connection also exposes execute_capability, execute_capability_script, and Program search/selection tools —"
-            : "Search for a capability by keyword. This connection only exposes this tool and execute_capability —",
-          "there is no list of individually-named tools to browse. Always search first.",
-          "Search covers native Google Workspace capabilities (Gmail, Calendar, Drive, Gmail drafts), org-connected external MCPs, and namespaced OpenWork Admin tools for allowlisted platform admins.",
-          "When Code Mode is enabled, accessible Programs appear as marketplace matches with kind script and execute through execute_capability like every other exact search result.",
-          "Try 2-4 keyword variants before deciding a capability is unavailable.",
-          "Native API matches include a connector-namespaced name, pathParams, queryParams, hasBody, and bodySchema. External MCP matches include argumentsSchema, schemaDigest, and invocation.argumentsField. A match with kind mcp_app is a standard MCP App launch capability from a connected MCP server; execute it normally and the OpenWork host will render its advertised ui:// resource.",
-          "Built-in and marketplace skill matches return SKILL.md content when executed.",
-        ].join(" "),
+        description: codemodeEnabled
+          ? `${SEARCH_CAPABILITIES_DESCRIPTION} When Code Mode is enabled, accessible Programs appear as marketplace matches with kind script and execute through execute_capability like every other exact search result.`
+          : SEARCH_CAPABILITIES_DESCRIPTION,
         annotations: SEARCH_CAPABILITIES_ANNOTATIONS,
         _meta: { ui: { visibility: ["model", "app"] } },
         inputSchema: z.object({

@@ -216,6 +216,30 @@ describe("native capability search", () => {
       status: "needs_connection",
     })
   })
+
+  test("preserves Calendar's UTC datetime schema in native discovery", async () => {
+    const matches = await nativeCapabilities.searchNativeCapabilities({
+      organizationId,
+      member,
+      query: "Acme Labs calendar events list",
+      catalog,
+      limit: 20,
+    })
+    const calendar = matches.find((match) => match.name === nativeCapabilities.buildNativeCapabilityName(
+      labsConnectionId,
+      "getCapabilitiesGoogleWorkspaceCalendarEvents",
+    ))
+
+    expect(calendar?.querySchema).toMatchObject({
+      type: "object",
+      properties: {
+        timeMin: { type: "string", format: "date-time" },
+        timeMax: { type: "string", format: "date-time" },
+        maxResults: { type: "integer", minimum: 1, maximum: 100, default: 25 },
+      },
+      additionalProperties: false,
+    })
+  })
 })
 
 describe("native capability execute", () => {
