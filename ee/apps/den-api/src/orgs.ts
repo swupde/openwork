@@ -8,6 +8,8 @@ import {
   MemberTable,
   OrganizationRoleTable,
   OrganizationTable,
+  ScimProviderTable,
+  ScimUserTombstoneTable,
   SsoConnectionTable,
   TeamMemberTable,
   TeamTable,
@@ -42,7 +44,10 @@ import {
 } from "./organization-access.js"
 import { ensureDefaultDesktopPolicyForOrganization } from "./desktop-policies.js"
 import { isProtectedOrganizationRoleName, shouldRevokeSessionsForRoleChange } from "./organization-role-hierarchy.js"
+import { appLogger } from "./observability/logger.js"
 import { isSingleOrgOwnerEmailEligible, resolveSingleOrgMembershipRole } from "./single-org-policy.js"
+
+const logger = appLogger.child({ component: "organizations" })
 
 type UserId = typeof AuthUserTable.$inferSelect.id
 type SessionId = typeof AuthSessionTable.$inferSelect.id
@@ -59,6 +64,9 @@ export type AcceptInvitationForUserResult = {
   member: MemberRow
 } | {
   status: "membership_removed"
+  invitation: InvitationRow
+} | {
+  status: "scim_deprovisioned"
   invitation: InvitationRow
 }
 
@@ -627,7 +635,7 @@ export async function acceptPendingInvitationForBootstrapMembership(input: {
   // Bootstrap paths already grant same-org membership before email verification.
   // organization-join-verification.ts keeps that gate on the explicit accept endpoint.
   const accepted = await acceptInvitation(invitation, input.userId, { fallbackRole: input.defaultRole })
-  return accepted?.member ?? null
+  return accepted?.status === "accepted" ? accepted.member : null
 }
 
 export async function reconcilePendingInvitationsForUser(userId: UserId) {
@@ -670,7 +678,7 @@ export async function reconcilePendingInvitationsForUser(userId: UserId) {
     }
 
     const accepted = await acceptInvitation(invitation, userId)
-    if (accepted) {
+    if (accepted?.status === "accepted") {
       acceptedCount += 1
     }
   }
@@ -679,6 +687,29 @@ export async function reconcilePendingInvitationsForUser(userId: UserId) {
 }
 
 async function acceptInvitation(invitation: InvitationRow, userId: UserId, options?: { fallbackRole?: string }) {
+  const scimConnections = await db
+    .select({ id: ScimProviderTable.id })
+    .from(ScimProviderTable)
+    .where(eq(ScimProviderTable.organizationId, invitation.organizationId))
+    .limit(1)
+  if (scimConnections[0]) {
+    const tombstones = await db
+      .select({ id: ScimUserTombstoneTable.id })
+      .from(ScimUserTombstoneTable)
+      .where(and(
+        eq(ScimUserTombstoneTable.organizationId, invitation.organizationId),
+        eq(ScimUserTombstoneTable.email, invitation.email.trim().toLowerCase()),
+      ))
+      .limit(1)
+    if (tombstones[0]) {
+      logger.info("skipped invitation acceptance for SCIM-deprovisioned member", {
+        organization_id: invitation.organizationId,
+        invitation_id: invitation.id,
+      })
+      return { status: "scim_deprovisioned" as const, invitation }
+    }
+  }
+
   const availableRoles = await listAssignableRoles(invitation.organizationId)
   return db.transaction(async (tx) => {
     const lockedInvitations = await tx
@@ -704,7 +735,7 @@ async function acceptInvitation(invitation: InvitationRow, userId: UserId, optio
     const invitationStatus = getInvitationStatus(currentInvitation)
     if (invitationStatus !== "pending") {
       return invitationStatus === "accepted" && existingMember
-        ? { invitation: currentInvitation, member: existingMember, newlyAccepted: false }
+        ? { status: "accepted" as const, invitation: currentInvitation, member: existingMember, newlyAccepted: false }
         : null
     }
 
@@ -853,7 +884,7 @@ async function acceptInvitation(invitation: InvitationRow, userId: UserId, optio
       .set({ status: "accepted" })
       .where(and(eq(InvitationTable.id, currentInvitation.id), eq(InvitationTable.status, "pending")))
 
-    return { invitation: currentInvitation, member, newlyAccepted: true }
+    return { status: "accepted" as const, invitation: currentInvitation, member, newlyAccepted: true }
   })
 }
 
@@ -935,6 +966,9 @@ export async function acceptInvitationForUser(input: {
       }
     }
     return null
+  }
+  if (accepted.status === "scim_deprovisioned") {
+    return accepted
   }
   if (accepted.newlyAccepted) {
     await runPostOrganizationMemberChangeHooks({
@@ -1094,7 +1128,7 @@ async function countActiveOwners(organizationId: OrgId) {
   return rows.filter((row) => roleIncludesOwner(row.role)).length
 }
 
-export async function ensureSingletonOrganizationForUser(userId: UserId) {
+export async function ensureSingletonOrganizationForUser(userId: UserId, options?: { forceOwner?: boolean }) {
   const userRows = await db
     .select({
       email: AuthUserTable.email,
@@ -1106,7 +1140,7 @@ export async function ensureSingletonOrganizationForUser(userId: UserId) {
 
   let organization = await getSingletonOrganization()
   if (!organization) {
-    if (!isSingleOrgOwnerEmailEligible({
+    if (!options?.forceOwner && !isSingleOrgOwnerEmailEligible({
       email: userEmail,
       ownerEmails: env.singleOrg.ownerEmails,
     })) {
@@ -1129,11 +1163,13 @@ export async function ensureSingletonOrganizationForUser(userId: UserId) {
   }
 
   const activeOwnerCount = await countActiveOwners(organization.id)
-  const role = resolveSingleOrgMembershipRole({
-    activeOwnerCount,
-    email: userEmail,
-    ownerEmails: env.singleOrg.ownerEmails,
-  })
+  const role = options?.forceOwner && activeOwnerCount === 0
+    ? "owner"
+    : resolveSingleOrgMembershipRole({
+        activeOwnerCount,
+        email: userEmail,
+        ownerEmails: env.singleOrg.ownerEmails,
+      })
   if (!role) {
     return null
   }
@@ -1593,6 +1629,9 @@ async function listOrganizationTeams(organizationId: OrgId) {
 
   const memberIdsByTeamId = new Map<typeof TeamTable.$inferSelect.id, MemberId[]>()
   for (const membership of memberships) {
+    if (!membership.orgMembershipId) {
+      continue
+    }
     const existing = memberIdsByTeamId.get(membership.teamId) ?? []
     existing.push(membership.orgMembershipId)
     memberIdsByTeamId.set(membership.teamId, existing)

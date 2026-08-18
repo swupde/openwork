@@ -47,6 +47,11 @@ import {
   resolveCodemodeConnectionNamespaceContext,
   type CodemodeConnectionNamespaceContext,
 } from "./codemode-namespaces.js"
+import {
+  getExternalToolsSearchCache,
+  setExternalToolsSearchCache,
+  type ExternalToolsSearchCacheKey,
+} from "./external-tools-search-cache.js"
 
 /**
  * Merges org-level External MCP Connections (capability-sources/) into the
@@ -68,8 +73,10 @@ import {
 
 const EXTERNAL_CAPABILITY_PREFIX = "mcp:"
 export const EXTERNAL_MCP_SEARCH_CONNECTION_LIMIT = CODEMODE_EXTERNAL_MCP_CONNECTION_LIMIT
-export const EXTERNAL_MCP_SEARCH_CONCURRENCY = 4
+export const EXTERNAL_MCP_SEARCH_CONCURRENCY = 8
 export const EXTERNAL_MCP_SEARCH_MATCH_LIMIT = 20
+const EXTERNAL_MCP_SEARCH_REQUEST_TIMEOUT_MS = 5_000
+const EXTERNAL_MCP_SEARCH_LIFECYCLE_TIMEOUT_MS = 8_000
 
 export function buildExternalCapabilityName(connectionId: string, toolName: string): string {
   return `${EXTERNAL_CAPABILITY_PREFIX}${connectionId}:${toolName}`
@@ -173,11 +180,18 @@ export type ExternalCapabilityMatch = CapabilityMatch & {
   /** Tells the generic execute facade where MCP arguments must be supplied. */
   invocation?: { argumentsField: "body" }
   /** Distinguishes a connection-health result from a callable capability. */
-  kind?: "connection_status"
+  kind?: "connection_status" | "mcp_app"
   /** Set for connection-level status rows: the tool exists but needs a human/admin fix before real tools can be listed. */
   status?: "needs_connection" | "error"
   hint?: string
   connectionStatus?: ExternalConnectionStatus
+}
+
+export type ExternalMcpAppLaunch = {
+  connectionId: string
+  toolName: string
+  resourceUri: string
+  arguments: Record<string, unknown>
 }
 
 export type ExternalConnectionStatus = {
@@ -218,6 +232,17 @@ const PROVIDER_ADMIN_ACTION_PATTERN = /\b(?:app (?:is )?not installed|admin(?:is
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+export function externalMcpAppResourceUri(tool: { _meta?: unknown }): string | null {
+  const meta = isRecord(tool._meta) ? tool._meta : {}
+  const ui = isRecord(meta.ui) ? meta.ui : {}
+  const resourceUri = typeof ui.resourceUri === "string"
+    ? ui.resourceUri
+    : typeof meta["ui/resourceUri"] === "string"
+      ? meta["ui/resourceUri"]
+      : null
+  return resourceUri?.startsWith("ui://") ? resourceUri : null
 }
 
 function cappedErrorMessage(message: string): string {
@@ -636,6 +661,7 @@ async function probeExternalMcpConnection(input: {
   limit: number
   deadline: ExternalMcpLifecycleDeadline
   scriptNamespace?: string
+  mcpAppsEnabled: boolean
 }): Promise<ExternalCapabilityMatch[]> {
   const matches: ExternalCapabilityMatch[] = []
   const add = (match: ExternalCapabilityMatch) => {
@@ -711,15 +737,31 @@ async function probeExternalMcpConnection(input: {
     ? { orgMembershipId: input.member.orgMembershipId }
     : undefined
   let tools: Awaited<ReturnType<typeof listExternalMcpTools>>
+  const cacheKey: ExternalToolsSearchCacheKey = {
+    organizationId: connection.organizationId,
+    connectionId: connection.id,
+    updatedAt: connection.updatedAt,
+    credentialMode: connection.credentialMode,
+    ...(connection.credentialMode === "per_member" ? { orgMembershipId: input.member.orgMembershipId } : {}),
+  }
+  const cachedProbe = getExternalToolsSearchCache(cacheKey)
   try {
-    tools = await listExternalMcpTools(
-      connection,
-      redirectUriFor(input.redirectUriBase, connection.id),
-      member,
-      undefined,
-      input.deadline,
-    )
+    if (cachedProbe?.outcome === "failure") throw cachedProbe.error
+    if (cachedProbe?.outcome === "success") {
+      tools = cachedProbe.tools
+    } else {
+      tools = await listExternalMcpTools(
+        connection,
+        redirectUriFor(input.redirectUriBase, connection.id),
+        member,
+        undefined,
+        input.deadline,
+        EXTERNAL_MCP_SEARCH_REQUEST_TIMEOUT_MS,
+      )
+      setExternalToolsSearchCache(cacheKey, { outcome: "success", tools })
+    }
   } catch (error) {
+    if (!cachedProbe) setExternalToolsSearchCache(cacheKey, { outcome: "failure", error })
     const message = upstreamErrorMessage(error)
     const diagnostic = error instanceof ExternalMcpDiagnosticError ? error.diagnostic : undefined
     const nameTokens = tokenize(connection.name)
@@ -760,6 +802,7 @@ async function probeExternalMcpConnection(input: {
     const summaryTokens = tokenize(summary)
     const score = scoreText(nameTokens, summaryTokens, input.queryTokens)
     if (score <= 0) continue
+    const resourceUri = input.mcpAppsEnabled ? externalMcpAppResourceUri(tool) : null
     add({
       name: buildExternalCapabilityName(connection.id, tool.name),
       method: "MCP",
@@ -772,6 +815,7 @@ async function probeExternalMcpConnection(input: {
       argumentsSchema: tool.inputSchema,
       schemaDigest: externalMcpToolSchemaDigest(tool.inputSchema),
       invocation: { argumentsField: "body" },
+      ...(resourceUri ? { kind: "mcp_app" as const, mcpApp: { resourceUri } } : {}),
       ...(input.scriptNamespace ? { scriptPath: codemodeScriptPath(input.scriptNamespace, tool.name) } : {}),
     })
   }
@@ -793,6 +837,7 @@ export async function searchExternalCapabilities(input: {
   includeScriptPaths?: boolean
   namespaceContext?: CodemodeConnectionNamespaceContext
   reportCoverage?: (coverage: ExternalMcpSearchCoverage) => void
+  mcpAppsEnabled?: boolean
 }): Promise<ExternalCapabilityMatch[]> {
   if (!input.member) return []
   const queryTokens = tokenize(input.query)
@@ -800,7 +845,7 @@ export async function searchExternalCapabilities(input: {
   const requestedLimit = input.limit ?? 5
   if (!Number.isFinite(requestedLimit) || requestedLimit <= 0) return []
   const limit = Math.min(Math.max(1, Math.trunc(requestedLimit)), EXTERNAL_MCP_SEARCH_MATCH_LIMIT)
-  const deadline = createExternalMcpLifecycleDeadline()
+  const deadline = createExternalMcpLifecycleDeadline(EXTERNAL_MCP_SEARCH_LIFECYCLE_TIMEOUT_MS)
   const namespaceContext = input.includeScriptPaths
     ? input.namespaceContext ?? await resolveCodemodeConnectionNamespaceContext({
       organizationId: input.organizationId,
@@ -831,6 +876,7 @@ export async function searchExternalCapabilities(input: {
       limit,
       deadline: sharedDeadline,
       scriptNamespace: scriptNamespaces?.get(connection.id),
+      mcpAppsEnabled: input.mcpAppsEnabled === true,
     }),
   })
 }
@@ -867,6 +913,7 @@ export type ExternalCapabilityExecuteResult =
       ok: true
       result: Awaited<ReturnType<typeof callExternalMcpTool>>
       schemaGuidance?: ExternalMcpSchemaGuidance
+      mcpApp?: ExternalMcpAppLaunch
     }
   | {
       ok: false
@@ -984,6 +1031,7 @@ export async function executeExternalCapability(input: {
   requireReadOnly?: boolean
   /** Fail closed when the live input schema no longer matches schemaDigest. */
   requireSchemaMatch?: boolean
+  mcpAppsEnabled?: boolean
 }): Promise<ExternalCapabilityExecuteResult> {
   if (!input.member) {
     return { ok: false, error: "forbidden", message: "No active org membership for this token." }
@@ -1172,10 +1220,21 @@ export async function executeExternalCapability(input: {
 
     schemaGuidance = advisorySchemaGuidance(schemaWarnings)
     const result = await providerCall
+    const resourceUri = input.mcpAppsEnabled === true ? externalMcpAppResourceUri(tool) : null
     return {
       ok: true,
       result,
       ...(schemaGuidance ? { schemaGuidance } : {}),
+      ...(resourceUri
+        ? {
+            mcpApp: {
+              connectionId: connection.id,
+              toolName: tool.name,
+              resourceUri,
+              arguments: forwardedArguments,
+            },
+          }
+        : {}),
     }
   } catch (error) {
     const message = upstreamErrorMessage(error)

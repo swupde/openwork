@@ -1,8 +1,10 @@
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
 import { checkedExec, defaultDaytonaExec } from "./daytona.ts";
+import { FAULT_PROXY_SCRIPT } from "./fault-proxy-script.ts";
 import type { DaytonaExec, DaytonaExecResult } from "./daytona.ts";
 
 const REPO_ROOT = fileURLToPath(new URL("../../../..", import.meta.url));
@@ -42,6 +44,7 @@ export interface DenSandboxOptions {
   ref: string;
   reuse?: string;
   repoRoot?: string;
+  bootstrapAdminEmail?: string;
   log?: (line: string) => void;
 }
 
@@ -62,6 +65,20 @@ export interface MockOnSandboxOptions {
 
 export interface MockOnSandbox {
   url: string;
+}
+
+export interface FaultProxyOnSandboxOptions {
+  sandbox: string;
+  port?: number;
+  upstreamPort?: number;
+  log?: (line: string) => void;
+  fetchImpl?: typeof fetch;
+}
+
+export interface FaultProxyOnSandbox {
+  url: string;
+  token: string;
+  stop(): Promise<void>;
 }
 
 export interface ConnectorSpecEnv {
@@ -155,6 +172,10 @@ function snapshotId(output: string, name: string): string | null {
 
 function sandboxTimestamp(): string {
   return new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);
+}
+
+export function serverSandboxName(): string {
+  return `openwork-server-${sandboxTimestamp()}-${process.pid}-${randomBytes(4).toString("hex")}`;
 }
 
 async function waitForExecReady(exec: DaytonaExec, sandbox: string): Promise<void> {
@@ -430,10 +451,11 @@ function lineWriter(log: (line: string) => void): LineWriter {
   };
 }
 
-function runDenProvisionScript(ref: string, repoRoot: string, log: (line: string) => void): Promise<LocalProcessResult> {
+function runDenProvisionScript(ref: string, repoRoot: string, bootstrapAdminEmail: string | undefined, log: (line: string) => void): Promise<LocalProcessResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn("bash", [".devcontainer/test-server-on-daytona.sh", ref, "--seed"], {
+    const child = spawn("bash", [".devcontainer/test-server-on-daytona.sh", ref, "--seed", "--name", serverSandboxName()], {
       cwd: repoRoot,
+      env: bootstrapAdminEmail ? { ...process.env, DEN_BOOTSTRAP_ADMIN_EMAILS: bootstrapAdminEmail } : process.env,
       stdio: ["ignore", "pipe", "pipe"],
     });
     const stdoutLines = lineWriter(log);
@@ -549,7 +571,12 @@ export async function provisionDenSandbox(options: DenSandboxOptions & Provision
       previewUrl(exec, sandbox, DEN_API_PORT),
     ]));
   } else {
-    const result = await timedStep(log, "Den provisioning script", () => runDenProvisionScript(ref, options.repoRoot ?? REPO_ROOT, log));
+    const result = await timedStep(log, "Den provisioning script", () => runDenProvisionScript(
+      ref,
+      options.repoRoot ?? REPO_ROOT,
+      options.bootstrapAdminEmail,
+      log,
+    ));
     if (result.code !== 0) {
       throw new Error(`Den provisioning script gate failed with exit ${result.code}. Output tail:\n${textTail(result.output)}`);
     }
@@ -628,6 +655,88 @@ echo detached`;
   });
 
   return { url };
+}
+
+export async function startFaultProxyOnSandbox(options: FaultProxyOnSandboxOptions & ProvisionExecOptions): Promise<FaultProxyOnSandbox> {
+  const exec = options.exec ?? defaultDaytonaExec;
+  const log = options.log ?? console.error;
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const port = options.port ?? 3985;
+  const upstreamPort = options.upstreamPort ?? DEN_WEB_PORT;
+  const token = randomBytes(16).toString("hex");
+  const url = await timedStep(log, "fault proxy preview URL gate", () => previewUrl(exec, options.sandbox, port));
+
+  await timedStep(log, "fault proxy process cleanup", async () => {
+    await execInSandbox(
+      exec,
+      options.sandbox,
+      "pkill -f openwork-fault-proxy || true",
+      { timeoutMs: 30_000, context: `fault proxy process cleanup for ${options.sandbox}` },
+    ).catch(() => undefined);
+  });
+
+  await timedStep(log, "fault proxy script upload", async () => {
+    const encoded = Buffer.from(FAULT_PROXY_SCRIPT).toString("base64");
+    await execInSandbox(
+      exec,
+      options.sandbox,
+      `printf %s ${encoded} | base64 -d > /tmp/openwork-fault-proxy.mjs`,
+      { timeoutMs: 30_000, context: `fault proxy script upload for ${options.sandbox}` },
+    );
+  });
+
+  await timedStep(log, "fault proxy process detach", async () => {
+    const detachScript = `python3 - <<PYEOF
+import subprocess
+log = open("/tmp/openwork-fault-proxy.log", "ab", buffering=0)
+subprocess.Popen(["bash", "-lc", "env PORT=${port} UPSTREAM=http://127.0.0.1:${upstreamPort} ISSUER=${url} CONTROL_TOKEN=${token} node /tmp/openwork-fault-proxy.mjs"], stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
+PYEOF
+echo detached`;
+    await execInSandbox(exec, options.sandbox, detachScript, { timeoutMs: 30_000, context: `fault proxy process detach for ${options.sandbox}` });
+  });
+
+  await timedStep(log, "fault proxy health gate", async () => {
+    const deadline = Date.now() + 60_000;
+    let last = "not attempted";
+    while (Date.now() < deadline) {
+      let body: unknown = null;
+      let responseOk = false;
+      try {
+        const response = await fetchImpl(`${url}/__openwork_faults/health`, { signal: AbortSignal.timeout(5_000) });
+        body = await response.json();
+        responseOk = response.ok;
+        if (!response.ok) last = `HTTP ${response.status}`;
+      } catch (error) {
+        last = messageText(error);
+      }
+      if (responseOk && isRecord(body) && body.ok === true) {
+        const reportedIssuer = typeof body.issuer === "string" ? body.issuer : JSON.stringify(body.issuer);
+        if (reportedIssuer !== url) throw new Error(`Fault proxy issuer gate failed: health reported ${reportedIssuer}, expected ${url}.`);
+        return;
+      }
+      await delay(2_000);
+    }
+    const proxyLog = await execInSandbox(
+      exec,
+      options.sandbox,
+      "tail -80 /tmp/openwork-fault-proxy.log 2>&1 || true",
+      { timeoutMs: 30_000, context: `fault proxy health log for ${options.sandbox}` },
+    );
+    throw new Error(`Fault proxy health gate failed at ${url}. Last: ${last}. Log tail:\n${outputTail(proxyLog)}`);
+  });
+
+  return {
+    url,
+    token,
+    async stop(): Promise<void> {
+      await execInSandbox(
+        exec,
+        options.sandbox,
+        "pkill -f openwork-fault-proxy.mjs || true",
+        { timeoutMs: 30_000, context: `fault proxy stop for ${options.sandbox}` },
+      ).catch(() => undefined);
+    },
+  };
 }
 
 function deletionOutput(result: DaytonaExecResult): string {

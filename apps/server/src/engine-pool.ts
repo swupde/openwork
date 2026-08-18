@@ -49,7 +49,11 @@ export type EngineSpawnTemplate = {
 
 export type EnginePoolHooks = {
   /** Today's in-place dispose. Used when the engine is idle. */
-  reloadInPlace: (config: ServerConfig, workspace: WorkspaceInfo) => Promise<void>;
+  reloadInPlace: (
+    config: ServerConfig,
+    workspace: WorkspaceInfo,
+    options?: { awaitPostRefreshSync?: boolean },
+  ) => Promise<void>;
   /** Whether the given engine has non-idle sessions. */
   engineBusy: (config: ServerConfig, workspace: WorkspaceInfo) => Promise<boolean>;
   /** Re-register runtime MCPs and reconcile cloud MCP against a fresh engine. */
@@ -164,22 +168,26 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-export function isConnectionRefusedClassError(error: unknown): boolean {
+export function isEngineConnectionFailure(error: unknown): boolean {
   const visited = new Set<object>();
   let current: unknown = error;
   for (let depth = 0; depth < 6 && current !== null && current !== undefined; depth += 1) {
     if (typeof current === "string") {
-      return /ECONNREFUSED|ECONNRESET|socket hang up/i.test(current);
+      return /ECONNREFUSED|ECONNRESET|ETIMEDOUT|UND_ERR_CONNECT_TIMEOUT|UND_ERR_HEADERS_TIMEOUT|socket hang up|Unable to connect|Headers Timeout Error/i.test(current);
     }
     if (!isRecord(current) || visited.has(current)) return false;
     visited.add(current);
     const code = current.code;
-    if (code === "ECONNREFUSED" || code === "ECONNRESET") return true;
+    if (code === "ECONNREFUSED" || code === "ECONNRESET" || code === "ETIMEDOUT" || code === "UND_ERR_CONNECT_TIMEOUT" || code === "UND_ERR_HEADERS_TIMEOUT") return true;
     const message = current.message;
-    if (typeof message === "string" && /ECONNREFUSED|ECONNRESET|socket hang up/i.test(message)) return true;
+    if (typeof message === "string" && /ECONNREFUSED|ECONNRESET|ETIMEDOUT|UND_ERR_CONNECT_TIMEOUT|UND_ERR_HEADERS_TIMEOUT|socket hang up|Unable to connect|Headers Timeout Error/i.test(message)) return true;
     current = current.cause;
   }
   return false;
+}
+
+export function isConnectionRefusedClassError(error: unknown): boolean {
+  return isEngineConnectionFailure(error);
 }
 
 function isRoutableGeneration(
@@ -289,7 +297,13 @@ export class EnginePool {
   private readonly hooks: EnginePoolHooks;
   private generations: Generation[] = [];
   private inFlight: Promise<RolloverOutcome> | null = null;
-  private pendingRollover: { reason: RolloverReason; workspace: WorkspaceInfo; manual: boolean } | null = null;
+  private pendingRollover: {
+    reason: RolloverReason;
+    workspace: WorkspaceInfo;
+    manual: boolean;
+    awaitPostRefreshSync: boolean;
+    forceStandby: boolean;
+  } | null = null;
   private lastSpawnAt = 0;
   private consecutiveConnectionFailures = 0;
   private lastRecoveryAt = Number.NEGATIVE_INFINITY;
@@ -302,6 +316,7 @@ export class EnginePool {
   private readonly pinnedRequests = new Map<string, string>();
   private readonly activeSessionsByGeneration = new Map<string, Set<string>>();
   private readonly eventProxyControllers = new Set<AbortController>();
+  private readonly drainWaiters = new Set<() => void>();
 
   constructor(input: { config: ServerConfig; template: EngineSpawnTemplate; hooks: EnginePoolHooks }) {
     this.config = input.config;
@@ -347,7 +362,7 @@ export class EnginePool {
   }
 
   reportRequestFailure(baseUrl: string, error: unknown, workspace: WorkspaceInfo): void {
-    if (!this.isPrimaryEndpoint(baseUrl) || !isConnectionRefusedClassError(error)) return;
+    if (!this.isPrimaryEndpoint(baseUrl) || !isEngineConnectionFailure(error)) return;
     this.consecutiveConnectionFailures += 1;
     if (this.consecutiveConnectionFailures < 3) return;
     const now = this.now();
@@ -458,15 +473,26 @@ export class EnginePool {
     reason: RolloverReason;
     workspace: WorkspaceInfo;
     manual?: boolean;
+    awaitPostRefreshSync?: boolean;
+    /** Apply a config change through a healthy standby even when the primary is idle. */
+    forceStandby?: boolean;
   }): Promise<RolloverOutcome> {
     if (this.disposed) return { action: "skipped", reason: "unchanged" };
-    const request = { reason: input.reason, workspace: input.workspace, manual: input.manual === true };
+    const request = {
+      reason: input.reason,
+      workspace: input.workspace,
+      manual: input.manual === true,
+      awaitPostRefreshSync: input.awaitPostRefreshSync !== false,
+      forceStandby: input.forceStandby === true,
+    };
     if (this.inFlight) {
       // Latest wins: a manual request keeps its manual flag so it still
       // bypasses the fingerprint guard when it runs.
       this.pendingRollover = {
         ...request,
         manual: request.manual || this.pendingRollover?.manual === true,
+        awaitPostRefreshSync: request.awaitPostRefreshSync || this.pendingRollover?.awaitPostRefreshSync === true,
+        forceStandby: request.forceStandby || this.pendingRollover?.forceStandby === true,
       };
       this.hooks.logger?.log("info", "Engine rollover coalesced into the in-flight request.", {
         "engine.rollover.reason": request.reason,
@@ -491,8 +517,10 @@ export class EnginePool {
     reason: RolloverReason;
     workspace: WorkspaceInfo;
     manual: boolean;
+    awaitPostRefreshSync: boolean;
+    forceStandby: boolean;
   }): Promise<RolloverOutcome> {
-    const { workspace, reason, manual } = request;
+    const { workspace, reason, manual, awaitPostRefreshSync, forceStandby } = request;
     // The standby reads config from disk at spawn, so make sure the file is
     // current before deciding anything.
     await this.hooks.writeRuntimeConfigFile(this.config, workspace.id).catch(() => undefined);
@@ -505,9 +533,11 @@ export class EnginePool {
       return { action: "skipped", reason: "unchanged" };
     }
 
-    const busy = await this.hooks.engineBusy(this.config, workspace).catch(() => false);
+    const busy = forceStandby
+      ? true
+      : await this.hooks.engineBusy(this.config, workspace).catch(() => false);
     if (!busy) {
-      await this.hooks.reloadInPlace(this.config, workspace);
+      await this.hooks.reloadInPlace(this.config, workspace, { awaitPostRefreshSync });
       if (primary) primary.fingerprint = fingerprint;
       this.hooks.logger?.log("info", "Engine reloaded in place (idle).", {
         "engine.rollover.reason": reason,
@@ -517,9 +547,17 @@ export class EnginePool {
 
     const draining = this.generations.find((entry) => entry.status === "draining");
     if (draining) {
+      if (forceStandby) {
+        this.hooks.logger?.log("info", "Engine standby rollover waiting for the active drain.", {
+          "engine.rollover.reason": reason,
+        });
+        await this.waitForDrain();
+        if (this.disposed) return { action: "skipped", reason: "unchanged" };
+        return this.runRollover(request);
+      }
       // Cap: one primary plus one draining. Park this change; it lands when
       // the current drain finishes.
-      this.pendingRollover = { reason, workspace, manual };
+      this.pendingRollover = { reason, workspace, manual, awaitPostRefreshSync, forceStandby };
       this.hooks.logger?.log("info", "Engine rollover parked behind an active drain.", {
         "engine.rollover.reason": reason,
       });
@@ -527,8 +565,8 @@ export class EnginePool {
     }
 
     const sinceLastSpawn = Date.now() - this.lastSpawnAt;
-    if (!manual && sinceLastSpawn < minSpawnIntervalMs()) {
-      this.pendingRollover = { reason, workspace, manual };
+    if (!manual && !forceStandby && sinceLastSpawn < minSpawnIntervalMs()) {
+      this.pendingRollover = { reason, workspace, manual, awaitPostRefreshSync, forceStandby };
       this.hooks.logger?.log("info", "Engine rollover throttled by the minimum spawn interval.", {
         "engine.rollover.reason": reason,
         "engine.rollover.since_last_spawn_ms": sinceLastSpawn,
@@ -615,7 +653,7 @@ export class EnginePool {
 
     // Best-effort and off the critical path: the new engine already has disk
     // config; this pushes the runtime-DB MCPs a fresh instance cannot see.
-    void this.hooks.postRefreshSync(this.config, workspace).catch(() => undefined);
+    this.detachPostRefreshSync(workspace);
 
     if (primary) this.startDrainMonitor(primary, workspace);
 
@@ -746,6 +784,8 @@ export class EnginePool {
       generation.registryId = null;
     }
     this.generations = this.generations.filter((entry) => entry.id !== generation.id);
+    for (const resolve of this.drainWaiters) resolve();
+    this.drainWaiters.clear();
     this.hooks.logger?.log("info", "Drained engine closed.", { "engine.drain.cause": cause });
 
     const next = this.pendingRollover;
@@ -791,6 +831,13 @@ export class EnginePool {
 
   private async currentFingerprint(): Promise<string> {
     return computeEngineConfigFingerprint(this.template);
+  }
+
+  private waitForDrain(): Promise<void> {
+    if (!this.generations.some((entry) => entry.status === "draining")) return Promise.resolve();
+    return new Promise((resolve) => {
+      this.drainWaiters.add(resolve);
+    });
   }
 
   private async recoverDeadPrimary(workspace: WorkspaceInfo): Promise<void> {
@@ -865,7 +912,7 @@ export class EnginePool {
       this.recoveryWorkspace = null;
       if (this.recoveryTimer) clearTimeout(this.recoveryTimer);
       this.recoveryTimer = null;
-      void this.hooks.postRefreshSync(this.config, workspace).catch(() => undefined);
+      this.detachPostRefreshSync(workspace);
     } catch (error) {
       if (replacement) {
         try {
@@ -909,6 +956,15 @@ export class EnginePool {
         ...this.template.env,
         OPENCODE_CONFIG: this.template.runtimeConfigPath,
       },
+    });
+  }
+
+  private detachPostRefreshSync(workspace: WorkspaceInfo): void {
+    void this.hooks.postRefreshSync(this.config, workspace).catch((error) => {
+      this.hooks.logger?.log("error", "Engine post-refresh MCP sync failed.", {
+        "workspace.id": workspace.id,
+        "engine.post_refresh.failure": error instanceof Error ? error.message : String(error),
+      });
     });
   }
 
@@ -1020,11 +1076,35 @@ export class EnginePool {
   }
 
   private async abortSession(generation: Generation, sessionId: string): Promise<void> {
-    await loopbackFetch(new URL(`/session/${encodeURIComponent(sessionId)}/abort`, generation.handle.url).toString(), {
-      method: "POST",
-      headers: { Authorization: buildEngineAuthProbeHeader(generation.handle.username, generation.handle.password) },
-      signal: AbortSignal.timeout(5_000),
+    this.hooks.logger?.log("info", "Aborting OpenCode session from engine pool.", {
+      "abort.source": "engine_pool.drain_timeout",
+      "abort.initiator": "system",
+      "abort.reason": "draining engine exceeded grace period",
+      "session.id": sessionId,
+      "engine.generation_id": generation.id,
     });
+    try {
+      await loopbackFetch(new URL(`/session/${encodeURIComponent(sessionId)}/abort`, generation.handle.url).toString(), {
+        method: "POST",
+        headers: { Authorization: buildEngineAuthProbeHeader(generation.handle.username, generation.handle.password) },
+        signal: AbortSignal.timeout(5_000),
+      });
+      this.hooks.logger?.log("info", "OpenCode session abort from engine pool completed.", {
+        "abort.source": "engine_pool.drain_timeout",
+        "abort.initiator": "system",
+        "session.id": sessionId,
+        "engine.generation_id": generation.id,
+      });
+    } catch (error) {
+      this.hooks.logger?.log("error", "OpenCode session abort from engine pool failed.", {
+        "abort.source": "engine_pool.drain_timeout",
+        "abort.initiator": "system",
+        "session.id": sessionId,
+        "engine.generation_id": generation.id,
+        "error.message": error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
   }
 }
 

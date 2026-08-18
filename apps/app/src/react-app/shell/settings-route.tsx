@@ -80,6 +80,7 @@ import { AdvancedView } from "@/react-app/domains/settings/pages/advanced-view";
 import { AppearanceView } from "@/react-app/domains/settings/pages/appearance-view";
 import { CloudAccountView } from "@/react-app/domains/settings/pages/cloud-account-view";
 import {
+  connectPluginsForComposer,
   EMPTY_CONNECT_CAPABILITY_INVENTORY,
   type ConnectCapabilityInventory,
 } from "@/react-app/domains/session/surface/connect-capability-inventory";
@@ -164,7 +165,7 @@ import {
 } from "./desktop-local-openwork";
 import { reloadEngineWithDesktopFallback } from "./engine-reload-escalation";
 import { resolveOpenworkConnection } from "./openwork-connection";
-import { abortSessionSafe } from "@/app/lib/opencode-session";
+import { abortSessionSafe, listCommands } from "@/app/lib/opencode-session";
 import { notifyAlert } from "./notifications";
 import { useReloadCoordinator } from "./reload-coordinator";
 import { CommandPalette } from "./command-palette";
@@ -191,6 +192,12 @@ import {
   OPENAI_IMAGE_MODEL,
   type LocalProviderInstallInput,
 } from "@/react-app/domains/settings/openai-image-extension";
+import {
+  libraryAgentsFromOpencode,
+  libraryCommandsFromSlashOptions,
+  type LibraryAgentItem,
+  type LibraryCommandItem,
+} from "@/react-app/domains/settings/library";
 
 const ROUTE_OPENWORK_CAPABILITIES: OpenworkServerCapabilities = {
   skills: { read: true, write: true, source: "openwork" },
@@ -260,7 +267,7 @@ function reconcileSelectedWorkspaceId(
 
 const SETTINGS_HIDE_TITLEBAR_KEY = "openwork.react.settings.hide-titlebar";
 const SETTINGS_UPDATE_AUTO_CHECK_KEY = "openwork.react.settings.update-auto-check";
-const SETTINGS_UPDATE_AUTO_DOWNLOAD_KEY = "openwork.react.settings.update-auto-download";
+export const SETTINGS_UPDATE_AUTO_DOWNLOAD_KEY = "openwork.react.settings.update-auto-download";
 
 export function parseSettingsPath(pathname: string): {
   tab: SettingsTab;
@@ -311,6 +318,8 @@ export function parseSettingsPath(pathname: string): {
         || tail === "connections"
         || tail === "mcps"
         || tail === "skills"
+        || tail === "commands"
+        || tail === "agents"
         || tail === "plugins"
         || tail === "needs-sign-in"
         || tail === "needs-admin-setup"
@@ -340,10 +349,15 @@ export function parseExtensionsPath(pathname: string): ReturnType<typeof parseSe
   return parseSettingsPath(`/settings/extensions${extensionPath ? `/${extensionPath}` : ""}`);
 }
 
-function readStoredBoolean(key: string, fallback: boolean) {
-  if (typeof window === "undefined") return fallback;
+export function readStoredBoolean(
+  key: string,
+  fallback: boolean,
+  storage?: Pick<Storage, "getItem">,
+) {
+  const target = storage ?? (typeof window === "undefined" ? null : window.localStorage);
+  if (!target) return fallback;
   try {
-    const raw = window.localStorage.getItem(key);
+    const raw = target.getItem(key);
     if (raw == null) return fallback;
     return raw === "1";
   } catch {
@@ -493,7 +507,7 @@ function SettingsRouteContent(props: SettingsSurfaceProps = {}) {
     readStoredBoolean(SETTINGS_UPDATE_AUTO_CHECK_KEY, true),
   );
   const [updateAutoDownload, setUpdateAutoDownload] = useState(() =>
-    readStoredBoolean(SETTINGS_UPDATE_AUTO_DOWNLOAD_KEY, false),
+    readStoredBoolean(SETTINGS_UPDATE_AUTO_DOWNLOAD_KEY, true),
   );
   const [configActionStatus, setConfigActionStatus] = useState<string | null>(null);
   const [revealConfigBusy, setRevealConfigBusy] = useState(false);
@@ -850,7 +864,7 @@ function SettingsRouteContent(props: SettingsSurfaceProps = {}) {
   // Not gated on the Extensions tab: the inventory should be warm before the
   // user gets there, and the fetch is deduped by the shared cloud cache.
   useEffect(() => {
-    void refreshConnectCapabilities();
+    void refreshConnectCapabilities({ force: true });
   }, [refreshConnectCapabilities]);
 
   const hasOpenWorkCloudProvider = useMemo(
@@ -1006,6 +1020,33 @@ function SettingsRouteContent(props: SettingsSurfaceProps = {}) {
   useEffect(() => {
     setActiveClient(opencodeClient);
   }, [opencodeClient]);
+
+  const [libraryCommands, setLibraryCommands] = useState<LibraryCommandItem[]>([]);
+  const [libraryAgents, setLibraryAgents] = useState<LibraryAgentItem[]>([]);
+  const loadLibraryLists = useCallback(async () => {
+    if (opencodeClient) {
+      try {
+        const [commands, agents] = await Promise.all([
+          listCommands(opencodeClient, selectedWorkspaceRoot || undefined),
+          opencodeClient.app.agents()
+            .then((result) => unwrap(result))
+            .catch(() => []),
+        ]);
+        setLibraryCommands(libraryCommandsFromSlashOptions(commands));
+        setLibraryAgents(libraryAgentsFromOpencode(Array.isArray(agents) ? agents : []));
+      } catch {
+        setLibraryCommands([]);
+        setLibraryAgents([]);
+      }
+    } else {
+      setLibraryCommands([]);
+      setLibraryAgents([]);
+    }
+    await refreshConnectCapabilities({ force: true });
+  }, [opencodeClient, refreshConnectCapabilities, selectedWorkspaceRoot]);
+  useEffect(() => {
+    void loadLibraryLists();
+  }, [loadLibraryLists]);
 
   const handleModelPickerLoadError = useCallback((error: unknown) => {
     toast.error(error instanceof Error ? error.message : t("app.unknown_error"));
@@ -1501,7 +1542,11 @@ function SettingsRouteContent(props: SettingsSurfaceProps = {}) {
       activeSessions: () => activeReloadBlockingSessions,
       stopSession: async (sessionId) => {
         if (!activeClient) return;
-        await abortSessionSafe(activeClient, sessionId);
+        await abortSessionSafe(activeClient, sessionId, undefined, {
+          source: "settings.reload_workspace.stop_session",
+          initiator: "user",
+          reason: "stop active session before workspace engine reload",
+        });
       },
     });
   }, [
@@ -2320,7 +2365,7 @@ function SettingsRouteContent(props: SettingsSurfaceProps = {}) {
               void orgMcpConnections.refresh();
               void refreshConnectCapabilities({ force: true });
             }}
-            mcpView={({ initialFilter, onFilterChange, initialState, onStateChange, detailId, onDetailIdChange }) => (
+            mcpView={({ initialFilter, onFilterChange, initialState, onStateChange, detailId, onDetailIdChange, onRefresh }) => (
               <McpView
                 busy={busy}
                 selectedWorkspaceRoot={selectedWorkspaceRoot}
@@ -2362,6 +2407,8 @@ function SettingsRouteContent(props: SettingsSurfaceProps = {}) {
                     ),
                   ),
                 ]}
+                installedCommands={libraryCommands}
+                installedAgents={libraryAgents}
                 availableConnectMcpServers={connectCapabilities.mcpServers.filter(
                   (entry) => !orgMcpConnectionItems.some((item) =>
                     item.name.localeCompare(entry.name, undefined, { sensitivity: "accent" }) === 0
@@ -2369,7 +2416,7 @@ function SettingsRouteContent(props: SettingsSurfaceProps = {}) {
                 )}
                 availableConnectMcpStatuses={connectCapabilities.mcpStatuses}
                 inventoryLoading={connectCapabilitiesLoading || (orgMcpConnections.loading && !orgMcpConnections.loaded)}
-                installedPlugins={extensionItems.installedCloudPlugins}
+                installedPlugins={connectPluginsForComposer(connectCapabilities.plugins)}
                 orgMcpItems={orgMcpConnectionItems}
                 organizationName={cloudSession.activeOrgName}
                 orgMcpError={orgMcpConnections.error}
@@ -2383,12 +2430,15 @@ function SettingsRouteContent(props: SettingsSurfaceProps = {}) {
                 readSkill={(name) => extensionsStore.readSkill(name)}
                 previewClaudePlugin={(url) => extensionsStore.previewClaudePlugin(url)}
                 installClaudePlugin={(url) => extensionsStore.installClaudePlugin(url)}
+                createLibraryItem={(kind, input) => extensionsStore.createLibraryItem(kind, input)}
+                onLibraryListsRefresh={loadLibraryLists}
                 initialFilter={initialFilter}
                 onFilterChange={onFilterChange}
                 initialState={initialState}
                 onStateChange={onStateChange}
                 detailId={detailId}
                 onDetailIdChange={onDetailIdChange}
+                onRefresh={onRefresh}
               />
             )}
 
@@ -2701,7 +2751,11 @@ function SettingsRouteContent(props: SettingsSurfaceProps = {}) {
         isRemoteWorkspace={selectedWorkspace?.workspaceType === "remote"}
         onForceStopSession={async (sessionId) => {
           if (!activeClient) return;
-          await abortSessionSafe(activeClient, sessionId);
+          await abortSessionSafe(activeClient, sessionId, undefined, {
+            source: "settings.connections.force_stop_session",
+            initiator: "user",
+            reason: "force stop active session from connections modal",
+          });
         }}
         onReloadEngine={reloadCoordinator.reloadWorkspaceEngine}
         modalState={{
