@@ -97,6 +97,16 @@ export const SEARCH_CAPABILITIES_DESCRIPTION = [
   "Native API matches include a connector-namespaced name, pathParams, queryParams, querySchema, hasBody, and bodySchema. External MCP matches include argumentsSchema, schemaDigest, and invocation.argumentsField.",
   "Built-in and marketplace skill matches return SKILL.md content when executed.",
 ].join(" ")
+export const CALENDAR_AGENDA_CAPABILITY_NAME = "native:google-workspace:getCapabilitiesGoogleWorkspaceCalendarAgenda"
+export const EXECUTE_CAPABILITY_DESCRIPTION = [
+  "Call a capability found via search_capabilities, by its exact name.",
+  `For the primary Google Calendar agenda for today, tomorrow, or one local date, call this tool directly with name ${CALENDAR_AGENDA_CAPABILITY_NAME} and query { day, timeZone, maxResults? }. Do not call search_capabilities first and do not load a Calendar skill first.`,
+  "Pass path/query/body only as described by that match's pathParams/queryParams/hasBody.",
+  "For external MCP capabilities, provider-advertised schema mismatches are returned as advisory schemaGuidance alongside the provider result; they do not block the downstream call.",
+  "When the exact capability is a standard MCP App launch tool, this call preserves its originating tool and ui:// binding so compatible OpenWork hosts render it without requiring a generated direct-tool name.",
+  "For skill capabilities listed in the remote skill catalog, this returns their authorized SKILL.md content.",
+  "Returns unknown_capability if name doesn't match a current capability — call search_capabilities again.",
+].join(" ")
 export const EXECUTE_CAPABILITY_ANNOTATIONS: ToolAnnotations = {
   readOnlyHint: false,
   destructiveHint: true,
@@ -198,6 +208,7 @@ export const AGENT_MCP_INSTRUCTIONS = [
   "Capabilities include native Google Workspace operations (Gmail read/search, Calendar list/create, Drive search/read, and Gmail draft creation) executed with the signed-in member's organization credentials, plus any MCP connections the organization has added.",
   "Allowlisted platform admins can also discover namespaced OpenWork Admin capabilities through this same connection; other members cannot discover or execute them.",
   "For an org-connected service, search once with one precise query, then execute an exact returned capability. A loaded capability-specific skill may name an exact connector-namespaced capability; execute that exact name directly instead of searching. Reuse an exact capability already returned in this task instead of searching again. Search a second time only when the first search returned no usable match or the server reports unknown_capability. Follow every returned parameter limit exactly, use default result limits first, batch independent reads in one tool round, fetch details only for selected records, and never repeat an unchanged failed call.",
+  `For the primary Google Calendar agenda for today, tomorrow, or one local date, call execute_capability directly with name ${CALENDAR_AGENDA_CAPABILITY_NAME} and query { day, timeZone, maxResults? }. Do not call search_capabilities first and do not load a Calendar skill first.`,
   "Built-in remote skills create-skill, share-plugin, add-to-marketplace, and add-user-to-marketplace are always listed in the skill index. Retrieve and follow the matching one by executing its exact capability; do not invent a local copy to access them.",
   "For a request to add a public GitHub plugin to an organization marketplace, search for the marketplace list, GitHub plugin import preview, GitHub plugin marketplace import, and resolved marketplace detail capabilities. Preview first; do not recreate the plugin by hand.",
   "Before importing, confirm the target marketplace, selected skill/server keys, and who can use them. Do not choose one authentication type for every server: the import route resolves known presets and plugin declarations, while the request authType is only a fallback for unknown servers.",
@@ -581,14 +592,7 @@ export function registerAgentMcpRoutes<T extends { Variables: RequestIdVariables
       EXECUTE_CAPABILITY_TOOL_NAME,
       {
         title: "Execute capability",
-        description: [
-          "Call a capability found via search_capabilities, by its exact name.",
-          "Pass path/query/body only as described by that match's pathParams/queryParams/hasBody.",
-          "For external MCP capabilities, provider-advertised schema mismatches are returned as advisory schemaGuidance alongside the provider result; they do not block the downstream call.",
-          "When the exact capability is a standard MCP App launch tool, this call preserves its originating tool and ui:// binding so compatible OpenWork hosts render it without requiring a generated direct-tool name.",
-          "For skill capabilities listed in the remote skill catalog, this returns their authorized SKILL.md content.",
-          "Returns unknown_capability if name doesn't match a current capability — call search_capabilities again.",
-        ].join(" "),
+        description: EXECUTE_CAPABILITY_DESCRIPTION,
         annotations: EXECUTE_CAPABILITY_ANNOTATIONS,
         _meta: { ui: { visibility: ["model", "app"] } },
         inputSchema: z.object({
