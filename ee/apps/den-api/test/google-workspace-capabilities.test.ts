@@ -102,10 +102,23 @@ let lastDraftPayload: unknown = null
 let lastGmailThreadUrl: string | null = null
 let forceDriveUploadError = false
 let largeDriveContentHitCount = 0
+// Bun loads these API suites into one process, while Den captures its API base
+// URL once at module import. Expose only the observation state needed by the
+// native-capability suite when both files resolve to this fake server.
+const sharedGoogleTestState = {
+  origin: "",
+  lastAuthorization: null as string | null,
+  callCount: 0,
+}
+;(globalThis as typeof globalThis & {
+  __openworkGoogleApiTestState?: typeof sharedGoogleTestState
+}).__openworkGoogleApiTestState = sharedGoogleTestState
 
 function resetFakeGoogle() {
   lastAuthorization = null
   googleCallCount = 0
+  sharedGoogleTestState.lastAuthorization = null
+  sharedGoogleTestState.callCount = 0
   googleCallUrls = []
   forceGoogleError = false
   forceGmailThreadError = false
@@ -157,8 +170,10 @@ const fakeGoogleServer = Bun.serve({
   async fetch(request) {
     const url = new URL(request.url)
     googleCallCount += 1
+    sharedGoogleTestState.callCount += 1
     googleCallUrls.push(request.url)
     lastAuthorization = request.headers.get("authorization")
+    sharedGoogleTestState.lastAuthorization = lastAuthorization
 
     if (url.pathname.startsWith("/calendar/v3/calendars/primary/events")) {
       lastCalendarUrl = request.url
@@ -382,6 +397,8 @@ const fakeGoogleServer = Bun.serve({
     return new Response(`Unhandled fake Google route: ${url.pathname}`, { status: 404 })
   },
 })
+fakeGoogleServer.unref()
+sharedGoogleTestState.origin = fakeGoogleServer.url.origin
 
 seedRequiredEnv()
 process.env.DEN_GOOGLE_API_BASE_URL = fakeGoogleServer.url.origin
@@ -525,7 +542,8 @@ afterAll(async () => {
   await db.delete(schema.OrganizationRoleTable).where(drizzle.eq(schema.OrganizationRoleTable.organizationId, organizationId))
   await db.delete(schema.OrganizationTable).where(drizzle.eq(schema.OrganizationTable.id, organizationId))
   await db.delete(schema.AuthUserTable).where(drizzle.eq(schema.AuthUserTable.id, userId))
-  fakeGoogleServer.stop(true)
+  // Keep the unref'ed server available to later suites that share the imported
+  // Den environment; the Bun process owns and closes it on exit.
   mock.restore()
 })
 

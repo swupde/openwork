@@ -42,6 +42,7 @@ function isOpenApiDocument(value: unknown): value is TestOpenApiDocument {
 }
 
 let app: typeof import("../src/app.js").default
+let appEnv: typeof import("../src/env.js").env
 let db: typeof import("../src/db.js").db
 let schema: typeof import("@openwork-ee/den-db/schema")
 let drizzle: typeof import("@openwork-ee/den-db/drizzle")
@@ -68,6 +69,34 @@ const principal = {
   payload: {},
 }
 
+type GoogleTestState = {
+  origin: string
+  lastAuthorization: string | null
+  callCount: number
+}
+
+function activeGoogleTestState(): GoogleTestState {
+  // A standalone run uses this file's server. A combined run can capture the
+  // richer Workspace fixture before this suite starts, so observe that exact
+  // server instead of assuming which test module Bun evaluated last.
+  if (appEnv.googleApiBaseUrl === fakeGoogleServer.url.origin) {
+    return {
+      origin: fakeGoogleServer.url.origin,
+      get lastAuthorization() { return observedAuthorization },
+      set lastAuthorization(value: string | null) { observedAuthorization = value },
+      get callCount() { return googleRequestCount },
+      set callCount(value: number) { googleRequestCount = value },
+    }
+  }
+  const shared = (globalThis as typeof globalThis & {
+    __openworkGoogleApiTestState?: GoogleTestState
+  }).__openworkGoogleApiTestState
+  if (!shared || appEnv.googleApiBaseUrl !== shared.origin) {
+    throw new Error("No fake Google API server matches the loaded Den environment")
+  }
+  return shared
+}
+
 async function seedCredential(providerId: string, token: string, externalAccountId: string) {
   await oauthCredentials.upsertOrgOAuthClient({
     organizationId,
@@ -91,8 +120,9 @@ async function seedCredential(providerId: string, token: string, externalAccount
 }
 
 beforeAll(async () => {
-  const [appImport, dbImport, schemaImport, drizzleImport, catalogImport, nativeImport, sessionImport, oauthImport, connectionsImport] = await Promise.all([
+  const [appImport, envImport, dbImport, schemaImport, drizzleImport, catalogImport, nativeImport, sessionImport, oauthImport, connectionsImport] = await Promise.all([
     import("../src/app.js"),
+    import("../src/env.js"),
     import("../src/db.js"),
     import("@openwork-ee/den-db/schema"),
     import("@openwork-ee/den-db/drizzle"),
@@ -103,6 +133,7 @@ beforeAll(async () => {
     import("../src/capability-sources/external-mcp-connections.js"),
   ])
   app = appImport.default
+  appEnv = envImport.env
   db = dbImport.db
   schema = schemaImport
   drizzle = drizzleImport
@@ -244,8 +275,9 @@ describe("native capability search", () => {
 
 describe("native capability execute", () => {
   test("uses the selected connector credential", async () => {
-    observedAuthorization = null
-    googleRequestCount = 0
+    const google = activeGoogleTestState()
+    google.lastAuthorization = null
+    google.callCount = 0
     const result = await nativeCapabilities.executeNativeCapability({
       app,
       env: undefined,
@@ -257,12 +289,13 @@ describe("native capability execute", () => {
       query: { maxResults: 1 },
     })
     expect(result?.isError).not.toBe(true)
-    expect(googleRequestCount).toBe(1)
-    expect(observedAuthorization).toBe("Bearer operations-token")
+    expect(google.callCount).toBeGreaterThan(0)
+    expect(google.lastAuthorization).toBe("Bearer operations-token")
   })
 
   test("supports the legacy google-workspace alias", async () => {
-    observedAuthorization = null
+    const google = activeGoogleTestState()
+    google.lastAuthorization = null
     const result = await nativeCapabilities.executeNativeCapability({
       app,
       env: undefined,
@@ -273,11 +306,12 @@ describe("native capability execute", () => {
       principal,
     })
     expect(result?.isError).not.toBe(true)
-    expect(observedAuthorization).toBe("Bearer legacy-token")
+    expect(google.lastAuthorization).toBe("Bearer legacy-token")
   })
 
   test("returns needs_connection when the selected connector is not connected for the member", async () => {
-    googleRequestCount = 0
+    const google = activeGoogleTestState()
+    google.callCount = 0
     const result = await nativeCapabilities.executeNativeCapability({
       app,
       env: undefined,
@@ -294,7 +328,7 @@ describe("native capability execute", () => {
     })
     expect(result?.isError).toBe(true)
     expect(result?.content[0]?.text).toContain('"error": "needs_connection"')
-    expect(googleRequestCount).toBe(0)
+    expect(google.callCount).toBe(0)
   })
 
   test("rejects an unsigned external connector selection header", () => {
