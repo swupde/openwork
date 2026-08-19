@@ -7,11 +7,26 @@ const GITHUB_API_BASE_URL = "https://api.github.com"
 const RELEASE_CACHE_TTL_MS = 5 * 60 * 1000
 const RELEASE_FETCH_TIMEOUT_MS = 3000
 const DESKTOP_RELEASE_TAG_PATTERN = /^v(\d+)\.(\d+)\.(\d+)$/
+const REQUIRED_UPDATER_MANIFEST_NAMES = new Set([
+  "cloud-linux-arm64.yml",
+  "cloud-linux.yml",
+  "cloud-mac.yml",
+  "cloud.yml",
+  "enterprise-linux-arm64.yml",
+  "enterprise-linux.yml",
+  "enterprise-mac.yml",
+  "enterprise.yml",
+  "latest-linux-arm64.yml",
+  "latest-linux.yml",
+  "latest-mac.yml",
+  "latest.yml",
+])
 
 const githubReleaseSchema = z.object({
   draft: z.boolean(),
   prerelease: z.boolean(),
   tag_name: z.string(),
+  assets: z.array(z.object({ name: z.string() })),
 })
 
 const githubReleasesSchema = z.array(githubReleaseSchema)
@@ -65,11 +80,16 @@ function copyReleaseMetadata(metadata: DesktopReleaseMetadata): DesktopReleaseMe
   }
 }
 
+function hasCompleteUpdaterManifests(release: z.infer<typeof githubReleaseSchema>) {
+  const assetNames = new Set(release.assets.map((asset) => asset.name))
+  return Array.from(REQUIRED_UPDATER_MANIFEST_NAMES).every((name) => assetNames.has(name))
+}
+
 function metadataFromReleases(releases: z.infer<typeof githubReleasesSchema>): DesktopReleaseMetadata {
   const publishedDesktopVersions = Array.from(new Set(
     releases.flatMap((release) => {
       const match = DESKTOP_RELEASE_TAG_PATTERN.exec(release.tag_name)
-      if (release.draft || release.prerelease || !match) {
+      if (release.draft || release.prerelease || !match || !hasCompleteUpdaterManifests(release)) {
         return []
       }
 

@@ -11,6 +11,30 @@ let failureRequests = 0
 let emptyRequests = 0
 let successRequestUrl: string | null = null
 
+const COMPLETE_UPDATER_MANIFEST_NAMES = [
+  "cloud-linux-arm64.yml",
+  "cloud-linux.yml",
+  "cloud-mac.yml",
+  "cloud.yml",
+  "enterprise-linux-arm64.yml",
+  "enterprise-linux.yml",
+  "enterprise-mac.yml",
+  "enterprise.yml",
+  "latest-linux-arm64.yml",
+  "latest-linux.yml",
+  "latest-mac.yml",
+  "latest.yml",
+]
+
+function release(tagName: string, options?: { draft?: boolean; prerelease?: boolean; assets?: string[] }) {
+  return {
+    draft: options?.draft ?? false,
+    prerelease: options?.prerelease ?? false,
+    tag_name: tagName,
+    assets: (options?.assets ?? COMPLETE_UPDATER_MANIFEST_NAMES).map((name) => ({ name })),
+  }
+}
+
 beforeAll(async () => {
   process.env.DATABASE_URL ??= "mysql://root:password@127.0.0.1:3306/openwork_test"
   process.env.DEN_DB_ENCRYPTION_KEY ??= "x".repeat(32)
@@ -31,15 +55,16 @@ beforeAll(async () => {
       }
       successRequestUrl = request.url
       return Response.json([
-        { draft: false, prerelease: false, tag_name: "v0.18.9" },
-        { draft: false, prerelease: false, tag_name: "v1.0.0" },
-        { draft: false, prerelease: false, tag_name: "v0.18.10" },
-        { draft: false, prerelease: false, tag_name: "v0.18.10" },
-        { draft: false, prerelease: true, tag_name: "v9.0.0" },
-        { draft: true, prerelease: false, tag_name: "v8.0.0" },
-        { draft: false, prerelease: false, tag_name: "v0.16.99" },
-        { draft: false, prerelease: false, tag_name: `v${MIN_SUPPORTED_DESKTOP_VERSION}` },
-        { draft: false, prerelease: false, tag_name: "release-7.0.0" },
+        release("v1.1.0", { assets: COMPLETE_UPDATER_MANIFEST_NAMES.filter((name) => name !== "cloud-mac.yml") }),
+        release("v0.18.9"),
+        release("v1.0.0"),
+        release("v0.18.10"),
+        release("v0.18.10"),
+        release("v9.0.0", { prerelease: true }),
+        release("v8.0.0", { draft: true }),
+        release("v0.16.99"),
+        release(`v${MIN_SUPPORTED_DESKTOP_VERSION}`),
+        release("release-7.0.0"),
       ])
     },
   })
@@ -81,6 +106,12 @@ describe("desktop release discovery", () => {
 
     expect(metadata.publishedDesktopVersions).not.toContain("9.0.0")
     expect(metadata.publishedDesktopVersions).not.toContain("8.0.0")
+  })
+
+  test("excludes a public release when any updater manifest is missing", async () => {
+    const metadata = await desktopReleases.createDesktopReleaseSource().getDesktopReleaseMetadata()
+
+    expect(metadata.publishedDesktopVersions).not.toContain("1.1.0")
   })
 
   test("falls back to the committed snapshot after a fetch failure without a request storm", async () => {
