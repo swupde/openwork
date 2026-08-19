@@ -683,6 +683,7 @@ async function connectedAccountStateForConnection(input: {
   const connectedRows = rows.filter((row) => Boolean(row.accessToken))
   const connectedAt = connectedRows
     .map((row) => row.connectedAt)
+    .filter((value): value is Date => value !== null)
     .sort((left, right) => right.getTime() - left.getTime())[0] ?? null
   return { connected: connectedRows.length > 0, connectedAt }
 }

@@ -329,6 +329,7 @@ export class ExternalMcpOAuthProvider implements OAuthClientProvider {
           scopes: tokens.scope ? tokens.scope.split(" ") : null,
           expiresAt,
           pendingCodeVerifier: null,
+          connectedAt: this.tokenExchangeCodeVerifier ? new Date() : existing?.connectedAt ?? new Date(),
         },
       })
       if (!saved) throw new Error("The external MCP connection identity changed during token persistence.")
@@ -374,6 +375,7 @@ export class ExternalMcpOAuthProvider implements OAuthClientProvider {
             tokenType: null,
             scopes: null,
             expiresAt: null,
+            connectedAt: null,
             ...(scope === "all" ? { pendingCodeVerifier: null } : {}),
           },
         })

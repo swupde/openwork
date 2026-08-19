@@ -497,6 +497,7 @@ export class DenEnterpriseMcpOAuthPersistence implements EnterpriseMcpOAuthPersi
               orgMembershipId: this.member.orgMembershipId,
               providerId: this.connection.id,
               pendingCodeVerifier,
+              connectedAt: null,
             })
           }
         } else {
@@ -656,9 +657,10 @@ export class DenEnterpriseMcpOAuthPersistence implements EnterpriseMcpOAuthPersi
           Date.now(),
           (this.isPerMember ? account?.updatedAt.getTime() : connection.updatedAt.getTime()) ?? 0,
         ) + 1)
-        const connectedAt = account
-          ? new Date(Math.max(Date.now(), account.connectedAt.getTime() + 1))
-          : new Date()
+        const connectedAt = new Date(Math.max(
+          Date.now(),
+          (account?.connectedAt?.getTime() ?? 0) + 1,
+        ))
         if (this.isPerMember && this.member) {
           if (account) {
             await tx
@@ -672,7 +674,7 @@ export class DenEnterpriseMcpOAuthPersistence implements EnterpriseMcpOAuthPersi
                 pendingCodeVerifier,
                 credentialHealth: credentialHealth("ready", null),
                 updatedAt,
-                ...(input.source === "authorization-code" ? { connectedAt } : {}),
+                ...(input.source === "authorization-code" || !account.connectedAt ? { connectedAt } : {}),
               })
               .where(eq(ConnectedAccountTable.id, account.id))
           } else {
@@ -688,6 +690,7 @@ export class DenEnterpriseMcpOAuthPersistence implements EnterpriseMcpOAuthPersi
               expiresAt,
               pendingCodeVerifier,
               credentialHealth: credentialHealth("ready", null),
+              connectedAt,
             })
           }
         } else {
@@ -739,6 +742,7 @@ export class DenEnterpriseMcpOAuthPersistence implements EnterpriseMcpOAuthPersi
               tokenType: null,
               scopes: null,
               expiresAt: null,
+              connectedAt: null,
               credentialHealth: invalidCredentialHealth(input.reason),
             })
             .where(and(

@@ -498,6 +498,13 @@
       "when": 1786982612757,
       "tag": "0071_shocking_namorita",
       "breakpoints": true
+    },
+    {
+      "idx": 72,
+      "version": "5",
+      "when": 1787142423780,
+      "tag": "0072_familiar_colonel_america",
+      "breakpoints": true
     }
   ]
 }
