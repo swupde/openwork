@@ -653,6 +653,40 @@ test("bootstrap repairs OAuth without replaying already-present later migrations
   }
 })
 
+test("bootstrap repairs a current migration ledger missing scim_provider.user_id", { skip: !mysqlUrl, timeout: 300_000 }, async () => {
+  if (!mysqlUrl) return
+
+  const root = await mysql.createConnection(mysqlUrl)
+  const database = scratchDatabaseName()
+  let connection: mysql.Connection | undefined
+  const priorDatabaseUrl = process.env.DATABASE_URL
+
+  try {
+    await root.query(`CREATE DATABASE ${quoteIdentifier(database)}`)
+    connection = await mysql.createConnection(mysqlConnectionConfigFor(mysqlUrl, database))
+    await applyStatements(connection, splitSqlStatements(await exportCurrentSchemaSql()))
+
+    process.env.DATABASE_URL = databaseUrlFor(mysqlUrl, database)
+    await bootstrapDenDb()
+    await connection.query("ALTER TABLE `scim_provider` DROP COLUMN `user_id`")
+
+    await bootstrapDenDb()
+    assert.equal(await columnNullable(connection, "scim_provider", "user_id"), "YES")
+
+    await bootstrapDenDb()
+    assert.equal(await columnNullable(connection, "scim_provider", "user_id"), "YES")
+  } finally {
+    if (priorDatabaseUrl === undefined) {
+      delete process.env.DATABASE_URL
+    } else {
+      process.env.DATABASE_URL = priorDatabaseUrl
+    }
+    await connection?.end().catch(() => {})
+    await root.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(database)}`).catch(() => {})
+    await root.end()
+  }
+})
+
 async function recreateScenarioTables(connection: mysql.Connection) {
   await connection.query("DROP TABLE IF EXISTS `inference_org_limit_policies`")
   await connection.query("DROP TABLE IF EXISTS `config_object_version`")

@@ -93,3 +93,7 @@ ship as a later migration once no deployed code references the old shape.
 - `db:generate` is the default path for new migration files.
 - `drizzle/meta/` must stay in sync with the SQL migration history so future generation stays incremental.
 - Only repair `drizzle/meta/` manually when recovering broken Drizzle history.
+- `db:bootstrap` and `db:migrate` run the idempotent repairs in
+  `src/schema-repairs.ts` after committed migrations. Add a repair only for a
+  demonstrated production drift that the migration ledger can no longer replay;
+  normal schema evolution still belongs in generated migrations.

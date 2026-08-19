@@ -85,6 +85,15 @@ async function tableExists(executor: Executor, table: string) {
   return rows.length > 0
 }
 
+async function columnExists(executor: Executor, table: string, column: string) {
+  const rows = await executor.query(
+    `SELECT 1 AS present FROM information_schema.COLUMNS
+     WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ? LIMIT 1`,
+    [table, column],
+  )
+  return rows.length > 0
+}
+
 async function organizationColumnNullability(executor: Executor, table: string): Promise<ColumnNullability | undefined> {
   const rows = await executor.query(
     `SELECT is_nullable AS is_nullable FROM information_schema.COLUMNS
@@ -194,6 +203,17 @@ async function ensureInferenceOrgLimitAmountNullable(executor: Executor) {
   console.log("[den-db] inference_org_limit_policies.limit_amount made nullable")
 }
 
+async function ensureScimProviderUserId(executor: Executor) {
+  const tableName = "scim_provider"
+  const columnName = "user_id"
+  if (!(await tableExists(executor, tableName)) || await columnExists(executor, tableName, columnName)) {
+    return
+  }
+
+  await runDdl(executor, "ALTER TABLE `scim_provider` ADD COLUMN `user_id` varchar(64) NULL")
+  console.log("[den-db] scim_provider.user_id column added")
+}
+
 export async function ensureSchemaRepairs(executor: Executor): Promise<void> {
   for (const repair of ORGANIZATION_REPAIRS) {
     if (!(await tableExists(executor, repair.table))) {
@@ -211,4 +231,5 @@ export async function ensureSchemaRepairs(executor: Executor): Promise<void> {
   }
 
   await ensureInferenceOrgLimitAmountNullable(executor)
+  await ensureScimProviderUserId(executor)
 }
