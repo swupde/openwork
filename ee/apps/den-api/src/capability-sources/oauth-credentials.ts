@@ -64,6 +64,7 @@ export type ConnectedAccountUpsertInput = {
   tokenType?: string | null
   expiresAt?: Date | null
   pendingCodeVerifier?: string | null
+  connectedAt?: Date | null
 }
 
 function connectedAccountChanges(input: ConnectedAccountUpsertInput) {
@@ -75,6 +76,7 @@ function connectedAccountChanges(input: ConnectedAccountUpsertInput) {
     ...(input.tokenType !== undefined ? { tokenType: input.tokenType } : {}),
     ...(input.expiresAt !== undefined ? { expiresAt: input.expiresAt } : {}),
     ...(input.pendingCodeVerifier !== undefined ? { pendingCodeVerifier: input.pendingCodeVerifier } : {}),
+    ...(input.connectedAt !== undefined ? { connectedAt: input.connectedAt } : {}),
   }
 }
 
@@ -169,6 +171,7 @@ export async function upsertConnectedAccount(input: ConnectedAccountUpsertInput)
     tokenType: input.tokenType ?? null,
     expiresAt: input.expiresAt ?? null,
     pendingCodeVerifier: input.pendingCodeVerifier ?? null,
+    connectedAt: input.connectedAt ?? null,
   })
   return (await getConnectedAccount(input))!
 }

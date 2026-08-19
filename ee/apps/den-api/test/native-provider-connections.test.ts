@@ -206,6 +206,7 @@ async function seedPendingGoogleOAuth(label: string) {
     providerId: "google-workspace",
     pendingCodeVerifier: "callback-pkce-verifier",
   })
+  expect(pending.connectedAt).toBeNull()
   const secret = process.env.BETTER_AUTH_SECRET
   if (!secret) throw new Error("BETTER_AUTH_SECRET is required")
   const state = genericOAuth.createOAuthStateToken({
@@ -399,6 +400,7 @@ describe("buildNativeProviderEntry", () => {
       externalAccountId: "connected@example.com",
       accessToken: "callback-access-token",
       pendingCodeVerifier: null,
+      connectedAt: expect.any(Date),
     })
   })
 

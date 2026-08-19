@@ -95,7 +95,11 @@ export const ConnectedAccountTable = mysqlTable(
      */
     pendingCodeVerifier: encryptedTextColumn("pending_code_verifier"),
     credentialHealth: compatJsonColumn<ExternalMcpCredentialHealth>("credential_health"),
-    connectedAt: timestamp("connected_at", { fsp: 3 }).notNull().defaultNow(),
+    /**
+     * A credential becomes connected only after a token exchange commits.
+     * Pending PKCE rows deliberately remain unconnected.
+     */
+    connectedAt: timestamp("connected_at", { fsp: 3 }),
     updatedAt: timestamp("updated_at", { fsp: 3 })
       .notNull()
       .default(sql`CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)`),

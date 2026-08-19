@@ -395,7 +395,7 @@ describe("Den enterprise MCP OAuth persistence adapter", () => {
     expect(clients).toEqual([])
   })
 
-  test("advances a per-member connectedAt only after a fresh authorization callback commits", async () => {
+  test("marks a pending per-member account connected only after its authorization callback commits", async () => {
     const perMemberConnection = await createExternalMcpConnection({
       organizationId,
       name: "Enterprise MCP reconnect completion",
@@ -441,6 +441,8 @@ describe("Den enterprise MCP OAuth persistence adapter", () => {
       .limit(1)
     const before = beforeRows[0]
     if (!before) throw new Error("Expected the pending account row.")
+    expect(before.accessToken).toBeNull()
+    expect(before.connectedAt).toBeNull()
 
     await persistence.credentials.save({
       context: reconnectContext,
@@ -456,7 +458,20 @@ describe("Den enterprise MCP OAuth persistence adapter", () => {
       .where(drizzle.eq(schema.ConnectedAccountTable.id, before.id))
       .limit(1)
     expect(afterRows[0]?.accessToken).toBe("fresh-member-access")
-    expect(afterRows[0]?.connectedAt.getTime()).toBeGreaterThan(before.connectedAt.getTime())
+    expect(afterRows[0]?.connectedAt).toBeInstanceOf(Date)
+
+    await persistence.credentials.invalidate({
+      context: reconnectContext,
+      reason: "provider-rejected",
+    })
+
+    const invalidatedRows = await db
+      .select()
+      .from(schema.ConnectedAccountTable)
+      .where(drizzle.eq(schema.ConnectedAccountTable.id, before.id))
+      .limit(1)
+    expect(invalidatedRows[0]?.accessToken).toBeNull()
+    expect(invalidatedRows[0]?.connectedAt).toBeNull()
   })
 
   test("removes a denied per-member authorization and keeps repeated cleanup idempotent", async () => {
