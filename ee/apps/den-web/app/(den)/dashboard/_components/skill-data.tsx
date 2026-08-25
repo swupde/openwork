@@ -113,25 +113,28 @@ export function useSkill(pluginId: string, skillId: string) {
 
 export function useCreateSkill(pluginId: string) {
   const queryClient = useQueryClient();
+  const { runReauthableAction } = useOrgDashboard();
 
   return useMutation({
     mutationFn: async (draft: SkillDraft): Promise<DenSkill> => {
-      const { response, payload } = await requestJson(
-        "/v1/config-objects",
-        {
-          method: "POST",
-          body: JSON.stringify(createSkillPayload(pluginId, draft)),
-        },
-        15000,
-      );
-      if (!response.ok) {
-        throw getRequestError(payload, response, `Failed to create skill (${response.status}).`);
-      }
-      const skill = parseSkillResponse(payload);
-      if (!skill) {
-        throw new Error("Skill create response was incomplete.");
-      }
-      return skill;
+      return runSkillMutation(runReauthableAction, "create-skill", async () => {
+        const { response, payload } = await requestJson(
+          "/v1/config-objects",
+          {
+            method: "POST",
+            body: JSON.stringify(createSkillPayload(pluginId, draft)),
+          },
+          15000,
+        );
+        if (!response.ok) {
+          throw getRequestError(payload, response, `Failed to create skill (${response.status}).`);
+        }
+        const skill = parseSkillResponse(payload);
+        if (!skill) {
+          throw new Error("Skill create response was incomplete.");
+        }
+        return skill;
+      });
     },
     onSuccess: async () => {
       await Promise.all([
@@ -144,28 +147,31 @@ export function useCreateSkill(pluginId: string) {
 
 export function useUpdateSkill(pluginId: string) {
   const queryClient = useQueryClient();
+  const { runReauthableAction } = useOrgDashboard();
 
   return useMutation({
     mutationFn: async (input: { skillId: string; draft: SkillDraft }): Promise<DenSkill> => {
-      const { response, payload } = await requestJson(
-        `/v1/config-objects/${encodeURIComponent(input.skillId)}/versions`,
-        {
-          method: "POST",
-          body: JSON.stringify({
-            input: { rawSourceText: skillSourceFromDraft(input.draft) },
-            reason: "Updated from Den Web",
-          }),
-        },
-        15000,
-      );
-      if (!response.ok) {
-        throw getRequestError(payload, response, `Failed to save skill (${response.status}).`);
-      }
-      const skill = parseSkillResponse(payload);
-      if (!skill) {
-        throw new Error("Skill update response was incomplete.");
-      }
-      return skill;
+      return runSkillMutation(runReauthableAction, "update-skill", async () => {
+        const { response, payload } = await requestJson(
+          `/v1/config-objects/${encodeURIComponent(input.skillId)}/versions`,
+          {
+            method: "POST",
+            body: JSON.stringify({
+              input: { rawSourceText: skillSourceFromDraft(input.draft) },
+              reason: "Updated from Den Web",
+            }),
+          },
+          15000,
+        );
+        if (!response.ok) {
+          throw getRequestError(payload, response, `Failed to save skill (${response.status}).`);
+        }
+        const skill = parseSkillResponse(payload);
+        if (!skill) {
+          throw new Error("Skill update response was incomplete.");
+        }
+        return skill;
+      });
     },
     onSuccess: async () => {
       await Promise.all([
@@ -182,7 +188,7 @@ export function useDeleteSkill(pluginId: string) {
 
   return useMutation({
     mutationFn: async (skillId: string): Promise<string> => {
-      await runReauthableAction("delete-skill", async () => {
+      return runSkillMutation(runReauthableAction, "delete-skill", async () => {
         const { response, payload } = await requestJson(
           `/v1/config-objects/${encodeURIComponent(skillId)}/delete`,
           { method: "POST" },
@@ -191,8 +197,8 @@ export function useDeleteSkill(pluginId: string) {
         if (!response.ok) {
           throw getRequestError(payload, response, `Failed to delete skill (${response.status}).`);
         }
+        return skillId;
       });
-      return skillId;
     },
     onSuccess: async () => {
       await queryClient.cancelQueries({ queryKey: skillQueryKeys.all });
@@ -200,4 +206,19 @@ export function useDeleteSkill(pluginId: string) {
       await queryClient.invalidateQueries({ queryKey: pluginQueryKeys.detail(pluginId) });
     },
   });
+}
+
+async function runSkillMutation<T>(
+  runReauthableAction: (label: string, action: () => Promise<void>) => Promise<void>,
+  label: string,
+  action: () => Promise<T>,
+): Promise<T> {
+  let result: T | undefined;
+  await runReauthableAction(label, async () => {
+    result = await action();
+  });
+  if (result === undefined) {
+    throw new Error("Skill mutation did not return a result.");
+  }
+  return result;
 }

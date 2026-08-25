@@ -12,7 +12,7 @@ import {
 } from "./catalog.js"
 import { buildExternalConnectionStatus, type ExternalCapabilityMatch, type McpMemberIdentity } from "./external-capabilities.js"
 import { invokeMcpOperation, normalizeToolBody, normalizeToolRecord } from "./invoke.js"
-import { compareCapabilityMatches, scoreText, tokenize, type CapabilityMatch } from "./search.js"
+import { compareCapabilityMatches, querySchemaFor, scoreText, tokenize, type CapabilityMatch } from "./search.js"
 import {
   codemodeScriptPath,
   resolveCodemodeConnectionNamespaceContext,
@@ -74,6 +74,7 @@ function capabilityMatch(
   scriptNamespace?: string,
 ): NativeCapabilityMatch {
   const bodySchema = getJsonRequestBodySchema(operation.operation)
+  const queryParameters = getParameters(operation.operation, "query")
   return {
     name: buildNativeCapabilityName(connection.id, operation.name),
     method: operation.method,
@@ -81,8 +82,9 @@ function capabilityMatch(
     score,
     summary: `[${connection.name}] ${operationSummary(operation)}`,
     pathParams: pathParameterNamesFromTemplate(operation.path),
-    queryParams: getParameters(operation.operation, "query")
+    queryParams: queryParameters
       .flatMap((parameter) => typeof parameter.name === "string" ? [parameter.name] : []),
+    ...(queryParameters.length === 0 ? {} : { querySchema: querySchemaFor(queryParameters) }),
     hasBody: hasJsonRequestBody(operation.operation),
     inputSchema: operation.inputSchema,
     ...(bodySchema === undefined ? {} : { bodySchema }),

@@ -1,17 +1,20 @@
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
 import { randomUUID } from "node:crypto"
-import { readdir, readFile } from "node:fs/promises"
+import { copyFile, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import test from "node:test"
 import { fileURLToPath } from "node:url"
 import { createDenTypeId } from "@openwork-ee/utils/typeid"
 import { drizzle } from "drizzle-orm/mysql2"
 import { migrate } from "drizzle-orm/mysql2/migrator"
+import { readMigrationFiles } from "drizzle-orm/migrator"
 import mysql from "mysql2/promise"
 import { ensureFulltextIndexes } from "../src/fulltext.ts"
 import { parseMySqlConnectionConfig } from "../src/mysql-config.ts"
 import { ensureSchemaRepairs, type Executor } from "../src/schema-repairs.ts"
+import { bootstrapDenDb } from "../scripts/bootstrap.ts"
 import {
   ConfigObjectTable,
   ConfigObjectVersionTable,
@@ -146,6 +149,22 @@ async function runDrizzleKitExport(runner: ExportRunner = defaultExportRunner, r
 
 async function exportCurrentSchemaSql() {
   return runDrizzleKitExport()
+}
+
+async function legacyPreOauthMigrationFolder() {
+  const journal = JSON.parse(await readFile(join(migrationsFolder, "meta", "_journal.json"), "utf8")) as {
+    entries: Array<{ idx: number; tag: string }>
+  }
+  const entries = journal.entries.filter((entry) => entry.idx <= 55)
+  const folder = await mkdtemp(join(tmpdir(), "openwork-den-legacy-migrations-"))
+  await mkdir(join(folder, "meta"), { recursive: true })
+  await writeFile(join(folder, "meta", "_journal.json"), JSON.stringify({ version: "7", dialect: "mysql", entries }))
+
+  for (const entry of entries) {
+    await copyFile(join(migrationsFolder, `${entry.tag}.sql`), join(folder, `${entry.tag}.sql`))
+  }
+
+  return folder
 }
 
 test("drizzle-kit export retries empty SQL and returns the successful retry", async () => {
@@ -511,6 +530,49 @@ test("migrations replay to exported schema and config object version inserts", {
     await root.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(migratedDatabase)}`).catch(() => {})
     await root.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(exportedDatabase)}`).catch(() => {})
     await root.end()
+  }
+})
+
+test("bootstrap repairs a legacy pre-oauth schema that was falsely marked current", { skip: !mysqlUrl, timeout: 300_000 }, async () => {
+  if (!mysqlUrl) return
+
+  const root = await mysql.createConnection(mysqlUrl)
+  const database = scratchDatabaseName()
+  const legacyFolder = await legacyPreOauthMigrationFolder()
+  let connection: mysql.Connection | undefined
+  const priorDatabaseUrl = process.env.DATABASE_URL
+
+  try {
+    await root.query(`CREATE DATABASE ${quoteIdentifier(database)}`)
+    connection = await mysql.createConnection(mysqlConnectionConfigFor(mysqlUrl, database))
+
+    const exportStatements = splitSqlStatements(await exportCurrentSchemaSql())
+    const ownedTables = await migrationOwnedTables()
+    const ownedIndexes = await migrationOwnedIndexes()
+    const nonMigrationOwnedTables = new Set(exportTableNames(exportStatements).filter((tableName) => !ownedTables.has(tableName)))
+    await seedNonMigrationOwnedTables(connection, exportStatements, nonMigrationOwnedTables, ownedIndexes)
+    await migrate(drizzle(connection), { migrationsFolder: legacyFolder })
+    await connection.query("DROP TABLE `__drizzle_migrations`")
+    await connection.query("CREATE TABLE `__drizzle_migrations` (`id` serial primary key, `hash` text not null, `created_at` bigint)")
+    for (const migration of readMigrationFiles({ migrationsFolder })) {
+      await connection.query("INSERT INTO `__drizzle_migrations` (`hash`, `created_at`) VALUES (?, ?)", [migration.hash, migration.folderMillis])
+    }
+
+    process.env.DATABASE_URL = databaseUrlFor(mysqlUrl, database)
+    await bootstrapDenDb()
+
+    const oauthResource = await queryRecords(connection, "SHOW TABLES LIKE 'oauthResource'")
+    assert.equal(oauthResource.length, 1, "bootstrap must apply the missing OAuth migration instead of trusting a false baseline")
+  } finally {
+    if (priorDatabaseUrl === undefined) {
+      delete process.env.DATABASE_URL
+    } else {
+      process.env.DATABASE_URL = priorDatabaseUrl
+    }
+    await connection?.end().catch(() => {})
+    await root.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(database)}`).catch(() => {})
+    await root.end()
+    await rm(legacyFolder, { recursive: true, force: true })
   }
 })
 

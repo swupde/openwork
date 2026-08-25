@@ -113,6 +113,14 @@ export const SEARCH_CAPABILITIES_ANNOTATIONS: ToolAnnotations = {
   idempotentHint: true,
   openWorldHint: true,
 }
+
+export const SEARCH_CAPABILITIES_DESCRIPTION = [
+  "Search for a capability by keyword. This connection exposes execute_capability, create_skill, and update_skill for the exact result; there is no list of individually-named tools to browse.",
+  "For an org-connected service, search once with one precise query, then execute an exact returned capability. A loaded capability-specific skill may name an exact connector-namespaced capability; execute that exact name directly instead of searching. Reuse an exact capability already returned in this task instead of searching again. Search a second time only when the first search returned no usable match or the server reports unknown_capability.",
+  "Search covers native Google Workspace capabilities (Gmail, Calendar, Drive, Gmail drafts), org-connected external MCPs, and namespaced OpenWork Admin tools for allowlisted platform admins.",
+  "Native API matches include a connector-namespaced name, pathParams, queryParams, querySchema, hasBody, and bodySchema. External MCP matches include argumentsSchema, schemaDigest, and invocation.argumentsField. A match with kind mcp_app is a standard MCP App launch capability from a connected MCP server; execute it normally and the OpenWork host will render its advertised ui:// resource.",
+  "Built-in and marketplace skill matches return SKILL.md content when executed.",
+].join(" ")
 export const EXECUTE_CAPABILITY_ANNOTATIONS: ToolAnnotations = {
   readOnlyHint: false,
   destructiveHint: true,
@@ -169,7 +177,7 @@ export const AGENT_MCP_INSTRUCTIONS = [
   "When a member asks to keep a successful Code Mode result, save it as a Workflow inside the existing OpenWork Connect Plugin they name by passing that pluginId to the Workflow save operation. Omit pluginId only for a private Workflow in the member's My Workflows Plugin. A Workflow inherits discovery and sharing from its Plugin and any Marketplace containing that Plugin; do not create a separate Workflow package or marketplace entry.",
   "Capabilities include native Google Workspace operations (Gmail read/search, Calendar list/create, Drive search/read, and Gmail draft creation) executed with the signed-in member's organization credentials, plus any MCP connections the organization has added.",
   "Allowlisted platform admins can also discover namespaced OpenWork Admin capabilities through this same connection; other members cannot discover or execute them.",
-  "Always call search_capabilities first with 2-4 keyword variants before concluding something is unavailable. Use execute_capability only with exact names returned by search_capabilities.",
+  "For an org-connected service, search once with one precise query, then execute an exact returned capability. A loaded capability-specific skill may name an exact connector-namespaced capability; execute that exact name directly instead of searching. Reuse an exact capability already returned in this task instead of searching again. Search a second time only when the first search returned no usable match or the server reports unknown_capability. Follow every returned parameter limit exactly, use default result limits first, batch independent reads in one tool round, fetch details only for selected records, and never repeat an unchanged failed call.",
   "Built-in remote skills create-skill, share-plugin, add-to-marketplace, and add-user-to-marketplace are always listed in the skill index. Retrieve and follow the matching one by executing its exact capability; do not invent a local copy to access them.",
   "For a request to add a public GitHub plugin to an organization marketplace, search for the marketplace list, GitHub plugin import preview, GitHub plugin marketplace import, and resolved marketplace detail capabilities. Preview first; do not recreate the plugin by hand.",
   "Before importing, confirm the target marketplace, selected skill/server keys, and who can use them. Do not choose one authentication type for every server: the import route resolves known presets and plugin declarations, while the request authType is only a fallback for unknown servers.",
@@ -521,17 +529,9 @@ export function registerAgentMcpRoutes<T extends { Variables: RequestIdVariables
       SEARCH_CAPABILITIES_TOOL_NAME,
       {
         title: "Search capabilities",
-        description: [
-          codemodeEnabled
-            ? "Search for a capability by keyword. This connection also exposes execute_capability, create_skill, update_skill, and execute_capability_script —"
-            : "Search for a capability by keyword. This connection also exposes execute_capability, create_skill, and update_skill —",
-          "there is no list of individually-named tools to browse. Always search first.",
-          "Search covers native Google Workspace capabilities (Gmail, Calendar, Drive, Gmail drafts), org-connected external MCPs, and namespaced OpenWork Admin tools for allowlisted platform admins.",
-          "When Workflows are enabled, accessible Workflows appear as marketplace matches with kind workflow and execute through execute_capability like every other exact search result.",
-          "Try 2-4 keyword variants before deciding a capability is unavailable.",
-          "Native API matches include a connector-namespaced name, pathParams, queryParams, hasBody, and bodySchema. External MCP matches include argumentsSchema, schemaDigest, and invocation.argumentsField. A match with kind mcp_app is a standard MCP App launch capability from a connected MCP server; execute it normally and the OpenWork host will render its advertised ui:// resource.",
-          "Built-in and marketplace skill matches return SKILL.md content when executed.",
-        ].join(" "),
+        description: codemodeEnabled
+          ? `${SEARCH_CAPABILITIES_DESCRIPTION} When Code Mode is enabled, accessible Programs appear as marketplace matches with kind script and execute through execute_capability like every other exact search result. This connection also exposes execute_capability_script.`
+          : `${SEARCH_CAPABILITIES_DESCRIPTION} When Workflows are enabled, accessible Workflows appear as marketplace matches with kind workflow and execute through execute_capability like every other exact search result.`,
         annotations: SEARCH_CAPABILITIES_ANNOTATIONS,
         _meta: { ui: { visibility: ["model", "app"] } },
         inputSchema: z.object({

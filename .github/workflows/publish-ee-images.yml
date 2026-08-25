@@ -48,6 +48,10 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
+  # The only production consumer for these release images is our x86_64 Dokploy
+  # host. Building arm64 through QEMU adds roughly half an hour to each tagged
+  # internal release without serving a deployed platform.
+  RELEASE_PLATFORM: linux/amd64
 
 jobs:
   artifact-version:
@@ -242,7 +246,7 @@ jobs:
         with:
           context: .
           file: ${{ matrix.dockerfile }}
-          platforms: ${{ (github.event_name == 'pull_request' || github.ref == 'refs/heads/dev') && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
+          platforms: ${{ env.RELEASE_PLATFORM }}
           load: ${{ github.event_name == 'pull_request' }}
           push: ${{ needs.artifact-version.outputs.publish == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
@@ -261,7 +265,7 @@ jobs:
         with:
           context: .
           file: ${{ matrix.dockerfile }}
-          platforms: ${{ (github.event_name == 'pull_request' || github.ref == 'refs/heads/dev') && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
+          platforms: ${{ env.RELEASE_PLATFORM }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
