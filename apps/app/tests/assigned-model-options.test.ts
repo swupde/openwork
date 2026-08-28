@@ -70,11 +70,103 @@ describe("assigned model options", () => {
     ]);
   });
 
+  test("preserves validated model.config.openwork guidance metadata", () => {
+    const [result] = assignedModelOptions([provider({
+      id: "lpr_openai",
+      source: "custom",
+      providerId: "openai",
+      name: "OpenAI",
+      hasApiKey: true,
+      models: [{
+        id: "openai-terra",
+        name: "openai-terra",
+        config: {
+          openwork: {
+            alias: "openai-terra",
+            dataContexts: ["internal"],
+            verification: {
+              status: "verified",
+              verifiedAt: "2026-08-27T12:00:00.000Z",
+              evidenceRef: "change-2026-08-27",
+            },
+          },
+        },
+        createdAt: null,
+      }],
+    })]);
+    expect(result?.workPolicy).toEqual({
+      alias: "openai-terra",
+      dataContexts: ["internal"],
+      verification: {
+        status: "verified",
+        verifiedAt: "2026-08-27T12:00:00.000Z",
+        evidenceRef: "change-2026-08-27",
+      },
+    });
+    expect(result?.title).toBe("OpenAI Terra");
+  });
+
+  test("drops malformed deployment verification metadata instead of treating it as proof", () => {
+    const [result] = assignedModelOptions([provider({
+      id: "lpr_nemotron",
+      source: "custom",
+      providerId: "bedrock",
+      name: "Bedrock",
+      hasApiKey: true,
+      models: [{
+        id: "nemotron-super-3-120b",
+        name: "Nemotron",
+        config: {
+          openwork: {
+            alias: "nemotron-super-3-120b",
+            dataContexts: ["client"],
+            deployment: { provider: "bedrock", region: "eu-central-1" },
+            verification: { status: "verified", verifiedAt: "not-a-date", evidenceRef: "" },
+          },
+        },
+        createdAt: null,
+      }],
+    })]);
+    expect(result?.workPolicy).toBeUndefined();
+  });
+
+  test("preserves an explicit required verification state without treating it as proof", () => {
+    const [result] = assignedModelOptions([provider({
+      id: "lpr_nemotron",
+      source: "custom",
+      providerId: "swup-litellm",
+      name: "SwitchUp AI models",
+      hasApiKey: true,
+      models: [{
+        id: "nemotron-super-3-120b",
+        name: "Nemotron Super 3 120B",
+        config: {
+          openwork: {
+            alias: "nemotron-super-3-120b",
+            dataContexts: ["client"],
+            deployment: {
+              provider: "bedrock",
+              region: "eu-central-1",
+              inferenceMode: "in-region",
+              providerModelId: "nvidia.nemotron-super-3-120b",
+            },
+            verification: { status: "required", verifiedAt: null, evidenceRef: null },
+          },
+        },
+        createdAt: null,
+      }],
+    })]);
+    expect(result?.workPolicy?.verification).toEqual({ status: "required", verifiedAt: null, evidenceRef: null });
+  });
+
   test("keeps local API-key models and lets the live workspace catalog replace fallbacks", () => {
-    const fallback = option("lpr_anthropic_team", "claude-sonnet", "Assigned Sonnet");
+    const fallback = {
+      ...option("lpr_anthropic_team", "claude-sonnet", "Assigned Sonnet"),
+      workPolicy: { alias: "claude-sonnet", dataContexts: ["internal" as const] },
+    };
     const live = option("lpr_anthropic_team", "claude-sonnet", "Live Sonnet");
     const local = option("openai", "gpt-5", "GPT-5");
 
-    expect(mergeModelOptions([live, local], [fallback])).toEqual([live, local]);
+    expect(mergeModelOptions([live, local], [fallback])).toEqual([{ ...live, workPolicy: fallback.workPolicy }, local]);
   });
 });

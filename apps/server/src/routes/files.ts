@@ -5,6 +5,8 @@ import { Readable } from "node:stream";
 import { recordAudit } from "../audit.js";
 import { ApiError } from "../errors.js";
 import { FileSessionStore } from "../file-sessions.js";
+import { runtimeStorageDir } from "../runtime-db.js";
+import { runtimeWorkspaceInboxDir, runtimeWorkspaceOutboxDir } from "../runtime-workspace-files.js";
 import type { ApprovalRequest, ServerConfig, TokenScope, WorkspaceInfo } from "../types.js";
 import { ensureDir, exists, shortId } from "../utils.js";
 import { addRoute, type RequestContext, type Route } from "./registry.js";
@@ -37,12 +39,12 @@ interface RegisterFileRoutesOptions {
   scopeRank: (scope: TokenScope) => number;
 }
 
-function resolveInboxDir(workspaceRoot: string): string {
-  return join(workspaceRoot, ".opencode", "openwork", "inbox");
+function resolveInboxDir(config: ServerConfig, workspaceRoot: string): string {
+  return runtimeWorkspaceInboxDir(runtimeStorageDir(config), workspaceRoot);
 }
 
-function resolveOutboxDir(workspaceRoot: string): string {
-  return join(workspaceRoot, ".opencode", "openwork", "outbox");
+function resolveOutboxDir(config: ServerConfig, workspaceRoot: string): string {
+  return runtimeWorkspaceOutboxDir(runtimeStorageDir(config), workspaceRoot);
 }
 
 export function normalizeWorkspaceRelativePath(input: string, options: { allowSubdirs: boolean }): string {
@@ -571,7 +573,7 @@ export function registerFileRoutes(options: RegisterFileRoutesOptions): void {
     if (!resolveInboxEnabled()) {
       return jsonResponse({ items: [] });
     }
-    const inboxRoot = resolveInboxDir(workspace.path);
+    const inboxRoot = resolveInboxDir(config, workspace.path);
     const items = await listInbox(inboxRoot);
     return jsonResponse({ items });
   });
@@ -581,7 +583,7 @@ export function registerFileRoutes(options: RegisterFileRoutesOptions): void {
     if (!resolveInboxEnabled()) {
       throw new ApiError(404, "inbox_disabled", "Workspace inbox is disabled");
     }
-    const inboxRoot = resolveInboxDir(workspace.path);
+    const inboxRoot = resolveInboxDir(config, workspace.path);
     const relativePath = decodeInboxId(ctx.params.inboxId);
     const absPath = resolveSafeChildPath(inboxRoot, relativePath);
     if (!(await exists(absPath))) {
@@ -623,7 +625,7 @@ export function registerFileRoutes(options: RegisterFileRoutesOptions): void {
     const requestedPath = queryPath.trim() ? queryPath : formPath.trim() ? formPath : file.name;
 
     const relativePath = normalizeWorkspaceRelativePath(requestedPath, { allowSubdirs: true });
-    const inboxRoot = resolveInboxDir(workspace.path);
+    const inboxRoot = resolveInboxDir(config, workspace.path);
     const dest = resolveSafeChildPath(inboxRoot, relativePath);
     const maxBytes = resolveInboxMaxBytes();
     if (file.size > maxBytes) {
@@ -653,7 +655,7 @@ export function registerFileRoutes(options: RegisterFileRoutesOptions): void {
       timestamp: Date.now(),
     });
 
-    return jsonResponse({ ok: true, path: relativePath, bytes: file.size });
+    return jsonResponse({ ok: true, path: relativePath, executionPath: dest, bytes: file.size });
   });
 
   addRoute(routes, "GET", "/workspace/:id/artifacts", "client", async (ctx) => {
@@ -661,7 +663,7 @@ export function registerFileRoutes(options: RegisterFileRoutesOptions): void {
     if (!resolveOutboxEnabled()) {
       return jsonResponse({ items: [] });
     }
-    const outboxRoot = resolveOutboxDir(workspace.path);
+    const outboxRoot = resolveOutboxDir(config, workspace.path);
     const items = await listArtifacts(outboxRoot);
     return jsonResponse({ items });
   });
@@ -671,7 +673,7 @@ export function registerFileRoutes(options: RegisterFileRoutesOptions): void {
     if (!resolveOutboxEnabled()) {
       throw new ApiError(404, "outbox_disabled", "Workspace outbox is disabled");
     }
-    const outboxRoot = resolveOutboxDir(workspace.path);
+    const outboxRoot = resolveOutboxDir(config, workspace.path);
     const relativePath = decodeArtifactId(ctx.params.artifactId);
     const absPath = resolveSafeChildPath(outboxRoot, relativePath);
     if (!(await exists(absPath))) {

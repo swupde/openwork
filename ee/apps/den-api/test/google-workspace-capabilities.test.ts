@@ -87,6 +87,7 @@ const FULL_SCOPES = [GMAIL_READ_SCOPE, CALENDAR_READ_SCOPE, CALENDAR_EVENTS_SCOP
 let lastAuthorization: string | null = null
 let googleCallCount = 0
 let googleCallUrls: string[] = []
+let googleRequests: Array<{ path: string; method: string; body: unknown }> = []
 let forceGoogleError = false
 let forceGmailThreadError = false
 let lastDriveQuery: string | null = null
@@ -101,6 +102,7 @@ let calendarCreateCount = 0
 let lastDraftPayload: unknown = null
 let lastGmailThreadUrl: string | null = null
 let forceDriveUploadError = false
+let forceNativeFileError = false
 let largeDriveContentHitCount = 0
 // Bun loads these API suites into one process, while Den captures its API base
 // URL once at module import. Expose only the observation state needed by the
@@ -120,6 +122,7 @@ function resetFakeGoogle() {
   sharedGoogleTestState.lastAuthorization = null
   sharedGoogleTestState.callCount = 0
   googleCallUrls = []
+  googleRequests = []
   forceGoogleError = false
   forceGmailThreadError = false
   lastDriveQuery = null
@@ -134,6 +137,7 @@ function resetFakeGoogle() {
   lastDraftPayload = null
   lastGmailThreadUrl = null
   forceDriveUploadError = false
+  forceNativeFileError = false
   largeDriveContentHitCount = 0
 }
 
@@ -172,6 +176,16 @@ const fakeGoogleServer = Bun.serve({
     googleCallCount += 1
     sharedGoogleTestState.callCount += 1
     googleCallUrls.push(request.url)
+    const requestText = request.method === "GET" || request.method === "HEAD" ? "" : await request.clone().text()
+    let requestBody: unknown = requestText
+    if (requestText && request.headers.get("content-type")?.includes("application/json")) {
+      try {
+        requestBody = JSON.parse(requestText)
+      } catch {
+        requestBody = requestText
+      }
+    }
+    googleRequests.push({ path: url.pathname, method: request.method, body: requestBody })
     lastAuthorization = request.headers.get("authorization")
     sharedGoogleTestState.lastAuthorization = lastAuthorization
 
@@ -284,6 +298,53 @@ const fakeGoogleServer = Bun.serve({
           entryPoints: [{ entryPointType: "video", uri: "https://meet.google.com/updated-meet" }],
         },
       })
+    }
+
+    if (url.pathname === "/v1/documents" && request.method === "POST") {
+      if (forceNativeFileError) return new Response("native create exploded", { status: 500 })
+      return json({ documentId: "native_doc_1" })
+    }
+    if (url.pathname === "/v1/documents/native_doc_existing" && request.method === "GET") {
+      return json({ documentId: "native_doc_existing", body: { content: [{ endIndex: 12 }] } })
+    }
+    if (/^\/v1\/documents\/native_doc_(?:1|existing):batchUpdate$/.test(url.pathname) && request.method === "POST") {
+      return json({ replies: [] })
+    }
+    if (url.pathname === "/v4/spreadsheets" && request.method === "POST") {
+      return json({ spreadsheetId: "native_sheet_1", sheets: [{ properties: { sheetId: 1, title: "Summary" } }] })
+    }
+    if (url.pathname === "/v4/spreadsheets/native_sheet_existing" && request.method === "GET") {
+      return json({ spreadsheetId: "native_sheet_existing", sheets: [{ properties: { sheetId: 7, title: "Old" } }, { properties: { sheetId: 8, title: "Extra" } }] })
+    }
+    if (/^\/v4\/spreadsheets\/native_sheet_(?:1|existing):batchUpdate$/.test(url.pathname) && request.method === "POST") {
+      return json({ replies: [] })
+    }
+    if (/^\/v4\/spreadsheets\/native_sheet_(?:1|existing)\/values\//.test(url.pathname)) {
+      return json({ updatedRows: 2 })
+    }
+    if (url.pathname === "/v1/presentations" && request.method === "POST") {
+      return json({ presentationId: "native_slides_1", slides: [{ objectId: "default_slide" }] })
+    }
+    if (url.pathname === "/v1/presentations/native_slides_existing" && request.method === "GET") {
+      return json({ presentationId: "native_slides_existing", slides: [{ objectId: "old_slide" }] })
+    }
+    if (/^\/v1\/presentations\/native_slides_(?:1|existing):batchUpdate$/.test(url.pathname) && request.method === "POST") {
+      return json({ replies: [] })
+    }
+
+    const nativeDriveMatch = /^\/drive\/v3\/files\/(native_(?:doc|sheet|slides)_(?:1|existing))$/.exec(url.pathname)
+    if (nativeDriveMatch) {
+      const fileId = nativeDriveMatch[1]
+      if (url.searchParams.get("fields") === "parents" && request.method === "GET") return json({ parents: ["root"] })
+      const type = fileId.includes("doc") ? "document" : fileId.includes("sheet") ? "spreadsheet" : "presentation"
+      const metadata = {
+        id: fileId,
+        name: type === "document" ? "Native document" : type === "spreadsheet" ? "Native spreadsheet" : "Native presentation",
+        mimeType: `application/vnd.google-apps.${type}`,
+        modifiedTime: "2026-08-27T12:00:00Z",
+        webViewLink: `https://docs.google.test/${type}/${fileId}`,
+      }
+      return json(metadata)
     }
 
     if (url.pathname === "/drive/v3/files") {
@@ -1101,6 +1162,95 @@ test("direct Drive upload preserves exact multipart bytes and returns the user-f
   })
 })
 
+test("native Google file create publishes Docs, Sheets, and Slides and returns real Drive links", async () => {
+  await seedConnectedAccount([DRIVE_FILE_SCOPE])
+  const cases = [
+    {
+      body: { type: "document", name: "Native document", folderId: "folder_1", text: "Hello document" },
+      createPath: "/v1/documents",
+      contentPath: "/v1/documents/native_doc_1:batchUpdate",
+      fileId: "native_doc_1",
+    },
+    {
+      body: { type: "spreadsheet", name: "Native spreadsheet", folderId: "folder_1", sheetName: "Summary", values: [["Metric", "Value"], ["Revenue", 1742.42]] },
+      createPath: "/v4/spreadsheets",
+      contentPath: "/v4/spreadsheets/native_sheet_1/values/%27Summary%27!A1",
+      fileId: "native_sheet_1",
+    },
+    {
+      body: { type: "presentation", name: "Native presentation", folderId: "folder_1", slides: [{ title: "Launch", body: "September 17" }] },
+      createPath: "/v1/presentations",
+      contentPath: "/v1/presentations/native_slides_1:batchUpdate",
+      fileId: "native_slides_1",
+    },
+  ] as const
+
+  for (const item of cases) {
+    resetFakeGoogle()
+    const response = await request("/v1/capabilities/google-workspace/native-files", { method: "POST", body: item.body })
+    expect(response.status).toBe(200)
+    const responseBody = expectRecord(await response.json(), "native create response")
+    const file = expectRecord(responseBody.file, "created native file")
+    expect(file.id).toBe(item.fileId)
+    expect(expectString(file.webViewLink, "native webViewLink")).toContain(item.fileId)
+    expect(googleRequests.some((call) => call.path === item.createPath && call.method === "POST")).toBe(true)
+    expect(googleRequests.some((call) => decodeURIComponent(call.path) === decodeURIComponent(item.contentPath))).toBe(true)
+    const placementUrl = googleCallUrls.map((value) => new URL(value)).find((url) => url.pathname === `/drive/v3/files/${item.fileId}` && url.searchParams.get("addParents") === "folder_1")
+    expect(placementUrl?.searchParams.get("removeParents")).toBe("root")
+  }
+})
+
+test("native Google file update replaces whole Docs, Sheets, and Slides content", async () => {
+  await seedConnectedAccount([DRIVE_FILE_SCOPE])
+  const cases = [
+    { fileId: "native_doc_existing", body: { type: "document", text: "Replacement" }, expectedDeletion: "deleteContentRange" },
+    { fileId: "native_sheet_existing", body: { type: "spreadsheet", sheetName: "Summary", values: [["A"], ["B"]] }, expectedDeletion: "deleteSheet" },
+    { fileId: "native_slides_existing", body: { type: "presentation", slides: [{ title: "New", body: "Body" }] }, expectedDeletion: "deleteObject" },
+  ] as const
+
+  for (const item of cases) {
+    resetFakeGoogle()
+    const response = await request(`/v1/capabilities/google-workspace/native-file/${item.fileId}`, { method: "PATCH", body: item.body })
+    expect(response.status).toBe(200)
+    const responseBody = expectRecord(await response.json(), "native update response")
+    expect(expectRecord(responseBody.file, "updated native file").id).toBe(item.fileId)
+    expect(JSON.stringify(googleRequests.map((call) => call.body))).toContain(item.expectedDeletion)
+  }
+})
+
+test("native file validation and Drive scope fail before calling Google", async () => {
+  const invalid = await request("/v1/capabilities/google-workspace/native-files", {
+    method: "POST",
+    body: { type: "spreadsheet", name: "Broken", values: "not rows" },
+  })
+  expect(invalid.status).toBe(400)
+  expect(googleCallCount).toBe(0)
+
+  await seedConnectedAccount([DRIVE_READ_SCOPE])
+  resetFakeGoogle()
+  const missingScope = await request("/v1/capabilities/google-workspace/native-files", {
+    method: "POST",
+    body: { type: "document", name: "No scope", text: "No mutation" },
+  })
+  expect(missingScope.status).toBe(409)
+  expect(googleCallCount).toBe(0)
+})
+
+test("native file Google failures preserve bounded upstream details", async () => {
+  await seedConnectedAccount([DRIVE_FILE_SCOPE])
+  resetFakeGoogle()
+  forceNativeFileError = true
+  const response = await request("/v1/capabilities/google-workspace/native-files", {
+    method: "POST",
+    body: { type: "document", name: "Failure", text: "Content" },
+  })
+  expect(response.status).toBe(502)
+  expect(await response.json()).toEqual({
+    error: "google_api_error",
+    message: "Google Docs create failed: 500 native create exploded",
+  })
+})
+
 test("drive upload requires Drive write scope before calling Google", async () => {
   await seedConnectedAccount([DRIVE_READ_SCOPE])
   resetFakeGoogle()
@@ -1247,6 +1397,10 @@ test("Google Workspace capability tools are discoverable and keep readable names
   expect(catalog.some((tool) => tool.name === "postCapabilitiesGoogleWorkspaceDriveFiles")).toBe(false)
   expect(catalog.some((tool) => tool.name.includes("DirectUploads"))).toBe(false)
   expect(searchCapabilities(catalog, "share drive file", 10)[0]?.name).toBe("postCapabilitiesGoogleWorkspaceDriveFileShare")
+  expect(searchCapabilities(catalog, "create a Google document spreadsheet presentation", 10)[0]?.name)
+    .toBe("postCapabilitiesGoogleWorkspaceNativeFiles")
+  expect(searchCapabilities(catalog, "replace content in an existing Google document", 10)[0]?.name)
+    .toBe("patchCapabilitiesGoogleWorkspaceNativeFile")
   const gmailMatch = searchCapabilities(catalog, "gmail search read messages", 10)[0]
   expect(gmailMatch?.name).toBe("getCapabilitiesGoogleWorkspaceGmailMessages")
   expect(gmailMatch?.queryParams).toEqual(["q", "maxResults"])
@@ -1279,6 +1433,8 @@ test("Google Workspace capability tools are discoverable and keep readable names
     "getCapabilitiesGoogleWorkspaceDriveFiles",
     "getCapabilitiesGoogleWorkspaceDriveFile",
     "postCapabilitiesGoogleWorkspaceDriveFileShare",
+    "postCapabilitiesGoogleWorkspaceNativeFiles",
+    "patchCapabilitiesGoogleWorkspaceNativeFile",
     "postCapabilitiesGoogleWorkspaceGmailDrafts",
   ]
   const catalogNames = new Set(catalog.map((tool) => tool.name))

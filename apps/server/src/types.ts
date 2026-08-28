@@ -140,8 +140,7 @@ export interface Capabilities {
     files: {
       injection: boolean;
       outbox: boolean;
-      inboxPath: string;
-      outboxPath: string;
+      storage: "app-managed";
       maxBytes: number;
     };
   };

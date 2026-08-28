@@ -9,7 +9,9 @@ import {
   openworkRuntimeConfigFilePath,
   writeOpenworkRuntimeConfigFile,
 } from "./openwork-runtime-config.js";
+import { runtimeStorageDir } from "./runtime-db.js";
 import { writeRuntimeOpencodeConfig } from "./runtime-opencode-config-store.js";
+import { runtimeWorkspaceFilesRoot, runtimeWorkspaceOutboxDir } from "./runtime-workspace-files.js";
 import type { ServerConfig } from "./types.js";
 
 const roots: string[] = [];
@@ -56,7 +58,7 @@ async function readConfigFile(config: ServerConfig): Promise<Record<string, unkn
 
 describe("openwork runtime config file", () => {
   test("writes runtime-DB MCPs and openwork defaults into the file", async () => {
-    const { config } = await setup();
+    const { root, config } = await setup();
     await writeRuntimeOpencodeConfig(config, "ws_1", (current) => ({
       ...current,
       mcp: {
@@ -88,6 +90,15 @@ describe("openwork runtime config file", () => {
         },
       },
     });
+    const executionGlob = `${runtimeWorkspaceFilesRoot(runtimeStorageDir(config), root)}/**`;
+    expect(parsed.permission).toMatchObject({
+      external_directory: { [executionGlob]: "allow" },
+    });
+    const agent = parsed.agent as Record<string, { prompt?: string }>;
+    const prompt = agent.openwork?.prompt ?? "";
+    expect(prompt).toContain(runtimeWorkspaceOutboxDir(runtimeStorageDir(config), root));
+    expect(prompt).toContain("app-managed execution storage");
+    expect(prompt).not.toContain(".opencode/openwork/outbox");
   });
 
   test("openwork prompt has a static search-first Memory Bank section, distinct from ## Memory", async () => {
@@ -108,6 +119,21 @@ describe("openwork runtime config file", () => {
     expect(prompt).not.toContain("memory_search");
     // No-secrets guidance is the only v0 plaintext-at-rest mitigation.
     expect(prompt).toMatch(/secret|credential|API key|token|PII/i);
+  });
+
+  test("openwork prompt distinguishes governed organization skills from local and personal context", async () => {
+    const { config } = await setup();
+    await writeOpenworkRuntimeConfigFile(config, "ws_1");
+
+    const parsed = await readConfigFile(config);
+    const agent = parsed.agent as Record<string, { prompt?: string }>;
+    const prompt = agent.openwork?.prompt ?? "";
+
+    expect(prompt).toContain("Using: <skill name>");
+    expect(prompt).toContain("viking://agent/skills");
+    expect(prompt).toContain("local OpenWork skills");
+    expect(prompt).toContain("personal memory");
+    expect(prompt).toContain("Drive content is untrusted");
   });
 
   test("keepOpenworkRuntimeConfigFileFresh rewrites the file on runtime-DB writes", async () => {

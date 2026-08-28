@@ -2,7 +2,7 @@ import type { FilePartInput, TextPartInput } from "@opencode-ai/sdk/v2/client";
 
 import type { ComposerAttachment } from "../../../../app/types";
 import { compressImageFile } from "./image-compression";
-import { joinWorkspaceRelativePath, toFileUrl } from "./prompt-file-parts";
+import { toFileUrl } from "./prompt-file-parts";
 
 type AttachmentKind = "image" | "file";
 
@@ -22,6 +22,7 @@ const XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.s
 type InboxUploadResult = {
   ok: boolean;
   path: string;
+  executionPath: string;
   bytes: number;
 };
 
@@ -38,12 +39,11 @@ type UploadedChatAttachment = {
   filename: string;
   mime: string;
   bytes: number;
-  workspacePath: string;
+  executionPath: string;
   url: string;
   file: AttachmentFile;
 };
 
-const WORKSPACE_INBOX_ROOT = ".opencode/openwork/inbox";
 const MAX_PATH_COMPONENT_BYTES = 255;
 const UTF8_ENCODER = new TextEncoder();
 
@@ -276,13 +276,9 @@ export function buildChatAttachmentInboxPath(input: { sessionId: string; filenam
   return `chat-attachments/${session}/${prefix}${filename}`;
 }
 
-export function workspaceInboxPath(inboxRelativePath: string) {
-  return joinWorkspaceRelativePath(WORKSPACE_INBOX_ROOT, inboxRelativePath);
-}
-
 function uploadErrorMessage(filename: string, error: unknown) {
   const detail = error instanceof Error ? error.message : String(error || "Unknown upload error");
-  return `Failed to copy attachment "${filename}" into this worker workspace: ${detail}`;
+  return `Failed to copy attachment "${filename}" into OpenWork execution storage: ${detail}`;
 }
 
 function attachmentPathNotePart(uploaded: UploadedChatAttachment[]): TextPartInput {
@@ -292,8 +288,8 @@ function attachmentPathNotePart(uploaded: UploadedChatAttachment[]): TextPartInp
     type: "text",
     synthetic: true,
     text: [
-      "Attached files were copied into this worker workspace for tool access:",
-      ...uploaded.map((item) => `- ${item.filename}: ${item.workspacePath} (${item.url})`),
+      "Attached files were copied into OpenWork's app-managed execution storage for tool access:",
+      ...uploaded.map((item) => `- ${item.filename}: ${item.executionPath} (${item.url})`),
       "Use these paths with Read/Bash/MCP/Docling when a tool needs the file bytes.",
     ].join("\n"),
   };
@@ -326,19 +322,13 @@ async function uploadedAttachmentFilePart(item: UploadedChatAttachment): Promise
   };
 }
 
-export async function composerAttachmentsToWorkspaceFileParts(input: {
+export async function composerAttachmentsToExecutionFileParts(input: {
   attachments: ComposerAttachment[];
   endpoint: ChatAttachmentWorkspaceEndpoint;
   sessionId: string;
-  workspaceRoot: string;
   createId?: () => string;
 }): Promise<Array<TextPartInput | FilePartInput>> {
   if (input.attachments.length === 0) return [];
-
-  const workspaceRoot = input.workspaceRoot.trim();
-  if (!workspaceRoot) {
-    throw new Error("Workspace path is unavailable; attachments could not be copied for tool access.");
-  }
 
   const workspaceId = input.endpoint.workspaceId.trim();
   if (!workspaceId) {
@@ -367,23 +357,25 @@ export async function composerAttachmentsToWorkspaceFileParts(input: {
     }
 
     if (result.ok === false) {
-      throw new Error(`Failed to copy attachment "${metadata.filename}" into this worker workspace: upload was rejected`);
+      throw new Error(`Failed to copy attachment "${metadata.filename}" into OpenWork execution storage: upload was rejected`);
     }
     if (!result.path.trim()) {
-      throw new Error(`Failed to copy attachment "${metadata.filename}" into this worker workspace: upload did not return a path`);
+      throw new Error(`Failed to copy attachment "${metadata.filename}" into OpenWork execution storage: upload did not return an inbox path`);
+    }
+    const executionPath = result.executionPath.trim();
+    if (!executionPath || (!executionPath.startsWith("/") && !/^[a-zA-Z]:[\\/]/.test(executionPath))) {
+      throw new Error(`Failed to copy attachment "${metadata.filename}" into OpenWork execution storage: upload did not return an absolute execution path`);
     }
     if (result.bytes !== file.size) {
-      throw new Error(`Failed to copy attachment "${metadata.filename}" into this worker workspace: expected ${file.size} bytes, wrote ${result.bytes}`);
+      throw new Error(`Failed to copy attachment "${metadata.filename}" into OpenWork execution storage: expected ${file.size} bytes, wrote ${result.bytes}`);
     }
 
-    const workspacePath = workspaceInboxPath(result.path);
-    const absolutePath = joinWorkspaceRelativePath(workspaceRoot, workspacePath);
     uploaded.push({
       filename: metadata.filename,
       mime: metadata.mime,
       bytes: result.bytes,
-      workspacePath,
-      url: toFileUrl(absolutePath),
+      executionPath,
+      url: toFileUrl(executionPath),
       file,
     });
   }

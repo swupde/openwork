@@ -130,4 +130,36 @@ describe("buildCloudProviderConfig", () => {
     const config = buildCloudProviderConfig(provider);
     expect(config.models).toEqual({});
   });
+
+  test("materializes image capabilities without leaking UI-only work policy", () => {
+    const provider: DenOrgLlmProviderConnection = {
+      id: "lpr_litellm",
+      source: "custom",
+      providerId: "openai",
+      name: "SwitchUp models",
+      providerConfig: { env: ["OPENAI_API_KEY"] },
+      hasApiKey: true,
+      models: [{
+        ...makeModel("openai-terra"),
+        config: {
+          attachment: true,
+          modalities: { input: ["text", "image"], output: ["text"] },
+          openwork: { alias: "openai-terra", dataContexts: ["internal"] },
+        },
+      }],
+      createdAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: UPDATED_AT,
+      apiKey: "sk-test",
+      apiKeys: null,
+    };
+
+    expect(buildCloudProviderConfig(provider).models).toEqual({
+      "openai-terra": {
+        id: "openai-terra",
+        name: "openai-terra",
+        attachment: true,
+        modalities: { input: ["text", "image"], output: ["text"] },
+      },
+    });
+  });
 });

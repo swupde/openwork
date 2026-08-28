@@ -70,6 +70,22 @@ interface RecordedDriveUpload extends RecordedAttachment {
   at: string;
 }
 
+interface RecordedNativeOperation {
+  method: string;
+  path: string;
+  body: unknown;
+  at: string;
+}
+
+interface NativeFile {
+  id: string;
+  name: string;
+  mimeType: string;
+  parents: string[];
+  accountEmail: string;
+  modifiedTime: string;
+}
+
 interface SigningKeys {
   keyId: string;
   privateKeyPem: string;
@@ -86,6 +102,8 @@ interface MockGoogleState {
   refreshTokens: Map<string, RefreshCredential>;
   drafts: Map<string, RecordedDraft[]>;
   driveUploads: Map<string, RecordedDriveUpload[]>;
+  nativeOperations: Map<string, RecordedNativeOperation[]>;
+  nativeFiles: Map<string, NativeFile>;
   keys: SigningKeys;
 }
 
@@ -143,7 +161,7 @@ function sendJson(response: ServerResponse, status: number, body: unknown): void
   response.writeHead(status, {
     "access-control-allow-origin": "*",
     "access-control-allow-headers": "authorization, content-type",
-    "access-control-allow-methods": "GET, POST, OPTIONS",
+    "access-control-allow-methods": "GET, POST, PUT, PATCH, OPTIONS",
     "cache-control": "no-store",
     "content-type": "application/json; charset=utf-8",
   });
@@ -581,6 +599,131 @@ async function createDriveUpload(state: MockGoogleState, request: IncomingMessag
   });
 }
 
+function nativeMimeType(type: "document" | "spreadsheet" | "presentation"): string {
+  return {
+    document: "application/vnd.google-apps.document",
+    spreadsheet: "application/vnd.google-apps.spreadsheet",
+    presentation: "application/vnd.google-apps.presentation",
+  }[type];
+}
+
+function nativePrefix(type: "document" | "spreadsheet" | "presentation"): string {
+  return { document: "doc", spreadsheet: "sheet", presentation: "slides" }[type];
+}
+
+function nativeTypeForCreatePath(path: string): "document" | "spreadsheet" | "presentation" | null {
+  if (path === "/v1/documents") return "document";
+  if (path === "/v4/spreadsheets") return "spreadsheet";
+  if (path === "/v1/presentations") return "presentation";
+  return null;
+}
+
+function nativeTitle(type: "document" | "spreadsheet" | "presentation", body: unknown): string {
+  if (!isRecord(body)) return "Untitled";
+  if (type === "spreadsheet" && isRecord(body.properties) && typeof body.properties.title === "string") {
+    return body.properties.title;
+  }
+  return typeof body.title === "string" ? body.title : "Untitled";
+}
+
+function recordNativeOperation(state: MockGoogleState, account: Account, entry: RecordedNativeOperation): void {
+  const operations = state.nativeOperations.get(account.email) ?? [];
+  operations.push(entry);
+  state.nativeOperations.set(account.email, operations);
+}
+
+function nativeMetadata(file: NativeFile): Record<string, unknown> {
+  return {
+    id: file.id,
+    name: file.name,
+    mimeType: file.mimeType,
+    modifiedTime: file.modifiedTime,
+    webViewLink: `https://drive.google.test/open?id=${file.id}`,
+    size: null,
+    parents: file.parents,
+  };
+}
+
+async function handleNativeGoogle(
+  state: MockGoogleState,
+  request: IncomingMessage,
+  response: ServerResponse,
+  url: URL,
+): Promise<boolean> {
+  const account = accountForRequest(state, request);
+  if (!account) return false;
+  const requestMethod = method(request);
+  const createType = nativeTypeForCreatePath(url.pathname);
+  if (createType && requestMethod === "POST") {
+    const body = await jsonBody(request);
+    const id = `native_${nativePrefix(createType)}_${randomUUID()}`;
+    const modifiedTime = new Date().toISOString();
+    state.nativeFiles.set(id, {
+      id,
+      name: nativeTitle(createType, body),
+      mimeType: nativeMimeType(createType),
+      parents: ["root"],
+      accountEmail: account.email,
+      modifiedTime,
+    });
+    recordNativeOperation(state, account, { method: requestMethod, path: url.pathname, body, at: modifiedTime });
+    if (createType === "document") {
+      sendJson(response, 200, { documentId: id });
+    } else if (createType === "spreadsheet") {
+      sendJson(response, 200, { spreadsheetId: id, sheets: [{ properties: { sheetId: 0, title: "Sheet1" } }] });
+    } else {
+      sendJson(response, 200, { presentationId: id, slides: [{ objectId: `${id}_initial` }] });
+    }
+    return true;
+  }
+
+  const contentMatch = /^\/(v1\/documents|v4\/spreadsheets|v1\/presentations)\/([^/:]+)(?::batchUpdate)?$/.exec(url.pathname);
+  const valuesMatch = /^\/v4\/spreadsheets\/([^/]+)\/values\/(.+?)(?::clear)?$/.exec(url.pathname);
+  if (contentMatch) {
+    const file = state.nativeFiles.get(decodeURIComponent(contentMatch[2]));
+    if (!file || file.accountEmail !== account.email) return false;
+    if (requestMethod === "GET") {
+      if (contentMatch[1] === "v1/documents") sendJson(response, 200, { documentId: file.id, body: { content: [{ endIndex: 2 }] } });
+      else if (contentMatch[1] === "v4/spreadsheets") sendJson(response, 200, { spreadsheetId: file.id, sheets: [{ properties: { sheetId: 0, title: "Sheet1" } }] });
+      else sendJson(response, 200, { presentationId: file.id, slides: [{ objectId: `${file.id}_existing` }] });
+      return true;
+    }
+    if (requestMethod === "POST" && url.pathname.endsWith(":batchUpdate")) {
+      const body = await jsonBody(request);
+      file.modifiedTime = new Date().toISOString();
+      recordNativeOperation(state, account, { method: requestMethod, path: url.pathname, body, at: file.modifiedTime });
+      sendJson(response, 200, { replies: [] });
+      return true;
+    }
+  }
+  if (valuesMatch && (requestMethod === "POST" || requestMethod === "PUT")) {
+    const file = state.nativeFiles.get(decodeURIComponent(valuesMatch[1]));
+    if (!file || file.accountEmail !== account.email) return false;
+    const body = await jsonBody(request);
+    file.modifiedTime = new Date().toISOString();
+    recordNativeOperation(state, account, { method: requestMethod, path: url.pathname, body, at: file.modifiedTime });
+    sendJson(response, 200, { updatedRange: decodeURIComponent(valuesMatch[2]), clearedRange: decodeURIComponent(valuesMatch[2]) });
+    return true;
+  }
+
+  const driveMatch = /^\/drive\/v3\/files\/([^/]+)$/.exec(url.pathname);
+  if (driveMatch) {
+    const file = state.nativeFiles.get(decodeURIComponent(driveMatch[1]));
+    if (!file || file.accountEmail !== account.email) return false;
+    if (requestMethod === "PATCH") {
+      const body = await jsonBody(request);
+      if (isRecord(body) && typeof body.name === "string" && body.name.trim()) file.name = body.name.trim();
+      const folder = url.searchParams.get("addParents");
+      if (folder) file.parents = [folder];
+      file.modifiedTime = new Date().toISOString();
+      recordNativeOperation(state, account, { method: requestMethod, path: `${url.pathname}${url.search}`, body, at: file.modifiedTime });
+    }
+    sendJson(response, 200, url.searchParams.get("fields") === "parents" ? { parents: file.parents } : nativeMetadata(file));
+    return true;
+  }
+  return false;
+}
+
 function pendingAuthorizations(state: MockGoogleState): unknown {
   return {
     pending: Array.from(state.pending.values()).map((entry) => ({
@@ -621,6 +764,10 @@ async function handleRequest(state: MockGoogleState, request: IncomingMessage, r
   }
   if (requestMethod === "GET" && url.pathname === "/__mock-google/drive-uploads") {
     sendJson(response, 200, { uploads: state.driveUploads.get((url.searchParams.get("email") ?? "").toLowerCase()) ?? [] });
+    return;
+  }
+  if (requestMethod === "GET" && url.pathname === "/__mock-google/native-operations") {
+    sendJson(response, 200, { operations: state.nativeOperations.get((url.searchParams.get("email") ?? "").toLowerCase()) ?? [] });
     return;
   }
   if (requestMethod === "GET" && url.pathname === "/authorize") {
@@ -668,6 +815,7 @@ async function handleRequest(state: MockGoogleState, request: IncomingMessage, r
     await createDriveUpload(state, request, response);
     return;
   }
+  if (await handleNativeGoogle(state, request, response, url)) return;
   sendJson(response, 404, { error: "not_found" });
 }
 
@@ -711,6 +859,8 @@ export async function startMockGoogleServer(options: MockGoogleServerOptions): P
     refreshTokens: new Map(),
     drafts: new Map(),
     driveUploads: new Map(),
+    nativeOperations: new Map(),
+    nativeFiles: new Map(),
     keys: createSigningKeys(),
   };
   const server = createServer((request, response) => {

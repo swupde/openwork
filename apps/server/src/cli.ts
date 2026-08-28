@@ -25,6 +25,8 @@ import { findManagedEngineWorkspace } from "./workspaces.js";
 import { keepOpenworkRuntimeConfigFileFresh, writeOpenworkRuntimeConfigFile } from "./openwork-runtime-config.js";
 import { sweepLegacyOpenCodeConfig } from "./legacy-config-sweep.js";
 import { resolveOpencodeModelsUrl } from "./opencode-models-url.js";
+import { runtimeStorageDir } from "./runtime-db.js";
+import { OPENWORK_RUNTIME_STORAGE_ENV } from "./runtime-workspace-files.js";
 import { startWorkerActivityHeartbeat } from "./worker-activity-heartbeat.js";
 import pkg from "../package.json" with { type: "json" };
 
@@ -82,6 +84,7 @@ if (!config.opencodeBaseUrl && process.env.OPENWORK_MANAGE_OPENCODE === "1") {
       OPENWORK_SERVER_TOKEN: config.token,
       OPENCODE_CONFIG: runtimeConfigPath,
       OPENCODE_MODELS_URL: opencodeModelsUrl,
+      [OPENWORK_RUNTIME_STORAGE_ENV]: runtimeStorageDir(config),
     };
     const engineSpawnTemplate: EngineSpawnTemplate = {
       bin: process.env.OPENWORK_OPENCODE_BIN,

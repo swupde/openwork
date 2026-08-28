@@ -6,6 +6,7 @@ import {
   type AgentContextDiagnosticsRequest,
 } from "@openwork/types/agent-context-diagnostics";
 import { normalizeBaseUrl } from "@openwork/types/url";
+import type { WorkContext } from "@openwork/types/work-context";
 import {
   AGENT_CONTEXT_DIAGNOSTICS_REQUEST_TIMEOUT_MS,
   requestAgentContextDiagnosticsPayload,
@@ -36,8 +37,7 @@ export type OpenworkServerCapabilities = {
     files?: {
       injection: boolean;
       outbox: boolean;
-      inboxPath: string;
-      outboxPath: string;
+      storage: "app-managed";
       maxBytes: number;
     };
   };
@@ -867,6 +867,7 @@ export type OpenworkInboxList = {
 export type OpenworkInboxUploadResult = {
   ok: boolean;
   path: string;
+  executionPath: string;
   bytes: number;
 };
 
@@ -1538,6 +1539,20 @@ export function createOpenworkServerClient(options: { baseUrl: string; token?: s
         timeoutMs: timeouts.binary,
       }),
     listWorkspaces: () => requestJson<OpenworkWorkspaceList>(baseUrl, "/workspaces", { token, hostToken, timeoutMs: timeouts.listWorkspaces }),
+    getWorkContext: (workspaceId: string) =>
+      requestJson<WorkContext>(baseUrl, `/workspace/${encodeURIComponent(workspaceId)}/work-context`, {
+        token,
+        hostToken,
+        timeoutMs: timeouts.config,
+      }),
+    updateWorkContext: (workspaceId: string, context: WorkContext) =>
+      requestJson<WorkContext>(baseUrl, `/workspace/${encodeURIComponent(workspaceId)}/work-context`, {
+        token,
+        hostToken,
+        method: "PUT",
+        body: context,
+        timeoutMs: timeouts.config,
+      }),
     createLocalWorkspace: (payload: { folderPath: string; name: string; preset: string }) =>
       requestJson<WorkspaceList>(baseUrl, "/workspaces/local", {
         token,
@@ -2175,10 +2190,14 @@ export function createOpenworkServerClient(options: { baseUrl: string; token?: s
       if (body) {
         try {
           const parsed = JSON.parse(body) as Partial<OpenworkInboxUploadResult>;
-          if (typeof parsed.path === "string" && parsed.path.trim()) {
+          if (
+            typeof parsed.path === "string" && parsed.path.trim() &&
+            typeof parsed.executionPath === "string" && parsed.executionPath.trim()
+          ) {
             return {
               ok: parsed.ok ?? true,
               path: parsed.path.trim(),
+              executionPath: parsed.executionPath.trim(),
               bytes: typeof parsed.bytes === "number" ? parsed.bytes : file.size,
             } satisfies OpenworkInboxUploadResult;
           }
@@ -2187,11 +2206,11 @@ export function createOpenworkServerClient(options: { baseUrl: string; token?: s
         }
       }
 
-      return {
-        ok: true,
-        path: options?.path?.trim() || file.name,
-        bytes: file.size,
-      } satisfies OpenworkInboxUploadResult;
+      throw new OpenworkServerError(
+        result.status,
+        "invalid_response",
+        "Shared folder upload did not return an execution path",
+      );
     },
 
     listInbox: (workspaceId: string) =>
