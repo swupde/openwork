@@ -150,11 +150,11 @@ async function exportCurrentSchemaSql() {
   return runDrizzleKitExport()
 }
 
-async function legacyPreOauthMigrationFolder() {
+async function migrationFolderThrough(maxIndex: number) {
   const journal = JSON.parse(await readFile(join(migrationsFolder, "meta", "_journal.json"), "utf8")) as {
     entries: Array<{ idx: number; tag: string }>
   }
-  const entries = journal.entries.filter((entry) => entry.idx <= 55)
+  const entries = journal.entries.filter((entry) => entry.idx <= maxIndex)
   const folder = await mkdtemp(join(tmpdir(), "openwork-den-legacy-migrations-"))
   await mkdir(join(folder, "meta"), { recursive: true })
   await writeFile(join(folder, "meta", "_journal.json"), JSON.stringify({ version: "7", dialect: "mysql", entries }))
@@ -535,7 +535,7 @@ test("bootstrap repairs a legacy pre-oauth schema that was falsely marked curren
 
   const root = await mysql.createConnection(mysqlUrl)
   const database = scratchDatabaseName()
-  const legacyFolder = await legacyPreOauthMigrationFolder()
+  const legacyFolder = await migrationFolderThrough(55)
   let connection: mysql.Connection | undefined
   const priorDatabaseUrl = process.env.DATABASE_URL
 
@@ -570,6 +570,94 @@ test("bootstrap repairs a legacy pre-oauth schema that was falsely marked curren
     await root.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(database)}`).catch(() => {})
     await root.end()
     await rm(legacyFolder, { recursive: true, force: true })
+  }
+})
+
+test("bootstrap applies migrations added after a healthy existing ledger", { skip: !mysqlUrl, timeout: 300_000 }, async () => {
+  if (!mysqlUrl) return
+
+  const root = await mysql.createConnection(mysqlUrl)
+  const database = scratchDatabaseName()
+  const through0078Folder = await migrationFolderThrough(78)
+  let connection: mysql.Connection | undefined
+  const priorDatabaseUrl = process.env.DATABASE_URL
+
+  try {
+    await root.query(`CREATE DATABASE ${quoteIdentifier(database)}`)
+    connection = await mysql.createConnection(mysqlConnectionConfigFor(mysqlUrl, database))
+
+    const exportStatements = splitSqlStatements(await exportCurrentSchemaSql())
+    const ownedTables = await migrationOwnedTables()
+    const ownedIndexes = await migrationOwnedIndexes()
+    const nonMigrationOwnedTables = new Set(exportTableNames(exportStatements).filter((tableName) => !ownedTables.has(tableName)))
+    await seedNonMigrationOwnedTables(connection, exportStatements, nonMigrationOwnedTables, ownedIndexes)
+    await migrate(drizzle(connection), { migrationsFolder: through0078Folder })
+
+    process.env.DATABASE_URL = databaseUrlFor(mysqlUrl, database)
+    await bootstrapDenDb()
+
+    const credentialMode = await queryRecords(connection, "SHOW COLUMNS FROM `llm_provider` LIKE 'credential_mode'")
+    assert.equal(credentialMode.length, 1, "bootstrap must execute 0079 instead of recording it as an applied baseline")
+  } finally {
+    if (priorDatabaseUrl === undefined) {
+      delete process.env.DATABASE_URL
+    } else {
+      process.env.DATABASE_URL = priorDatabaseUrl
+    }
+    await connection?.end().catch(() => {})
+    await root.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(database)}`).catch(() => {})
+    await root.end()
+    await rm(through0078Folder, { recursive: true, force: true })
+  }
+})
+
+test("bootstrap repairs the post-OAuth false-baseline schema", { skip: !mysqlUrl, timeout: 300_000 }, async () => {
+  if (!mysqlUrl) return
+
+  const root = await mysql.createConnection(mysqlUrl)
+  const database = scratchDatabaseName()
+  const through0067Folder = await migrationFolderThrough(67)
+  let connection: mysql.Connection | undefined
+  const priorDatabaseUrl = process.env.DATABASE_URL
+
+  try {
+    await root.query(`CREATE DATABASE ${quoteIdentifier(database)}`)
+    connection = await mysql.createConnection(mysqlConnectionConfigFor(mysqlUrl, database))
+
+    const exportStatements = splitSqlStatements(await exportCurrentSchemaSql())
+    const ownedTables = await migrationOwnedTables()
+    const ownedIndexes = await migrationOwnedIndexes()
+    const nonMigrationOwnedTables = new Set(exportTableNames(exportStatements).filter((tableName) => !ownedTables.has(tableName)))
+    await seedNonMigrationOwnedTables(connection, exportStatements, nonMigrationOwnedTables, ownedIndexes)
+    await migrate(drizzle(connection), { migrationsFolder: through0067Folder })
+
+    const latestApplied = Math.max(...readMigrationFiles({ migrationsFolder: through0067Folder }).map((migration) => migration.folderMillis))
+    for (const migration of readMigrationFiles({ migrationsFolder }).filter((entry) => entry.folderMillis > latestApplied)) {
+      await connection.query("INSERT INTO `__drizzle_migrations` (`hash`, `created_at`) VALUES (?, ?)", [migration.hash, migration.folderMillis])
+    }
+
+    process.env.DATABASE_URL = databaseUrlFor(mysqlUrl, database)
+    await bootstrapDenDb()
+
+    const credentialMode = await queryRecords(connection, "SHOW COLUMNS FROM `llm_provider` LIKE 'credential_mode'")
+    const workflowRun = await queryRecords(connection, "SHOW TABLES LIKE 'workflow_run'")
+    const legacyCodemodeRun = await queryRecords(connection, "SHOW TABLES LIKE 'codemode_run'")
+    const latestMigration = await queryRecords(connection, "SELECT MAX(`created_at`) AS latest FROM `__drizzle_migrations`")
+
+    assert.equal(credentialMode.length, 1, "the falsely recorded 0079 migration must be replayed")
+    assert.equal(workflowRun.length, 1, "the falsely recorded workflow migration must be replayed")
+    assert.equal(legacyCodemodeRun.length, 0, "the legacy workflow table must be migrated completely")
+    assert.equal(Number(latestMigration[0]?.latest), Math.max(...readMigrationFiles({ migrationsFolder }).map((migration) => migration.folderMillis)))
+  } finally {
+    if (priorDatabaseUrl === undefined) {
+      delete process.env.DATABASE_URL
+    } else {
+      process.env.DATABASE_URL = priorDatabaseUrl
+    }
+    await connection?.end().catch(() => {})
+    await root.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(database)}`).catch(() => {})
+    await root.end()
+    await rm(through0067Folder, { recursive: true, force: true })
   }
 })
 
