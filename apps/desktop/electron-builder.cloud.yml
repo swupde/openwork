@@ -3,14 +3,13 @@ appId: com.differentai.openwork
 productName: OpenWork Cloud
 extraMetadata:
   openworkDistribution: cloud
-  openworkReleaseRepository: swupde/openwork
 protocols:
   - name: OpenWork Cloud
     schemes:
       - openwork
 publish:
   - provider: github
-    owner: swupde
+    owner: different-ai
     repo: openwork
     releaseType: release
     channel: cloud
