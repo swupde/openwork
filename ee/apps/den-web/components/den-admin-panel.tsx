@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Copy, Pencil, Trash2 } from "lucide-react";
+import { denApiCredentials, denApiEndpoint } from "../app/(den)/_lib/den-api-origin";
 
 type AccessState = "loading" | "ready" | "signed-out" | "forbidden" | "error";
 type ViewMode = "users" | "companies" | "organizations";
@@ -130,8 +131,6 @@ type AdminUser = {
 type AdminOrganizationCapabilities = {
   installLinks: boolean;
   mcpConnections: boolean;
-  workflows: boolean;
-  remoteMcpApps: boolean;
   cloud: boolean;
 };
 
@@ -419,8 +418,6 @@ function parseAdminPayload(payload: unknown): AdminPayload | null {
           capabilities: {
             installLinks: capabilities.installLinks === true,
             mcpConnections: capabilities.mcpConnections === true,
-            workflows: capabilities.workflows === true,
-            remoteMcpApps: capabilities.remoteMcpApps === true,
             cloud: capabilities.cloud === true
           }
         };
@@ -791,7 +788,7 @@ function buildFixtureOrganization(index: number): AdminOrganization {
     freeSeatCount: target ? 25 : DEFAULT_FREE_SEAT_COUNT,
     seatsFreeAdditional: target ? 20 : 0,
     billableSeatCount: target ? 103 : 0,
-    capabilities: { installLinks: target, mcpConnections: target, workflows: false, remoteMcpApps: false, cloud: false }
+    capabilities: { installLinks: target, mcpConnections: target, cloud: false }
   };
 }
 
@@ -956,12 +953,9 @@ function adminScaleFixturePayload(path: string): unknown | null {
 
 const AUTH_TOKEN_STORAGE_KEY = "openwork:web:auth-token";
 
-// The den proxy strips cookies from requests whose Origin matches a cloud
-// instance origin (they are bearer-only by design), and browsers always send
-// an Origin header on mutating fetches. Cookie-only admin writes therefore
-// 401 when den-web itself is served from such an origin. Attach the stored
-// bearer token like den-flow's requestJson does; den-api accepts either
-// credential, so cookie-authenticated sessions keep working unchanged.
+// Browser calls go straight to the api.* origin. Attach the stored bearer token
+// like den-flow's requestJson does; den-api accepts either bearer or cookie
+// credentials, so cookie-authenticated sessions keep working unchanged.
 function withStoredBearer(headers: Record<string, string>): Record<string, string> {
   if (typeof window === "undefined") {
     return headers;
@@ -979,9 +973,10 @@ async function requestJson(path: string, signal?: AbortSignal) {
     return { response: new Response(JSON.stringify(fixturePayload), { status: 200 }), payload: fixturePayload };
   }
 
-  const response = await fetch(`/api/den${path}`, {
+  const endpoint = denApiEndpoint(path);
+  const response = await fetch(endpoint, {
     method: "GET",
-    credentials: "include",
+    credentials: denApiCredentials(endpoint),
     signal,
     headers: withStoredBearer({
       Accept: "application/json"
@@ -1007,9 +1002,10 @@ function isAbortError(error: unknown): boolean {
 }
 
 async function patchJson(path: string, body: unknown) {
-  const response = await fetch(`/api/den${path}`, {
+  const endpoint = denApiEndpoint(path);
+  const response = await fetch(endpoint, {
     method: "PATCH",
-    credentials: "include",
+    credentials: denApiCredentials(endpoint),
     headers: withStoredBearer({
       Accept: "application/json",
       "Content-Type": "application/json"
@@ -1032,9 +1028,10 @@ async function patchJson(path: string, body: unknown) {
 }
 
 async function postJson(path: string, body: unknown) {
-  const response = await fetch(`/api/den${path}`, {
+  const endpoint = denApiEndpoint(path);
+  const response = await fetch(endpoint, {
     method: "POST",
-    credentials: "include",
+    credentials: denApiCredentials(endpoint),
     headers: withStoredBearer({
       Accept: "application/json",
       "Content-Type": "application/json"
@@ -1055,9 +1052,10 @@ async function postJson(path: string, body: unknown) {
 }
 
 async function putJson(path: string, body: unknown) {
-  const response = await fetch(`/api/den${path}`, {
+  const endpoint = denApiEndpoint(path);
+  const response = await fetch(endpoint, {
     method: "PUT",
-    credentials: "include",
+    credentials: denApiCredentials(endpoint),
     headers: withStoredBearer({
       Accept: "application/json",
       "Content-Type": "application/json"
@@ -1080,9 +1078,10 @@ async function putJson(path: string, body: unknown) {
 }
 
 async function deleteJson(path: string) {
-  const response = await fetch(`/api/den${path}`, {
+  const endpoint = denApiEndpoint(path);
+  const response = await fetch(endpoint, {
     method: "DELETE",
-    credentials: "include",
+    credentials: denApiCredentials(endpoint),
     headers: withStoredBearer({
       Accept: "application/json"
     })
@@ -2627,32 +2626,6 @@ export function DenAdminPanel() {
                       <label className="inline-flex items-center gap-2 text-sm text-slate-700">
                         <input
                           type="checkbox"
-                          data-testid="admin-capability-workflows"
-                          checked={org.capabilities.workflows}
-                          disabled={savingCapabilityOrgId === org.id}
-                          onChange={(event) => {
-                            void saveOrganizationCapability(org, "workflows", event.target.checked);
-                          }}
-                          className="h-4 w-4 rounded border-slate-300"
-                        />
-                        Codemode scripts (alpha)
-                      </label>
-                      <label className="inline-flex items-center gap-2 text-sm text-slate-700">
-                        <input
-                          type="checkbox"
-                          data-testid="admin-capability-remoteMcpApps"
-                          checked={org.capabilities.remoteMcpApps}
-                          disabled={savingCapabilityOrgId === org.id}
-                          onChange={(event) => {
-                            void saveOrganizationCapability(org, "remoteMcpApps", event.target.checked);
-                          }}
-                          className="h-4 w-4 rounded border-slate-300"
-                        />
-                        Native MCP Apps (preview)
-                      </label>
-                      <label className="inline-flex items-center gap-2 text-sm text-slate-700">
-                        <input
-                          type="checkbox"
                           data-testid="admin-capability-cloud"
                           checked={org.capabilities.cloud}
                           disabled={savingCapabilityOrgId === org.id}
@@ -2673,7 +2646,7 @@ export function DenAdminPanel() {
                     <p className="mt-1 text-xs text-slate-400">On by default. Turn off to hide member-facing org connections, marketplace capabilities on the agent rail, and the desktop Connect tab.</p>
                     <p className="mt-1 text-xs text-slate-400">Confined multi-tool scripts run server-side for this organization.</p>
                     <p className="mt-1 text-xs text-slate-400">Off by default. Requires the deployment master switch and exposes native provider MCP Apps and imported Apps for this organization.</p>
-                    <p className="mt-1 text-xs text-slate-400">Off by default. Turn on to show Cloud alpha access in this organization.</p>
+                    <p className="mt-1 text-xs text-slate-400">Off by default. Turn on organization-scoped Cloud workers and remote Cloud capabilities.</p>
                   </div>
 
                   <div className="mt-4 grid gap-3 border-t border-slate-200 pt-4 lg:grid-cols-[12rem_10rem_auto] lg:items-end">

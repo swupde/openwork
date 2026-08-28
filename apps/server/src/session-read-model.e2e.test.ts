@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { startServer } from "./server.js";
-import type { ServerConfig } from "./types.js";
+import { proxyOpencodeRequest, startServer } from "./server.js";
+import type { ServerConfig, WorkspaceInfo } from "./types.js";
 
 type Served = {
   port: number;
@@ -35,7 +35,7 @@ function auth(token: string) {
   return { Authorization: `Bearer ${token}` };
 }
 
-function startMockOpencode(input?: { invalidList?: boolean; holdCommand?: Promise<void> }) {
+function startMockOpencode(input?: { invalidList?: boolean; holdCommand?: Promise<void>; sessionDirectory?: string }) {
   const requests: Array<{ pathname: string; search: string; directory: string | null; method: string; body?: unknown }> = [];
   const server = Bun.serve({
     hostname: "127.0.0.1",
@@ -60,7 +60,7 @@ function startMockOpencode(input?: { invalidList?: boolean; holdCommand?: Promis
             id: "ses_created",
             title: typeof title === "string" ? title : "New session",
             slug: "created-session",
-            directory: request.headers.get("x-opencode-directory"),
+            directory: input?.sessionDirectory ?? request.headers.get("x-opencode-directory"),
             time: { created: 300, updated: 300 },
           });
         }
@@ -87,7 +87,7 @@ function startMockOpencode(input?: { invalidList?: boolean; holdCommand?: Promis
           id: "ses_1",
           title: "Hostname Check",
           slug: "hostname-check",
-          directory: request.headers.get("x-opencode-directory"),
+          directory: input?.sessionDirectory ?? request.headers.get("x-opencode-directory"),
           time: { created: 100, updated: 200 },
         });
       }
@@ -140,7 +140,30 @@ function startMockOpencode(input?: { invalidList?: boolean; holdCommand?: Promis
   return { server, requests };
 }
 
-async function startOpenworkServer(input: { workspaceRoot: string; opencodeBaseUrl?: string; readOnly?: boolean }) {
+async function startOpenworkServer(input: {
+  workspaceRoot: string;
+  secondWorkspaceRoot?: string;
+  opencodeBaseUrl?: string;
+  readOnly?: boolean;
+}) {
+  const workspaces: WorkspaceInfo[] = [{
+    id: "ws_1",
+    name: "Workspace",
+    path: input.workspaceRoot,
+    preset: "starter",
+    workspaceType: "local",
+    ...(input.opencodeBaseUrl ? { baseUrl: input.opencodeBaseUrl } : {}),
+  }];
+  if (input.secondWorkspaceRoot) {
+    workspaces.push({
+      id: "ws_2",
+      name: "Other workspace",
+      path: input.secondWorkspaceRoot,
+      preset: "starter",
+      workspaceType: "local",
+      ...(input.opencodeBaseUrl ? { baseUrl: input.opencodeBaseUrl } : {}),
+    });
+  }
   const config: ServerConfig = {
     host: "127.0.0.1",
     port: 0,
@@ -148,17 +171,8 @@ async function startOpenworkServer(input: { workspaceRoot: string; opencodeBaseU
     hostToken: "owt_host_token",
     approval: { mode: "auto", timeoutMs: 1000 },
     corsOrigins: ["*"],
-    workspaces: [
-      {
-        id: "ws_1",
-        name: "Workspace",
-        path: input.workspaceRoot,
-        preset: "starter",
-        workspaceType: "local",
-        ...(input.opencodeBaseUrl ? { baseUrl: input.opencodeBaseUrl } : {}),
-      },
-    ],
-    authorizedRoots: [input.workspaceRoot],
+    workspaces,
+    authorizedRoots: [input.workspaceRoot, ...(input.secondWorkspaceRoot ? [input.secondWorkspaceRoot] : [])],
     readOnly: input.readOnly ?? true,
     startedAt: Date.now(),
     tokenSource: "cli",
@@ -338,6 +352,29 @@ describe("workspace session read APIs", () => {
     expect(proxyRequest?.directory).toBe(encodeURIComponent(workspaceRoot));
   });
 
+  test("keeps opencode proxy requests off the workspace bootstrap path", async () => {
+    const workspaceRoot = await createWorkspaceRoot();
+    const mock = startMockOpencode();
+    const openwork = await startOpenworkServer({
+      workspaceRoot,
+      opencodeBaseUrl: `http://127.0.0.1:${mock.server.port}`,
+      readOnly: false,
+    });
+    const commandsDir = join(workspaceRoot, ".opencode", "commands");
+    const commandPath = join(commandsDir, "legacy.md");
+    const legacyCommand = "---\nname: legacy\ndescription: Legacy\nmodel: null\n---\nRun legacy command\n";
+    await mkdir(commandsDir, { recursive: true });
+    await writeFile(commandPath, legacyCommand, "utf8");
+
+    const response = await fetch(`http://127.0.0.1:${openwork.server.port}/workspace/ws_1/opencode/session`, {
+      headers: auth(openwork.token),
+    });
+
+    expect(response.status).toBe(200);
+    expect(mock.requests.some((request) => request.pathname === "/session")).toBe(true);
+    expect(await readFile(commandPath, "utf8")).toBe(legacyCommand);
+  });
+
   test("returns 404 when the upstream session is missing", async () => {
     const workspaceRoot = await createWorkspaceRoot();
     const mock = startMockOpencode();
@@ -357,30 +394,122 @@ describe("workspace session read APIs", () => {
 
   });
 
-  test("acknowledges proxied session commands before upstream completion", async () => {
+  test("returns 404 when a session belongs to another workspace", async () => {
     const workspaceRoot = await createWorkspaceRoot();
-    const command = deferred();
-    const mock = startMockOpencode({ holdCommand: command.promise });
+    const secondWorkspaceRoot = await createWorkspaceRoot();
+    const mock = startMockOpencode({ sessionDirectory: workspaceRoot });
     const openwork = await startOpenworkServer({
       workspaceRoot,
+      secondWorkspaceRoot,
       opencodeBaseUrl: `http://127.0.0.1:${mock.server.port}`,
     });
 
-    const response = await Promise.race([
-      fetch(`http://127.0.0.1:${openwork.server.port}/workspace/ws_1/opencode/session/ses_1/command`, {
-        method: "POST",
-        headers: { ...auth(openwork.token), "Content-Type": "application/json" },
-        body: JSON.stringify({ command: "review", arguments: "" }),
-      }),
-      new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 100)),
-    ]);
+    const response = await fetch(
+      `http://127.0.0.1:${openwork.server.port}/workspace/ws_2/sessions/ses_1/snapshot`,
+      { headers: auth(openwork.token) },
+    );
 
-    expect(response).not.toBe("timeout");
-    expect(response instanceof Response ? response.status : 0).toBe(200);
-    await expect(response instanceof Response ? response.json() : null).resolves.toMatchObject({ accepted: true });
-    const sawCommand = await waitUntil(() => mock.requests.some((request) => request.pathname === "/session/ses_1/command"));
-    command.resolve();
-    expect(sawCommand).toBe(true);
+    expect(response.status).toBe(404);
+    await expect(response.json()).resolves.toMatchObject({ code: "session_not_found" });
+  });
+
+  test.serial("acknowledges proxied session commands before upstream completion and admits each message once", async () => {
+    const workspaceRoot = await createWorkspaceRoot();
+    const engineUrl = "http://127.0.0.1:4111";
+    const replacementEngineUrl = "http://127.0.0.1:4222";
+    const workspace: WorkspaceInfo = {
+      id: "ws_1",
+      name: "Workspace",
+      path: workspaceRoot,
+      preset: "starter",
+      workspaceType: "local",
+      baseUrl: engineUrl,
+    };
+    const config: ServerConfig = {
+      host: "127.0.0.1",
+      port: 0,
+      token: "owt_test_token",
+      hostToken: "owt_host_token",
+      approval: { mode: "auto", timeoutMs: 1_000 },
+      corsOrigins: ["*"],
+      workspaces: [workspace],
+      authorizedRoots: [workspaceRoot],
+      readOnly: false,
+      startedAt: Date.now(),
+      tokenSource: "cli",
+      hostTokenSource: "cli",
+      logFormat: "pretty",
+      logRequests: false,
+    };
+    const originalFetch = globalThis.fetch;
+    const requests: string[] = [];
+    const upstream = deferred();
+    globalThis.fetch = Object.assign(
+      (input: Parameters<typeof fetch>[0]) => {
+        requests.push(input instanceof Request ? input.url : String(input));
+        return upstream.promise.then(() => Response.json({ ok: true }));
+      },
+      { preconnect: originalFetch.preconnect },
+    );
+    const sendCommand = (
+      targetWorkspace: WorkspaceInfo,
+      sessionId: string,
+      body: string,
+    ) => {
+      const proxyPath = `/session/${sessionId}/command`;
+      const url = new URL(`http://openwork.invalid/opencode${proxyPath}`);
+      return proxyOpencodeRequest({
+        config,
+        workspace: targetWorkspace,
+        proxyPath,
+        url,
+        request: new Request(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body,
+        }),
+      });
+    };
+    const commandBody = JSON.stringify({ messageID: "msg_command_once", command: "review", arguments: "" });
+
+    try {
+      const response = await Promise.race([
+        sendCommand(workspace, "ses_1", commandBody),
+        new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 100)),
+      ]);
+      expect(response).not.toBe("timeout");
+      expect(response instanceof Response ? response.status : 0).toBe(200);
+      await expect(response instanceof Response ? response.json() : null).resolves.toMatchObject({ accepted: true });
+
+      const duplicate = await sendCommand(workspace, "ses_1", commandBody);
+      expect(duplicate.status).toBe(200);
+      await expect(duplicate.json()).resolves.toMatchObject({ accepted: true });
+
+      const conflict = await sendCommand(
+        workspace,
+        "ses_1",
+        JSON.stringify({ messageID: "msg_command_once", command: "summarize", arguments: "" }),
+      );
+      expect(conflict.status).toBe(409);
+      await expect(conflict.json()).resolves.toMatchObject({ code: "command_admission_conflict" });
+
+      const rolloverDuplicate = await sendCommand(
+        { ...workspace, baseUrl: replacementEngineUrl },
+        "ses_1",
+        commandBody,
+      );
+      const otherSession = await sendCommand(workspace, "ses_2", commandBody);
+      expect(rolloverDuplicate.status).toBe(200);
+      expect(otherSession.status).toBe(200);
+      expect(requests.map((request) => new URL(request).pathname)).toEqual([
+        "/session/ses_1/command",
+        "/session/ses_2/command",
+      ]);
+      expect(requests.every((request) => request.startsWith(engineUrl))).toBe(true);
+    } finally {
+      upstream.resolve();
+      globalThis.fetch = originalFetch;
+    }
   });
 
   test("keeps legacy /w workspace opencode proxy alias", async () => {

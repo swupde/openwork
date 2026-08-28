@@ -5,6 +5,7 @@ import {
   AlertTriangle,
   Check,
   ChevronRight,
+  CirclePause,
   Copy,
   Download,
   FileIcon,
@@ -15,7 +16,6 @@ import {
   Split,
   Undo2,
 } from "lucide-react"
-import { PaperGrainGradient } from "@openwork/ui/react"
 import {
   DynamicToolUIPart,
   isFileUIPart,
@@ -27,6 +27,8 @@ import type { SessionStatus } from "@opencode-ai/sdk/v2/client"
 import { openDesktopUrl, revealDesktopItemInDir } from "@/app/lib/desktop"
 import { isElectronRuntime } from "@/app/lib/runtime-env"
 import { SYNTHETIC_SESSION_ERROR_MESSAGE_PREFIX } from "@/app/types"
+import { t } from "@/i18n"
+import { sessionErrorPresentationFromUIMessage } from "@/react-app/domains/session/sync/session-error"
 import { ApplyPatchTool } from "@/components/tools/apply-patch"
 import { BashTool } from "@/components/tools/bash"
 import { EditTool } from "@/components/tools/edit"
@@ -46,7 +48,6 @@ import { TodoWriteTool } from "@/components/tools/todowrite"
 import { WebfetchTool } from "@/components/tools/webfetch"
 import { WebsearchTool } from "@/components/tools/websearch"
 import { useMessageList, useSessionErrorMessage } from "@/components/chat/message-list-provider"
-import { ArtifactList } from "@/components/chat/artifact"
 import { TaskSuggestions } from "@/components/chat/task-suggestions"
 import {
   DescriptiveButtonContent,
@@ -87,6 +88,10 @@ import { ReasoningBlock } from "@/components/chat/reasoning-block"
 import { SubagentRunLine } from "@/components/chat/subagent-run-line"
 import { ToolAggregateGroup } from "@/components/chat/tool-aggregate-group"
 import {
+  CurrentToolLifecycleProvider,
+  useCurrentToolLifecycleResolver,
+} from "@/components/chat/current-tool-lifecycle-context"
+import {
   isApplyPatchToolPart,
   isBashToolPart,
   isEditToolPart,
@@ -104,15 +109,17 @@ import {
   isWriteToolPart,
 } from "@/lib/build-in-tools"
 import type { ThreadStatus } from "@/lib/messages"
+import type { SessionActivityStatus } from "@/react-app/domains/session/status/session-activity-store"
 import { formatToolCallDuration } from "@/lib/tool-call-duration"
-import {
-  collectToolParts,
-  getActiveToolLabel,
-} from "@/lib/tool-activity"
+import { collectLatestAssistantToolParts } from "@/lib/latest-assistant-tool-parts"
+import { isToolPartInFlight } from "@/lib/tool-activity"
 import { faviconUrlForHref } from "@/lib/favicon"
+import { useOpenArtifactPath } from "@/lib/artifacts"
 import { cn } from "@/lib/utils"
+import { DevProfiler } from "@/react-app/shell/dev-profiler"
 import { groupMessages, isMessageGroup, getLastTextPart, getAggregateOnlyParts, getAssistantRenderGroups, getFileTitle, getMediaBadge, getMessageCompleted, getMessageCreated, formatMessageTimestamp, splitTurnAtAnswer, type UIMessageWithIndex, getMessagesText, getSafeFileDownloadUrl, getSafeFileRevealPath } from "./utils"
 import type { AnyToolPart } from "@/lib/tool-aggregate"
+import { resolveConnectorToolIdentity } from "@/react-app/domains/connections/connector-tool-identity"
 
 const SEARCH_HIGHLIGHT_MARK_CLASS = "rounded px-0.5 bg-amber-4/70 text-current"
 
@@ -169,7 +176,41 @@ class ToolMessage extends React.Component<ToolMessageProps, { failed: boolean }>
 }
 
 const ToolMessageInner = ({ part }: ToolMessageProps) => {
-  const { onMcpReconnect, onMcpReopenAuthorization, onMcpRetry } = useMessageList()
+  const { connectorIdentities, onMcpReconnect, onMcpReopenAuthorization, onMcpRetry } = useMessageList()
+  const resolveLifecycle = useCurrentToolLifecycleResolver()
+  const lifecycle = resolveLifecycle(part.toolCallId, isToolPartInFlight(part))
+
+  if (lifecycle === "waiting") {
+    return (
+      <div
+        className="flex items-start gap-2 rounded-md border border-amber-7 bg-amber-2 px-3 py-2 text-sm text-amber-12"
+        data-tool-lifecycle="waiting"
+        role="status"
+      >
+        <CirclePause aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
+        <div>
+          <div className="font-medium">Waiting for your action</div>
+          <div className="text-xs text-amber-11">Choose an option or approve the request to continue.</div>
+        </div>
+      </div>
+    )
+  }
+
+  if (lifecycle === "interrupted") {
+    return (
+      <div
+        className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive"
+        data-tool-lifecycle="interrupted"
+        role="alert"
+      >
+        <AlertTriangle aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
+        <div>
+          <div className="font-medium">Task interrupted</div>
+          <div className="text-xs text-destructive/80">This step stopped before it finished. Retry to continue.</div>
+        </div>
+      </div>
+    )
+  }
 
   if (isBashToolPart(part)) {
     return <BashTool part={part} />
@@ -245,6 +286,7 @@ const ToolMessageInner = ({ part }: ToolMessageProps) => {
     return (
       <CapabilityCallLine
         part={part}
+        connector={resolveConnectorToolIdentity(part, connectorIdentities)}
         onReconnect={onMcpReconnect}
         onReopenAuthorization={onMcpReopenAuthorization}
         onRetry={onMcpRetry}
@@ -280,6 +322,7 @@ interface FileMessageProps {
 }
 
 function FileMessage({ part, tone }: FileMessageProps) {
+  const openArtifactPath = useOpenArtifactPath()
   const title = getFileTitle(part)
   const badge = getMediaBadge(part)
   const isImage = part.mediaType.startsWith("image/") && Boolean(part.url)
@@ -303,6 +346,22 @@ function FileMessage({ part, tone }: FileMessageProps) {
     void revealDesktopItemInDir(revealPath)
   }, [revealPath])
 
+  const fileContent = (
+    <>
+      <DescriptiveButtonIcon>
+        <FileIcon className="size-5 shrink-0" />
+      </DescriptiveButtonIcon>
+      <DescriptiveButtonContent className="gap-0">
+        <DescriptiveButtonTitle className="truncate text-xs">{title}</DescriptiveButtonTitle>
+        {badge ? (
+          <DescriptiveButtonDescription className="text-[10px]">
+            {badge}
+          </DescriptiveButtonDescription>
+        ) : null}
+      </DescriptiveButtonContent>
+    </>
+  )
+
   if (isImage && tone === "user") {
     return <ImageAttachmentBadge src={part.url} alt={title} />
   }
@@ -323,19 +382,18 @@ function FileMessage({ part, tone }: FileMessageProps) {
 
   return (
     <div className="flex h-auto w-fit min-w-0 max-w-full shrink items-center justify-start gap-2 rounded-xl border border-border/70 bg-background/40 ps-2 pe-2 py-1 text-left text-sm font-medium whitespace-normal">
-      <div className="flex min-w-0 items-center gap-2 pe-2">
-        <DescriptiveButtonIcon>
-          <FileIcon className="size-5 shrink-0" />
-        </DescriptiveButtonIcon>
-        <DescriptiveButtonContent className="gap-0">
-          <DescriptiveButtonTitle className="truncate text-xs">{title}</DescriptiveButtonTitle>
-          {badge ? (
-            <DescriptiveButtonDescription className="text-[10px]">
-              {badge}
-            </DescriptiveButtonDescription>
-          ) : null}
-        </DescriptiveButtonContent>
-      </div>
+      {revealPath ? (
+        <button
+          type="button"
+          className="flex min-w-0 items-center gap-2 pe-2 text-left transition-opacity hover:opacity-80"
+          onClick={() => openArtifactPath(revealPath)}
+          title={`Open ${title} in Artifacts`}
+        >
+          {fileContent}
+        </button>
+      ) : (
+        <div className="flex min-w-0 items-center gap-2 pe-2">{fileContent}</div>
+      )}
       {downloadUrl || canReveal ? (
         <DropdownMenu>
           <DropdownMenuTrigger
@@ -473,7 +531,7 @@ const AssistantMessage = React.memo(
             if (group.kind === "tool-aggregate") {
               return (
                 <div key={`tool-aggregate-${index}`} className="w-full">
-                  <ToolAggregateGroup parts={group.parts} />
+                  <ToolAggregateGroup parts={group.parts} thoughts={group.thoughts} />
                 </div>
               )
             }
@@ -744,7 +802,13 @@ type MessageComponentProps = {
 const MessageComponent = React.memo(
   ({ message, isLastMessage, isStreaming, isLastStep, hideReasoning }: MessageComponentProps) => {
     if (isSessionErrorMessage(message)) {
-      return <ErrorMessage error={getMessagesText([message]) || "Session failed"} />
+      const presentation = sessionErrorPresentationFromUIMessage(message)
+      return (
+        <ErrorMessage
+          error={getMessagesText([message]) || "Session failed"}
+          resumePrompt={presentation?.recoveryPrompt}
+        />
+      )
     }
 
     if (isEmptyMessage(message)) {
@@ -774,41 +838,58 @@ const MessageComponent = React.memo(
 
 MessageComponent.displayName = "MessageComponent"
 
-const LoadingMessage = React.memo(({ label }: { label?: string }) => (
-  <Message className="mx-auto flex w-full max-w-3xl flex-col items-start gap-2 px-2 md:px-10">
-    <div className="group flex w-full flex-col gap-0">
-      <div className="flex items-center gap-1.5 px-1 py-1 text-sm text-muted-foreground">
-        <div style={{ width: 20, height: 20, borderRadius: "50%", overflow: "hidden" }}>
-          <PaperGrainGradient
-            speed={12}
-            softness={0.1}
-            intensity={1}
-            noise={0.05}
-            shape="sphere"
-            colors={["#818cf8", "#fb7185", "#fbbf24", "#34d399"]}
-            colorBack="#ffffff00"
-            style={{ backgroundColor: "#818cf8", width: "100%", height: "100%", borderRadius: "50%" }}
-          />
-        </div>
-        <span>{label ?? "Thinking…"}</span>
+const LoadingMessage = React.memo(({ elapsedSeconds }: { elapsedSeconds: number }) => (
+    <Message className="mx-auto flex w-full max-w-3xl flex-col items-start gap-2 px-2 md:px-10">
+      <div data-loading-message="working" className="py-1 text-sm text-muted-foreground">
+        <span className="ow-text-shimmer tabular-nums">Working {elapsedSeconds}s</span>
       </div>
-    </div>
-  </Message>
+    </Message>
 ))
 
 LoadingMessage.displayName = "LoadingMessage"
 
 interface ErrorMessageProps {
   error: string | null
+  /** Set only for interrupted runs (aborted / provider timeout) that can resume. */
+  resumePrompt?: string | null
 }
 
-function ErrorMessage({ error }: ErrorMessageProps) {
+function ErrorMessage({ error, resumePrompt }: ErrorMessageProps) {
+  const { onResumeInterrupted } = useMessageList()
+
+  // A resumable interruption is a pause, not a failure: it renders as a
+  // quiet status line (like "Working 12s"), with Resume as the emphasis.
+  if (resumePrompt && onResumeInterrupted) {
+    return (
+      <Message className="not-prose mx-auto flex w-full max-w-3xl flex-col items-start gap-2 px-2 md:px-10">
+        <div
+          data-testid="session-error-interrupted"
+          className="flex min-w-0 items-center gap-2 py-1 text-sm text-muted-foreground"
+        >
+          <CirclePause aria-hidden="true" className="size-4 shrink-0" />
+          <span className="min-w-0 truncate">{error}</span>
+          <span aria-hidden="true" className="text-muted-foreground/60">·</span>
+          <button
+            type="button"
+            data-testid="session-error-resume"
+            onClick={() => onResumeInterrupted(resumePrompt)}
+            className="shrink-0 cursor-pointer font-medium text-foreground underline-offset-2 transition-colors hover:underline"
+          >
+            {t("session.resume_interrupted")}
+          </button>
+        </div>
+      </Message>
+    )
+  }
+
   return (
     <Message className="not-prose mx-auto flex w-full max-w-3xl flex-col items-start gap-2 px-0 md:px-10">
       <div className="group flex w-full flex-col items-start gap-0">
-        <div className="text-foreground flex min-w-0 flex-1 flex-row items-start gap-2 rounded-lg border-2 border-red-300 bg-red-300/20 px-2 py-1">
-          <AlertTriangle size={16} className="mt-0.5 shrink-0 text-destructive" />
-          <p className="whitespace-pre-wrap text-destructive">{error}</p>
+        <div className="flex min-w-0 flex-1 flex-col gap-1.5 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm">
+          <div className="flex flex-row items-start gap-2">
+            <AlertTriangle aria-hidden="true" size={16} className="mt-0.5 shrink-0 text-destructive" />
+            <p className="whitespace-pre-wrap text-destructive">{error}</p>
+          </div>
         </div>
       </div>
     </Message>
@@ -836,10 +917,16 @@ const RetryMessage = React.memo(({ status }: RetryMessageProps) => {
   const [seconds, setSeconds] = React.useState(() => retryDelaySeconds(status))
 
   React.useEffect(() => {
-    const update = () => setSeconds(retryDelaySeconds(status))
+    let timer: number | null = null
+    const update = () => {
+      const nextSeconds = retryDelaySeconds(status)
+      setSeconds((current) => current === nextSeconds ? current : nextSeconds)
+      if (nextSeconds > 0) timer = window.setTimeout(update, 1000)
+    }
     update()
-    const timer = window.setInterval(update, 1000)
-    return () => window.clearInterval(timer)
+    return () => {
+      if (timer !== null) window.clearTimeout(timer)
+    }
   }, [status])
 
   const info = seconds > 0
@@ -926,7 +1013,7 @@ function CompletedStepRun({ label, children }: { label: string; children: React.
 
 interface AssistantMessageGroupProps {
   items: UIMessageWithIndex[]
-  messages: UIMessage[]
+  isLastGroup: boolean
   isStreaming: boolean
 }
 
@@ -949,7 +1036,7 @@ function collectMcpAppParts(items: UIMessageWithIndex[]): DynamicToolUIPart[] {
 
 function MessageGroup({
   items,
-  messages,
+  isLastGroup,
   isStreaming,
 }: AssistantMessageGroupProps) {
   const { onRevertToUserMessage, onForkAtMessage, showThinking } = useMessageList()
@@ -958,16 +1045,7 @@ function MessageGroup({
   // client-side messages (e.g. session errors) don't exist on the server and
   // silently corrupt fork/revert boundaries.
   const lastRealItem = items.findLast((item) => !isSessionErrorMessage(item.message))
-  const isLiveGroup = isStreaming && lastItem !== undefined && lastItem.index === messages.length - 1
-  const stepsRef = React.useRef<HTMLDivElement>(null)
-
-  // Keep the capped step run pinned to the latest step while streaming.
-  React.useEffect(() => {
-    const node = stepsRef.current
-    if (node && isLiveGroup) {
-      node.scrollTop = node.scrollHeight
-    }
-  })
+  const isLiveGroup = isStreaming && isLastGroup
 
   if (!lastItem || isMessageEmptyGroup(items)) {
     return null;
@@ -977,9 +1055,9 @@ function MessageGroup({
   const lastTextMessage = getLastTextPart(lastItem.message)
   const mcpAppParts = collectMcpAppParts(items)
 
-  // Leading messages without prose (tool/reasoning steps) render inside a
-  // height-capped scroll area so long runs stay compact; messages with text
-  // or files render inline below it.
+  // Leading messages without prose (tool/reasoning steps) render inline and
+  // rely on the transcript's one scroll container. Tool activity must never
+  // create a nested scrollbar while it grows.
   let stepCount = 0
   while (stepCount < items.length && !getRenderableMessage(items[stepCount].message)) {
     stepCount += 1
@@ -1022,7 +1100,7 @@ function MessageGroup({
         total +
         (item.message.role === "assistant" && !isSessionErrorMessage(item.message)
           ? getAssistantRenderGroups(item.message.parts, showThinking).reduce(
-            (rows, group) => rows + (group.kind === "tool-aggregate" ? group.parts.length : 1),
+            (rows, group) => rows + (group.kind === "tool-aggregate" ? group.parts.length + group.thoughts.length : 1),
             0
           )
           : 1),
@@ -1049,7 +1127,7 @@ function MessageGroup({
     : []
 
   const renderItem = (item: UIMessageWithIndex, groupIndex: number, hideReasoning?: boolean) => {
-    const isLastMessage = item.index === messages.length - 1
+    const isLastMessage = isLastGroup && item.index === lastItem.index
 
     return (
       <div key={item.message.id}>
@@ -1099,6 +1177,7 @@ function MessageGroup({
   }
 
   return (
+    <DevProfiler id={`MessageGroup:${lastItem.message.id}`}>
       <div className="flex flex-col gap-2 group/message-group">
       {/* The scroll area keeps the same 8px rhythm the parts inside a single
           message use, so a step row is spaced identically whether or not a
@@ -1106,13 +1185,13 @@ function MessageGroup({
       {stepItems.length > 0 ? (
         collapseSteps ? (
           <CompletedStepRun label={stepRunLabel}>
-            <div className="flex max-h-[520px] flex-col gap-2 overflow-y-auto">
+            <div className="flex flex-col gap-2">
               {renderItems(stepItems, 0)}
               {foldedReasoning}
             </div>
           </CompletedStepRun>
         ) : (
-          <div ref={stepsRef} className="flex max-h-[520px] flex-col gap-2 overflow-y-auto">
+          <div data-live-steps="" className="flex flex-col gap-2">
             {renderItems(stepItems, 0)}
           </div>
         )
@@ -1126,11 +1205,6 @@ function MessageGroup({
         </Message>
       ))}
       {renderItems(proseItems, stepItems.length, collapseSteps)}
-      {/* Paper artifact strip: one FILES row per turn, at the end. */}
-      <ArtifactList
-        messages={items.map((item) => item.message)}
-        includeTargetFallbacks={false}
-      />
       {lastTextMessage && !isStreaming && (
         <div className="mx-auto flex w-full max-w-3xl flex-wrap items-center gap-2 px-2 opacity-0 transition-opacity duration-150 group-hover/message-group:opacity-100 max-lg:opacity-100 pointer-coarse:opacity-100 md:px-8">
           <MessageActions className="flex gap-0">
@@ -1165,41 +1239,112 @@ function MessageGroup({
         </div>
       )}
       </div>
+    </DevProfiler>
   )
 }
+
+function sameMessageGroupProps(left: AssistantMessageGroupProps, right: AssistantMessageGroupProps): boolean {
+  return left.isLastGroup === right.isLastGroup
+    && left.isStreaming === right.isStreaming
+    && left.items.length === right.items.length
+    && left.items.every((item, index) => (
+      item.index === right.items[index]?.index
+      && item.message === right.items[index]?.message
+    ))
+}
+
+const MemoizedMessageGroup = React.memo(MessageGroup, sameMessageGroupProps)
+
+type StandaloneMessageProps = {
+  message: UIMessage
+  isLastMessage: boolean
+  isStreaming: boolean
+  isLastStep: boolean
+}
+
+const StandaloneMessage = React.memo(function StandaloneMessage(props: StandaloneMessageProps) {
+  return <MessageComponent {...props} />
+})
 
 interface MessageListProps {
   messages: UIMessage[]
   status: ThreadStatus
+  activityStatus: SessionActivityStatus
   retryStatus?: RetryStatus | null
 }
 
-export function shouldShowMessageListLoading(status: ThreadStatus, messageCount: number) {
+export function shouldShowMessageListLoading(
+  status: ThreadStatus,
+  messageCount: number,
+  hasVisibleToolActivity = false,
+) {
+  if (hasVisibleToolActivity) return false
   return status === "streaming" || (status === "submitted" && messageCount > 0)
 }
 
-export function MessageList({ messages, status, retryStatus }: MessageListProps) {
+export function MessageList({ messages, status, activityStatus, retryStatus }: MessageListProps) {
   const isStreaming = status === "streaming" || status === "retrying"
-  const showLoading = shouldShowMessageListLoading(status, messages.length)
+  const runActive = status === "submitted" || status === "streaming" || status === "retrying"
+  const runStartedAtRef = React.useRef<number | null>(null)
+  const [runElapsedSeconds, setRunElapsedSeconds] = React.useState(0)
+  // Anchor the counter to the user message that started the run (server
+  // timestamp), so switching sessions and back doesn't reset it to 0 on
+  // remount. Optimistic messages without metadata fall back to first-mount
+  // wall clock.
+  const runStartedAt = React.useMemo(() => {
+    if (!runActive) return null
+    for (let index = messages.length - 1; index >= 0; index--) {
+      const message = messages[index]
+      if (message && message.role === "user") return getMessageCreated(message)
+    }
+    return null
+  }, [messages, runActive])
+  React.useEffect(() => {
+    if (!runActive) {
+      runStartedAtRef.current = null
+      setRunElapsedSeconds(0)
+      return
+    }
+    if (runStartedAt !== null) runStartedAtRef.current = runStartedAt
+    else if (runStartedAtRef.current === null) runStartedAtRef.current = Date.now()
+    const updateElapsed = () => {
+      const startedAt = runStartedAtRef.current
+      if (startedAt !== null) setRunElapsedSeconds(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)))
+    }
+    updateElapsed()
+    const interval = window.setInterval(updateElapsed, 1000)
+    return () => window.clearInterval(interval)
+  }, [runActive, runStartedAt])
   const items = React.useMemo(() => groupMessages(messages, status), [messages, status]);
   const error = useSessionErrorMessage();
   const hasSessionErrorMessage = React.useMemo(() => messages.some(isSessionErrorMessage), [messages])
-  const liveActionLabel = isStreaming
-    ? getActiveToolLabel(collectToolParts(messages))
-    : null
+  const latestAssistantToolParts = React.useMemo(
+    () => collectLatestAssistantToolParts(messages),
+    [messages],
+  )
+  const hasVisibleToolActivity = latestAssistantToolParts.some(isToolPartInFlight)
+  const showLoading = shouldShowMessageListLoading(status, messages.length, hasVisibleToolActivity)
+  const currentToolCallIds = React.useMemo(
+    () => new Set(latestAssistantToolParts.map((part) => part.toolCallId)),
+    [latestAssistantToolParts],
+  )
 
   return (
-    <div className={cn("flex flex-col gap-2 @container/message-list")}>
-      {messages.length === 0 && <TaskSuggestions className="mx-auto w-full max-w-3xl shrink-0 px-3 pb-3 md:px-5 md:pb-5 grow" />}
+    <CurrentToolLifecycleProvider
+      activityStatus={activityStatus}
+      currentToolCallIds={currentToolCallIds}
+    >
+      <div className={cn("flex flex-col gap-2 @container/message-list")}>
+        {messages.length === 0 && <TaskSuggestions className="mx-auto w-full max-w-3xl shrink-0 px-3 pb-3 md:px-5 md:pb-5 grow" />}
 
-      {items.map((item) => {
+        {items.map((item) => {
         if (isMessageGroup(item)) {
           return (
-            <MessageGroup
+            <MemoizedMessageGroup
               key={item.messages[0]?.message.id ?? "empty-assistant-group"}
               items={item.messages}
-              messages={messages}
-              isStreaming={isStreaming}
+              isLastGroup={item.messages.at(-1)?.index === messages.length - 1}
+              isStreaming={isStreaming && item.messages.at(-1)?.index === messages.length - 1}
             />
           )
         }
@@ -1209,21 +1354,20 @@ export function MessageList({ messages, status, retryStatus }: MessageListProps)
           !messages[item.index + 1] || messages[item.index + 1].role !== item.message.role
 
         return (
-          <div key={item.message.id}>
-            <MessageComponent
-              message={item.message}
-              isLastMessage={isLastMessage}
-              isStreaming={isLastMessage && isStreaming}
-              isLastStep={isLastStep}
-            />
-            <ArtifactList messages={[item.message]} includeTargetFallbacks={false} />
-          </div>
+          <StandaloneMessage
+            key={item.message.id}
+            message={item.message}
+            isLastMessage={isLastMessage}
+            isStreaming={isLastMessage && isStreaming}
+            isLastStep={isLastStep}
+          />
         )
-      })}
+        })}
 
-      {showLoading && <LoadingMessage label={liveActionLabel ?? undefined} />}
-      {retryStatus ? <RetryMessage status={retryStatus} /> : null}
-      {error && !hasSessionErrorMessage ? <ErrorMessage error={error} /> : null}
-    </div>
+        {showLoading && <LoadingMessage elapsedSeconds={runElapsedSeconds} />}
+        {retryStatus ? <RetryMessage status={retryStatus} /> : null}
+        {error && !hasSessionErrorMessage ? <ErrorMessage error={error} /> : null}
+      </div>
+    </CurrentToolLifecycleProvider>
   )
 }

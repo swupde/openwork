@@ -24,10 +24,10 @@ import { registerAdminRoutes } from "./routes/admin/index.js"
 import { registerAuthRoutes } from "./routes/auth/index.js"
 import { registerBootstrapRoutes } from "./routes/bootstrap/index.js"
 import { registerCloudRoutes } from "./routes/cloud/index.js"
+import { registerDeprecatedMemoryRoutes } from "./routes/deprecated-memory.js"
 import { registerDeprecatedSkillHubRoutes } from "./routes/deprecated-skill-hubs.js"
 import { registerDevRoutes } from "./routes/dev/index.js"
 import { registerMcpTokenRoutes } from "./routes/mcp/index.js"
-import { registerMemoryRoutes } from "./routes/memory/index.js"
 import { registerAutomationRoutes } from "./routes/automations/index.js"
 import { configureCloudAgentExecutor, configureCloudWorkflowExecutor } from "./automations/service.js"
 import { cloudAgentRuntimeAvailable, executeCloudAgent } from "./automations/cloud-agent-executor.js"
@@ -36,13 +36,13 @@ import { buildCapabilityToolTree, createCapabilityRegistryContext } from "./mcp/
 import { executeMarketplaceCapability } from "./mcp/marketplace-capabilities.js"
 import { resolveMcpMemberIdentity } from "./mcp/external-capabilities.js"
 import { DEN_MCP_REQUESTED_SCOPES } from "./mcp/scopes.js"
-import { workflowsEnabled } from "./capability-sources/workflow-rollout.js"
 import { registerMeRoutes } from "./routes/me/index.js"
 import { registerOrgRoutes } from "./routes/org/index.js"
 import { registerTelemetryRoutes } from "./routes/telemetry/index.js"
 import { registerVersionRoutes } from "./routes/version/index.js"
 import { registerWebhookRoutes } from "./routes/webhooks/index.js"
 import { registerWorkerRoutes } from "./routes/workers/index.js"
+import { registerCloudWorkerCompatibilityPreflightRoute } from "./routes/workers/compatibility.js"
 import type { AuthContextVariables } from "./session.js"
 import { sessionMiddleware } from "./session.js"
 import { isOperationalErrorPath, normalizeOperationalErrorResponse, operationalErrorResponse } from "./operational-errors.js"
@@ -122,6 +122,10 @@ app.use(
     maxAge: 600,
   }),
 )
+
+// This bearer-token-only compatibility surface must accept native/file-origin
+// preflights before the credentialed browser allowlist can intercept OPTIONS.
+registerCloudWorkerCompatibilityPreflightRoute(app)
 
 if (env.corsOrigins.length > 0) {
   app.use(
@@ -210,11 +214,11 @@ registerAdminRoutes(app)
 registerAuthRoutes(app)
 registerBootstrapRoutes(app)
 registerCloudRoutes(app)
+registerDeprecatedMemoryRoutes(app)
 registerDeprecatedSkillHubRoutes(app)
 registerDevRoutes(app)
 registerMeRoutes(app)
-registerMemoryRoutes(app)
-registerAutomationRoutes(app)
+registerAutomationRoutes(app, { enabled: env.automations.runtimeEnabled })
 registerOrgRoutes(app)
 registerVersionRoutes(app)
 registerWebhookRoutes(app)
@@ -242,10 +246,6 @@ configureCloudWorkflowExecutor(async ({ organizationId, ownerMemberId, automatio
     eq(OrganizationTable.id, normalizedOrganizationId),
   ).limit(1)
   const organizationMetadata = organizations[0]?.metadata
-  const codemodeEnabled = workflowsEnabled(organizationMetadata)
-  if (!codemodeEnabled) {
-    return { ok: false, message: "Workflows are disabled for this organization.", retryable: false }
-  }
   const member = await resolveMcpMemberIdentity({ userId, organizationId })
   if (!member) return { ok: false, message: "The Automation owner is no longer active.", retryable: false }
   const catalog = await getCatalog(app as unknown as Hono, undefined)
@@ -258,7 +258,6 @@ configureCloudWorkflowExecutor(async ({ organizationId, ownerMemberId, automatio
     organizationId: normalizedOrganizationId,
     member,
     redirectUriBase: env.apiPublicUrl ?? "http://127.0.0.1",
-    codemodeEnabled,
     generatedArtifactViewsEnabled: env.generatedArtifactViewsEnabled,
     organizationMetadata,
     mcpConnectionsGatingEnabled: env.mcpConnectionsGatingEnabled,
@@ -271,7 +270,6 @@ configureCloudWorkflowExecutor(async ({ organizationId, ownerMemberId, automatio
     configObjectVersionId: action.script.configObjectVersionId,
     automationRunId: normalizeDenTypeId("automationRun", automationRunId),
     body: action.input,
-    codemodeEnabled: true,
     validateScriptOutput: true,
     buildTools: () => buildCapabilityToolTree(capabilityContext),
   })

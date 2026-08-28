@@ -3,13 +3,14 @@ appId: com.differentai.openwork
 productName: OpenWork Enterprise
 extraMetadata:
   openworkDistribution: enterprise
+  openworkReleaseRepository: swupde/openwork
 protocols:
   - name: OpenWork Enterprise
     schemes:
       - openwork
 publish:
   - provider: github
-    owner: different-ai
+    owner: swupde
     repo: openwork
     releaseType: release
     channel: enterprise

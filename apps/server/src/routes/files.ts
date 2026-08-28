@@ -18,6 +18,7 @@ const FILE_SESSION_MAX_BATCH_ITEMS = 64;
 const FILE_SESSION_MAX_FILE_BYTES = 5_000_000;
 const FILE_SESSION_CATALOG_DEFAULT_LIMIT = 2000;
 const FILE_SESSION_CATALOG_MAX_LIMIT = 10000;
+const FILE_BROWSER_EXCLUDED_DIRECTORIES = new Set([".git", "node_modules"]);
 const MAX_PATH_COMPONENT_BYTES = 255;
 const WINDOWS_RESERVED_PATH_COMPONENT = /^(?:con|prn|aux|nul|clock\$|conin\$|conout\$|com[1-9¹²³]|lpt[1-9¹²³])(?:\..*)?$/i;
 
@@ -113,6 +114,7 @@ export function isSupportedWorkspaceTextFilePath(relativePath: string): boolean 
     ".md",
     ".mdx",
     ".markdown",
+    ".mmd",
     ".csv",
     ".tsv",
     ".json",
@@ -131,6 +133,34 @@ export function isSupportedWorkspaceTextFilePath(relativePath: string): boolean 
     ".cjs",
     ".css",
     ".scss",
+    ".astro",
+    ".bash",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cs",
+    ".dart",
+    ".ex",
+    ".exs",
+    ".go",
+    ".graphql",
+    ".h",
+    ".hpp",
+    ".java",
+    ".kt",
+    ".kts",
+    ".lua",
+    ".php",
+    ".prisma",
+    ".py",
+    ".rb",
+    ".rs",
+    ".sh",
+    ".sql",
+    ".svelte",
+    ".swift",
+    ".vue",
+    ".zig",
     ".txt",
     ".log",
   ].some((ext) =>
@@ -203,13 +233,14 @@ type ArtifactTargetInput = {
 
 function artifactPreviewForPath(path: string): string {
   const lowered = path.toLowerCase();
-  if (/\.(md|markdown|mdx)$/.test(lowered)) return "markdown";
+  if (/\.(md|markdown|mdx|mmd)$/.test(lowered)) return "markdown";
   if (/\.(csv|tsv|xlsx|xls|ods)$/.test(lowered)) return "sheet";
   if (/\.(ppt|pptx|pptm|pot|potx|odp|key|sxi)$/.test(lowered)) return "slides";
   if (lowered.endsWith(".docx")) return "document";
   if (/\.(png|jpe?g|gif|webp|svg)$/.test(lowered)) return "image";
   if (lowered.endsWith(".pdf")) return "pdf";
   if (/\.(html|htm)$/.test(lowered)) return "html";
+  if (/\.(astro|bash|c|cc|cpp|cs|css|dart|ex|exs|go|graphql|h|hpp|java|js|jsx|json|jsonc|kt|kts|lua|mjs|cjs|php|prisma|py|rb|rs|scss|sh|sql|svelte|swift|toml|ts|tsx|vue|xml|yaml|yml|zig)$/.test(lowered)) return "code";
   if (isSupportedWorkspaceTextFilePath(path)) return "text";
   return "external";
 }
@@ -422,7 +453,7 @@ function normalizeResolvedRelativePath(input: string): string {
   return parts.join("/");
 }
 
-async function listWorkspaceCatalogEntries(workspaceRoot: string): Promise<FileSessionCatalogEntry[]> {
+async function listWorkspaceCatalogEntries(workspaceRoot: string, excludeHeavyDirectories = false): Promise<FileSessionCatalogEntry[]> {
   const rootResolved = resolve(workspaceRoot);
   const items: FileSessionCatalogEntry[] = [];
 
@@ -431,6 +462,9 @@ async function listWorkspaceCatalogEntries(workspaceRoot: string): Promise<FileS
     entries.sort((a, b) => a.name.localeCompare(b.name));
 
     for (const entry of entries) {
+      if (excludeHeavyDirectories && entry.isDirectory() && FILE_BROWSER_EXCLUDED_DIRECTORIES.has(entry.name)) {
+        continue;
+      }
       const absPath = join(dirPath, entry.name);
       const relRaw = relative(rootResolved, absPath).replace(/\\/g, "/");
       const rel = normalizeResolvedRelativePath(relRaw);
@@ -744,8 +778,9 @@ export function registerFileRoutes(options: RegisterFileRoutesOptions): void {
     const after = parseCatalogPathFilter(ctx.url.searchParams.get("after"));
     const includeDirs = ctx.url.searchParams.get("includeDirs") !== "false";
     const limit = parseCatalogLimit(ctx.url.searchParams.get("limit"));
+    const excludeHeavyDirectories = ctx.url.searchParams.get("excludeHeavyDirectories") === "true";
 
-    const entries = await listWorkspaceCatalogEntries(workspace.path);
+    const entries = await listWorkspaceCatalogEntries(workspace.path, excludeHeavyDirectories);
     const filtered = entries.filter((entry) => {
       if (!includeDirs && entry.kind === "dir") return false;
       if (!matchesCatalogFilter(entry.path, prefix)) return false;

@@ -110,6 +110,11 @@ function resultRecord(payload: Record<string, unknown>) {
   return payload.result
 }
 
+function errorRecord(payload: Record<string, unknown>) {
+  if (!isRecord(payload.error)) throw new Error("Expected JSON-RPC error")
+  return payload.error
+}
+
 function listedToolNames(payload: Record<string, unknown>): string[] {
   const tools = resultRecord(payload).tools
   if (!Array.isArray(tools)) throw new Error("Expected MCP tools list")
@@ -139,16 +144,15 @@ afterAll(() => {
   mock.restore()
 })
 
-test("does not register execute_capability_script when the org flag is off", async () => {
+test("registers execute_capability_script without any org rollout flag", async () => {
   const tools = listedToolNames(await rpc(buildApp(), "tools/list"))
-  expect(tools).not.toContain("execute_capability_script")
+  expect(tools).toContain("execute_capability_script")
   expect(tools).not.toContain("save_artifact_view")
   expect(tools).not.toContain("activate_artifact_view_revision")
   expect(tools).not.toContain("retire_artifact_view")
 })
 
 test("registers Code Mode without enabling agent-authored MCP App views", async () => {
-  organizationMetadata = { capabilities: { workflows: true } }
   const names = listedToolNames(await rpc(buildApp(), "tools/list"))
   expect(names).toContain("execute_capability_script")
   expect(names).toContain("render_workflow_artifact")
@@ -160,11 +164,9 @@ test("registers Code Mode without enabling agent-authored MCP App views", async 
 })
 
 test("rejects guessed generated-view tool calls while keeping Workflows enabled", async () => {
-  organizationMetadata = { capabilities: { workflows: true } }
   for (const name of ["save_artifact_view", "activate_artifact_view_revision", "retire_artifact_view"]) {
     const payload = await rpc(buildApp(), "tools/call", { name, arguments: {} })
-    expect(resultRecord(payload).isError).toBe(true)
-    expect(JSON.stringify(payload)).toContain("not found")
+    expect(errorRecord(payload)).toMatchObject({ code: -32602, message: expect.stringContaining("not found") })
   }
 })
 
@@ -180,8 +182,7 @@ test("advertises standard Workflow discovery and execution instructions", async 
   expect(initialized.instructions).not.toContain("search/selection tools")
 })
 
-test("executes a confined script when the org flag is on", async () => {
-  organizationMetadata = { capabilities: { workflows: true } }
+test("executes a confined script by default", async () => {
   const payload = await rpc(buildApp(), "tools/call", {
     name: "execute_capability_script",
     arguments: { code: "return 1 + 1" },
@@ -190,7 +191,6 @@ test("executes a confined script when the org flag is on", async () => {
 })
 
 test("exposes in-program capability search over the Den namespace", async () => {
-  organizationMetadata = { capabilities: { workflows: true } }
   const payload = await rpc(buildApp(), "tools/call", {
     name: "execute_capability_script",
     arguments: { code: "return await tools.$codemode.search({ query: \"workers\" })" },
@@ -199,7 +199,6 @@ test("exposes in-program capability search over the Den namespace", async () => 
 })
 
 test("makes the Workflow save operation discoverable through the standard capability catalog", async () => {
-  organizationMetadata = { capabilities: { workflows: true } }
   const payload = await rpc(buildApp(), "tools/call", {
     name: "search_capabilities",
     arguments: { query: "save Workflow to Plugin" },

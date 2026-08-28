@@ -9,8 +9,8 @@ import {
 import { db } from "../db.js"
 import { env } from "../env.js"
 import { appLogger } from "../observability/logger.js"
-import { fetchWithConnectRetry, previewFetch } from "../workers/preview-fetch.js"
-import { decodeProviderCredential, readProviderEnvNames } from "./provider-credentials.js"
+import { fetchPreviewNoRedirect, fetchWithConnectRetry, previewFetch } from "../workers/preview-fetch.js"
+import { decodeProviderCredential, readProviderEnvNames, selectLegacyScalarCredentialEnvName, selectPrimaryCredentialEnvName } from "./provider-credentials.js"
 
 type JsonRecord = Record<string, unknown>
 type OrganizationId = typeof LlmProviderTable.$inferSelect.organizationId
@@ -282,10 +282,15 @@ function providerEnvEntries(provider: CloudProviderMaterializationProvider): Env
   }
 
   if (credential.apiKey && envNames[0]) {
-    upsertEnvEntry(entries, envNames[0], credential.apiKey)
+    upsertEnvEntry(
+      entries,
+      selectLegacyScalarCredentialEnvName(envNames) ?? envNames[0],
+      credential.apiKey,
+    )
   }
 
-  const primaryCredential = credential.apiKey?.trim() || entries[0]?.value || ""
+  const primaryCredentialEnvName = selectPrimaryCredentialEnvName(envNames, entries.map((entry) => entry.key))
+  const primaryCredential = credential.apiKey?.trim() || entries.find((entry) => entry.key === primaryCredentialEnvName)?.value || ""
   if (provider.source === "openwork" && primaryCredential) {
     upsertEnvEntry(entries, "OPENWORK_API_KEY", primaryCredential)
     const baseUrl = readOpenWorkInferenceBaseUrl(provider.providerConfig)
@@ -364,7 +369,7 @@ function providerHasRequiredCredential(provider: CloudProviderMaterializationPro
     return true
   }
 
-  return envEntries.some((entry) => envNames.includes(entry.key))
+  return selectPrimaryCredentialEnvName(envNames, envEntries.map((entry) => entry.key)) !== null
 }
 
 function prepareMaterialization(providers: CloudProviderMaterializationProvider[]): PreparedMaterialization {
@@ -418,7 +423,7 @@ async function fetchWithTimeout(fetchImpl: FetchImpl, url: string, init: Request
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), requestTimeoutMs)
   try {
-    return await fetchImpl(url, { ...init, signal: controller.signal })
+    return await fetchPreviewNoRedirect(fetchImpl, url, { ...init, signal: controller.signal })
   } finally {
     clearTimeout(timeout)
   }

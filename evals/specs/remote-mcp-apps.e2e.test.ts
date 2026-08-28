@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { rm } from "node:fs/promises";
 import { expect, onTestFinished } from "vitest";
 import { clickButton, createAndSelectWorkspace, createOrgConnection, denFetch, evalIn, waitFor } from "@openwork/behaviors";
 import { connect, debuggerUrlFor, evaluate, listTargets, navigate } from "@openwork/cdp";
@@ -17,7 +18,7 @@ const title = !e2eTestsEnabled
     ? "Remote MCP Apps skipped — needs local placement without OPENWORK_EVAL_DEN_API_URL"
     : !mysqlOpen
       ? "Remote MCP Apps skipped — needs MySQL on 127.0.0.1:3306"
-      : "standard MCP Apps stay behind capability search while standalone URL Apps remain unavailable";
+      : "standard MCP Apps refresh after connection changes while standalone URL Apps remain unavailable";
 const providerId = "remote-mcp-apps-provider";
 const modelId = "remote-mcp-apps-model";
 const desktopClosingReply = "Project Atlas is open through its standard MCP server.";
@@ -328,6 +329,39 @@ async function agentRpc(
   return requireRecord(message.result, `${method} result`);
 }
 
+async function reconcileDesktopCatalog(input: {
+  app: Awaited<ReturnType<typeof desktop>>;
+  workspaceId: string;
+  denApiUrl: string;
+  mcpToken: string;
+  appHostMcpToken: string;
+}) {
+  return evalIn(input.app, `(async () => {
+    const port = localStorage.getItem("openwork.server.port");
+    const token = localStorage.getItem("openwork.server.token");
+    if (!port || !token) return "missing local server credentials";
+    const response = await fetch("http://127.0.0.1:" + port + "/workspace/" + encodeURIComponent(${JSON.stringify(input.workspaceId)}) + "/mcp/openwork-cloud/reconcile", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        config: {
+          type: "remote",
+          url: ${JSON.stringify(`${input.denApiUrl}/mcp/agent`)},
+          enabled: true,
+          headers: { Authorization: ${JSON.stringify(`Bearer ${input.mcpToken}`)} },
+          oauth: false,
+        },
+        appHostAuthorization: ${JSON.stringify(`Bearer ${input.appHostMcpToken}`)},
+        provider: ${JSON.stringify(providerId)},
+        model: ${JSON.stringify(modelId)},
+        trigger: "exact-head-tape-refresh",
+      }),
+    });
+    const text = await response.text();
+    return response.ok ? "ok" : "HTTP " + response.status + " " + text.slice(0, 1_000);
+  })()`, { awaitPromise: true, timeoutMs: 60_000 });
+}
+
 function toolsFrom(result: Record<string, unknown>) {
   return Array.isArray(result.tools) ? result.tools.filter(isRecord) : [];
 }
@@ -338,7 +372,6 @@ function contentsFrom(result: Record<string, unknown>) {
 
 test.skipIf(!e2eTestsEnabled || !localPlacement || !mysqlOpen)(title, { timeout: 360_000 }, async ({ evidence, place }) => {
   needs({ optIn: ["OPENWORK_EVAL_E2E_TESTS"] });
-  process.env.DEN_REMOTE_MCP_APPS_ENABLED = "true";
 
   let standardMcpCalls = 0;
   let agentMcpUpstream: { token: string; staticUrl: string; connectedUrl: string } | null = null;
@@ -495,12 +528,6 @@ test.skipIf(!e2eTestsEnabled || !localPlacement || !mysqlOpen)(title, { timeout:
     : [];
   const organizationId = String(orgs[0]?.id ?? "");
   expect(organizationId).not.toBe("");
-  const enabled = await denFetch(den.admin, `/v1/admin/organizations/${organizationId}/capabilities`, {
-    method: "PUT",
-    headers: { authorization: `Bearer ${den.admin.token}` },
-    body: JSON.stringify({ capabilities: { remoteMcpApps: true } }),
-  });
-  expect(enabled.response.ok, enabled.text).toBe(true);
 
   const connection = await createOrgConnection(den.admin, {
     name: "Atlas read-only projects",
@@ -781,9 +808,11 @@ test.skipIf(!e2eTestsEnabled || !localPlacement || !mysqlOpen)(title, { timeout:
   expect(JSON.stringify(providerAppRun.structuredContent)).toContain("Atlas migration");
   expect(standardMcpCalls).toBe(2);
 
-  await using desktopApp = await desktop({
+  const desktopProfileDir = `/tmp/openwork-remote-mcp-apps-profile-${Date.now()}`;
+  let desktopApp = await desktop({
     name: "remote-mcp-apps",
     mode: process.env.OPENWORK_EVAL_CDP_URL?.trim() ? "attach" : "spawn",
+    profileDir: process.env.OPENWORK_EVAL_CDP_URL?.trim() ? undefined : desktopProfileDir,
     env: {
       ANTHROPIC_API_KEY: "",
       OPENAI_API_KEY: "",
@@ -792,6 +821,10 @@ test.skipIf(!e2eTestsEnabled || !localPlacement || !mysqlOpen)(title, { timeout:
       OPENWORK_API_KEY: "",
       OPENWORK_INFERENCE_BASE_URL: "",
     },
+  });
+  onTestFinished(async () => {
+    await desktopApp.stop().catch(() => undefined);
+    await rm(desktopProfileDir, { recursive: true, force: true });
   });
   const workspace = await createAndSelectWorkspace(desktopApp, {
     path: `/tmp/openwork-remote-mcp-apps-${Date.now()}`,
@@ -872,6 +905,30 @@ test.skipIf(!e2eTestsEnabled || !localPlacement || !mysqlOpen)(title, { timeout:
     return "ok";
   })()`, { awaitPromise: true, timeoutMs: 60_000 });
   expect(configured).toBe("ok");
+
+  const lateConnection = await createOrgConnection(den.admin, {
+    name: "Atlas added after Desktop reconcile",
+    url: `${fixtureUrl}/mcp`,
+    authType: "none",
+    credentialMode: "shared",
+    access: { orgWide: true },
+  });
+  gatewayCapabilityName = `mcp:${lateConnection.id}:open_project_atlas`;
+  const refreshedIndexRead = await agentRpc(
+    den.ref.apiUrl,
+    appHostMcpToken,
+    "resources/read",
+    { uri: "openwork://connect/mcp-servers/index.json" },
+    "/mcp/agent",
+    appHostCapabilityHeaders,
+  );
+  const refreshedIndex = requireRecord(
+    JSON.parse(String(contentsFrom(refreshedIndexRead)[0]?.text ?? "{}")),
+    "refreshed Connect MCP server index",
+  );
+  const refreshedServers = Array.isArray(refreshedIndex.servers) ? refreshedIndex.servers.filter(isRecord) : [];
+  expect(refreshedServers).toContainEqual(expect.objectContaining({ connectionId: lateConnection.id }));
+
   await evalIn(desktopApp, "location.reload(); true");
   await waitFor(desktopApp, "Boolean(window.__openworkControl)", { timeoutMs: 30_000, label: "desktop control after reload" });
   const engineReady = await evalIn(desktopApp, `(async () => {
@@ -975,7 +1032,7 @@ test.skipIf(!e2eTestsEnabled || !localPlacement || !mysqlOpen)(title, { timeout:
   expect(persistedMcpResult._meta).toEqual({
     source: "project-atlas-standard-mcp",
     "openwork/mcpApp": {
-      connectionId: connection.id,
+      connectionId: lateConnection.id,
       toolName: "open_project_atlas",
       resourceUri: connectedResourceUri,
       arguments: {},
@@ -985,11 +1042,16 @@ test.skipIf(!e2eTestsEnabled || !localPlacement || !mysqlOpen)(title, { timeout:
     timeoutMs: 60_000,
     label: "connected standard MCP App sandboxed iframe",
   });
-  const mountedProjectAtlas = await waitForMountedProjectAtlas(desktopApp, undefined, 15_000);
+  const mountedProjectAtlas = await waitForMountedProjectAtlas(desktopApp, undefined, 30_000);
   const desktopTranscript = await evalIn(desktopApp, "document.body?.innerText ?? ''");
   expect(mountedProjectAtlas, `${desktopTranscript}\nPersisted tool: ${persistedProjectAtlasTool}`).toBe(true);
   expect(desktopTranscript).not.toContain("MCP_APP_INITIALIZE_TIMEOUT");
   expect(desktopTranscript).not.toContain("Interactive view unavailable");
+  expect(standardMcpCalls).toBe(3);
+
+  await evalIn(desktopApp, "location.reload(); true");
+  await waitFor(desktopApp, "Boolean(window.__openworkControl)", { timeoutMs: 30_000, label: "desktop control after App reload" });
+  expect(await waitForMountedProjectAtlas(desktopApp, undefined, 30_000)).toBe(true);
   expect(standardMcpCalls).toBe(3);
   const desktopShot = await screenshot(desktopApp);
   const desktopExpectations = [
@@ -1007,55 +1069,65 @@ test.skipIf(!e2eTestsEnabled || !localPlacement || !mysqlOpen)(title, { timeout:
   });
   expect(desktopSeen.ok, desktopSeen.why).toBe(true);
 
-  const disabled = await denFetch(den.admin, `/v1/admin/organizations/${organizationId}/capabilities`, {
-    method: "PUT",
-    headers: { authorization: `Bearer ${den.admin.token}` },
-    body: JSON.stringify({ capabilities: { remoteMcpApps: false } }),
-  });
-  expect(disabled.response.ok, disabled.text).toBe(true);
-
-  const flagOffTools = await agentRpc(den.ref.apiUrl, mcpToken, "tools/list", {});
-  expect(toolsFrom(flagOffTools).some((tool) => tool.name === "import_remote_mcp_app")).toBe(false);
-  expect(toolsFrom(flagOffTools).some((tool) => String(tool.name ?? "").startsWith("launch_remote_app_"))).toBe(false);
-  const flagOffSearch = await agentRpc(den.ref.apiUrl, mcpToken, "tools/call", {
-    name: "search_capabilities",
-    arguments: { query: "open Project Atlas", type: "mcp", limit: 5 },
-  });
-  const flagOffMatches = Array.isArray(requireRecord(flagOffSearch.structuredContent, "flag-off search").matches)
-    ? (requireRecord(flagOffSearch.structuredContent, "flag-off search").matches as unknown[]).filter(isRecord)
-    : [];
-  const flagOffMatch = requireRecord(
-    flagOffMatches.find((match) => match.name === gatewayCapabilityName),
-    "flag-off regular MCP capability",
-  );
-  expect(flagOffMatch.kind).toBeUndefined();
-  expect(flagOffMatch.mcpApp).toBeUndefined();
-
-  const flagOffRun = await agentRpc(den.ref.apiUrl, mcpToken, "tools/call", {
-    name: "execute_capability",
-    arguments: { name: gatewayCapabilityName, body: {} },
-  });
-  expect(flagOffRun.isError, JSON.stringify(flagOffRun)).not.toBe(true);
-  expect(JSON.stringify(flagOffRun.structuredContent)).toContain("Connected through OpenWork Connect");
-  expect(requireRecord(flagOffRun._meta, "flag-off provider metadata")["openwork/mcpApp"]).toBeUndefined();
-
-  const flagOffProviderTools = await agentRpc(den.ref.apiUrl, appHostMcpToken, "tools/list", {}, connectedEndpoint, appHostHeaders);
-  expect(toolsFrom(flagOffProviderTools)).toEqual([]);
-  const flagOffIndexRead = await agentRpc(
-    den.ref.apiUrl,
-    appHostMcpToken,
-    "resources/read",
-    { uri: "openwork://connect/mcp-servers/index.json" },
-    "/mcp/agent",
-    appHostCapabilityHeaders,
-  );
-  const flagOffIndex = requireRecord(JSON.parse(String(contentsFrom(flagOffIndexRead)[0]?.text ?? "{}")), "flag-off Connect MCP server index");
-  expect(flagOffIndex.servers).toEqual([]);
-  expect(standardMcpCalls).toBe(4);
+  if (!process.env.OPENWORK_EVAL_CDP_URL?.trim()) {
+    const persistedSessionHash = String(await evalIn(desktopApp, "location.hash"));
+    expect(persistedSessionHash).toContain("/session/");
+    await desktopApp.stop();
+    desktopApp = await desktop({
+      name: "remote-mcp-apps-restarted",
+      profileDir: desktopProfileDir,
+      env: {
+        ANTHROPIC_API_KEY: "",
+        OPENAI_API_KEY: "",
+        OPENROUTER_API_KEY: "",
+        GOOGLE_GENERATIVE_AI_API_KEY: "",
+        OPENWORK_API_KEY: "",
+        OPENWORK_INFERENCE_BASE_URL: "",
+      },
+    });
+    await waitFor(desktopApp, "Boolean(window.__openworkControl)", { timeoutMs: 30_000, label: "restarted Desktop control" });
+    await waitFor(desktopApp, `Boolean(localStorage.getItem("openwork.server.port") && localStorage.getItem("openwork.server.token"))`, {
+      timeoutMs: 60_000,
+      label: "restarted Desktop local server credentials",
+    });
+    await evalIn(desktopApp, `location.hash = ${JSON.stringify(persistedSessionHash)}; true`);
+    const restartResolution = await evalIn(desktopApp, `(async () => {
+      const port = localStorage.getItem("openwork.server.port");
+      const token = localStorage.getItem("openwork.server.token");
+      if (!port || !token) return { error: "missing local server credentials" };
+      const headers = { Authorization: "Bearer " + token, "Content-Type": "application/json" };
+      const base = "http://127.0.0.1:" + port + "/workspace/" + encodeURIComponent(${JSON.stringify(workspace.workspaceId)});
+      const [resolved, listed] = await Promise.all([
+        fetch(base + "/mcp-apps/resolve", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            projectedToolName: "openwork-cloud_execute_capability",
+            launch: {
+              connectionId: ${JSON.stringify(connection.id)},
+              toolName: "open_project_atlas",
+              resourceUri: ${JSON.stringify(connectedResourceUri)},
+              arguments: {},
+            },
+          }),
+        }),
+        fetch(base + "/mcp", { headers }),
+      ]);
+      return {
+        hash: location.hash,
+        resolvedStatus: resolved.status,
+        resolved: await resolved.text(),
+        listedStatus: listed.status,
+        listed: await listed.text(),
+      };
+    })()`, { awaitPromise: true, timeoutMs: 60_000 });
+    expect(await waitForMountedProjectAtlas(desktopApp, undefined, 60_000), JSON.stringify(restartResolution)).toBe(true);
+    expect(standardMcpCalls).toBe(3);
+  }
 
   evidence.recordAssertionEvidence(
-    "Native MCP Apps stay bounded while standalone URL Apps remain unavailable",
-    `Kept every model-visible provider operation behind search_capabilities and execute_capability; exposed only the regular connected Project Atlas App binding on connection ${connection.id} to the App host; blocked direct provider access; proved the URL import tool, REST calls, Library button/form, capability matches, ui:// library resources, and standalone launch tools absent; completed the native MCP App handshake; then disabled the organization rollout, published an empty provider index, and preserved ordinary search/execute without MCP App launch metadata.`,
-    standardMcpCalls === 4 && mountedProjectAtlas,
+    "Native MCP Apps recover from catalog changes and restart while standalone URL Apps remain unavailable",
+    `Reconciled Desktop before adding connection ${lateConnection.id}, then rendered that newly added standard MCP App through search_capabilities and execute_capability without leaking provider tools into the model runtime. Exposed only the regular connected Project Atlas App binding on connection ${connection.id} to the App host; blocked direct provider access; proved the URL import tool, REST calls, Library button/form, capability matches, ui:// library resources, and standalone launch tools absent; completed the native MCP App handshake and same-server Search projects action; reloaded the App; and recovered after a Desktop restart on the same isolated profile.`,
+    standardMcpCalls === 3 && mountedProjectAtlas,
   );
 });

@@ -8,11 +8,13 @@
       "types": "./src/index.ts",
       "development": "./src/index.ts",
       "default": "./src/index.ts"
-    }
+    },
+    "./stack": "./src/stack.ts"
   },
   "dependencies": {
     "@openwork/behaviors": "workspace:*",
     "@openwork/cdp": "workspace:*",
+    "@openwork/env": "workspace:*",
     "@openwork/test-evidence": "workspace:*",
     "@openwork/hosts": "workspace:*",
     "@openwork/labs": "workspace:*",

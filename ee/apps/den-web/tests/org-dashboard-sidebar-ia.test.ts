@@ -29,6 +29,11 @@ describe("Den org sidebar information architecture", () => {
     expect(shell).toContain("access.isAdmin && activeOrg");
     expect(shell).toContain("manageItems.length > 0");
     expect(shell).toContain("observabilityItems.length > 0");
+    expect(shell).toContain("const showWeb = runtimeConfigLoaded\n    && orgContext?.capabilities.openworkWeb === true");
+    expect(shell).not.toMatch(/const showWeb =[\s\S]{0,160}runtimeConfig\.orgMode/);
+    expect(shell).toContain("orgContext?.capabilities.openworkWeb === true");
+    expect(shell).not.toContain("orgContext?.capabilities.cloud");
+    expect(shell).not.toMatch(/label: "OpenWork Web"[\s\S]{0,120}badge:/);
   });
 
   test("admins see Manage then Observability then Team, with Models as a Providers category", () => {
@@ -36,6 +41,7 @@ describe("Den org sidebar information architecture", () => {
     const pluginDirectory = indexOfNeedle('label: "Plugin Directory"');
     const connectors = indexOfNeedle('label: "Connectors"');
     const sources = indexOfNeedle('label: "Sources"');
+    const managedDashboards = indexOfNeedle('label: "Dashboards"');
     const workflowRuns = indexOfNeedle('label: "Workflow Runs"');
     const analytics = indexOfNeedle('label: "Analytics"');
     const workSection = indexOfNeedle('{ label: "Work", items: workItems }');
@@ -46,6 +52,7 @@ describe("Den org sidebar information architecture", () => {
     expect(marketplace).toBeLessThan(pluginDirectory);
     expect(pluginDirectory).toBeLessThan(connectors);
     expect(connectors).toBeLessThan(sources);
+    expect(sources).toBeLessThan(managedDashboards);
     expect(workflowRuns).toBeLessThan(analytics);
     expect(workSection).toBeLessThan(manageSection);
     expect(manageSection).toBeLessThan(observabilitySection);

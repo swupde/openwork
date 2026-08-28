@@ -43,6 +43,7 @@ export const idTypesMapNameToPrefix = {
   llmProvider: "lpr",
   llmProviderModel: "lpm",
   llmProviderAccess: "lpa",
+  llmProviderMemberCredential: "lpc",
   desktopPolicy: "dpo",
   desktopPolicyMember: "dpm",
   organizationRole: "orl",
@@ -80,6 +81,7 @@ export const idTypesMapNameToPrefix = {
   automationRun: "atr",
   automationRunEvent: "ate",
   automationThread: "ath",
+  remoteSessionCommand: "rsc",
   codemodeRun: "cmr",
   workflowRun: "wfr",
   artifactView: "arv",
@@ -95,9 +97,11 @@ export const idTypesMapNameToPrefix = {
   externalMcpConnection: "emc",
   externalMcpConnectionAccessGrant: "emg",
   pluginMcpRequirementBinding: "pmr",
-  memory: "mem",
-  memctx: "mctx",
+
+
   tempFile: "tmpf",
+  dashboard: "dsb",
+  dashboardAccessGrant: "dsg",
 } as const
 
 export const denTypeIdPrefixes = idTypesMapNameToPrefix

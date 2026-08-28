@@ -11,7 +11,7 @@ import {
   AGENT_CONTEXT_DIAGNOSTICS_REQUEST_TIMEOUT_MS,
   requestAgentContextDiagnosticsPayload,
 } from "./agent-context-diagnostics-transport";
-import { desktopFetch, desktopFetchAgentContextDiagnostics } from "./desktop";
+import { desktopFetch, desktopFetchAgentContextDiagnostics, desktopUploadMultipart, electronLocalPathForFile } from "./desktop";
 import { isOpenworkGatewayRuntime } from "./gateway-runtime";
 import { isDesktopRuntime } from "./runtime-env";
 import type { ExecResult, OpencodeConfigFile, WorkspaceInfo, WorkspaceList } from "./desktop";
@@ -260,6 +260,20 @@ export type OpenworkWorkspaceFileDeleteResult = {
   code?: string;
 };
 
+export type OpenworkWorkspaceCatalogEntry = {
+  path: string;
+  kind: "file" | "dir";
+  size: number;
+  mtimeMs: number;
+  revision: string;
+};
+
+export type OpenworkWorkspaceCatalog = {
+  items: OpenworkWorkspaceCatalogEntry[];
+  total: number;
+  truncated: boolean;
+};
+
 export type OpenworkAuthorizedFoldersResponse = {
   folders: string[];
   hiddenCount: number;
@@ -419,6 +433,31 @@ export type OpenworkMcpAppLaunchReference = {
   toolName: string;
   resourceUri: string;
   arguments: Record<string, unknown>;
+};
+
+export type OpenworkMcpAppCatalogApp = {
+  serverName: string;
+  /** Present for Connect app-host apps: launch them through this connection reference. */
+  connectionId?: string;
+  toolName: string;
+  projectedToolName: string;
+  resourceUri: string;
+  title: string | null;
+  description: string | null;
+  /** True when the launch tool declares required input, so a host cannot start it with empty arguments. */
+  requiresInput: boolean;
+  /** True when calling the launch tool needs user approval (not explicitly read-only, or destructive). */
+  requiresApproval: boolean;
+};
+
+export type OpenworkMcpAppCatalogServer = {
+  serverName: string;
+  /** Human-readable provider name for Connect app-host servers. */
+  displayName?: string;
+  connectionId?: string;
+  reachable: boolean;
+  error?: string;
+  apps: OpenworkMcpAppCatalogApp[];
 };
 
 export type OpenworkMcpAppToolResult = {
@@ -834,7 +873,7 @@ export type OpenworkResolvedArtifactTarget = {
   kind: "file" | "url";
   value: string;
   name: string;
-  preview: "browser" | "markdown" | "sheet" | "slides" | "image" | "pdf" | "html" | "text" | "external";
+  preview: "browser" | "markdown" | "code" | "sheet" | "slides" | "document" | "image" | "pdf" | "html" | "text" | "external";
   confidence: number;
   reason: string;
   exists?: boolean;
@@ -1287,6 +1326,15 @@ const OPENWORK_STREAM_URL_RE = /\/events(\b|\?)|\/event-stream\b|\/stream\b/;
 
 function isStreamUrl(url: string): boolean {
   return OPENWORK_STREAM_URL_RE.test(url);
+}
+
+function isLoopbackUrl(url: string): boolean {
+  try {
+    const hostname = new URL(url).hostname;
+    return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "[::1]";
+  } catch {
+    return false;
+  }
 }
 
 const resolveFetch = (url?: string) => {
@@ -1950,6 +1998,12 @@ export function createOpenworkServerClient(options: { baseUrl: string; token?: s
         `/workspace/${workspaceId}/mcp`,
         { token, hostToken },
       ),
+    listMcpApps: (workspaceId: string) =>
+      requestJson<{ servers: OpenworkMcpAppCatalogServer[] }>(
+        baseUrl,
+        `/workspace/${encodeURIComponent(workspaceId)}/mcp-apps/list`,
+        { token, hostToken, timeoutMs: timeouts.binary },
+      ),
     resolveMcpApp: (
       workspaceId: string,
       projectedToolName: string,
@@ -2151,23 +2205,39 @@ export function createOpenworkServerClient(options: { baseUrl: string; token?: s
         hostToken,
         method: "DELETE",
       }),
+    uploadInboxPrefersOriginalFile: (file: File) =>
+      isDesktopRuntime() && !isLoopbackUrl(baseUrl) && electronLocalPathForFile(file) !== null,
     uploadInbox: async (workspaceId: string, file: File, options?: { path?: string }) => {
       const id = workspaceId.trim();
       if (!id) throw new Error("workspaceId is required");
       if (!file) throw new Error("file is required");
-      const form = new FormData();
-      form.append("file", file);
-      if (options?.path?.trim()) {
-        form.append("path", options.path.trim());
+      const uploadPath = `/workspace/${encodeURIComponent(id)}/inbox`;
+      let result: { ok: boolean; status: number; text: string };
+      if (isDesktopRuntime() && !isLoopbackUrl(baseUrl) && electronLocalPathForFile(file) !== null) {
+        const response = await desktopUploadMultipart(file, {
+          url: `${baseUrl}${uploadPath}`,
+          method: "POST",
+          headers: buildAuthHeaders(token, hostToken),
+          fields: options?.path?.trim() ? { path: options.path.trim() } : undefined,
+          timeoutMs: timeouts.binary,
+        });
+        result = {
+          ok: response.status >= 200 && response.status < 300,
+          status: response.status,
+          text: response.body,
+        };
+      } else {
+        const form = new FormData();
+        form.append("file", file);
+        if (options?.path?.trim()) form.append("path", options.path.trim());
+        result = await requestMultipartRaw(baseUrl, uploadPath, {
+          token,
+          hostToken,
+          method: "POST",
+          body: form,
+          timeoutMs: timeouts.binary,
+        });
       }
-
-      const result = await requestMultipartRaw(baseUrl, `/workspace/${encodeURIComponent(id)}/inbox`, {
-        token,
-        hostToken,
-        method: "POST",
-        body: form,
-        timeoutMs: timeouts.binary,
-      });
 
       if (!result.ok) {
         let message = result.text.trim();
@@ -2239,6 +2309,28 @@ export function createOpenworkServerClient(options: { baseUrl: string; token?: s
         `/workspace/${encodeURIComponent(workspaceId)}/files/stat?path=${encodeURIComponent(path)}`,
         { token, hostToken },
       ),
+
+    listWorkspaceFiles: async (workspaceId: string) => {
+      const created = await requestJson<{ session: { id: string } }>(
+        baseUrl,
+        `/workspace/${encodeURIComponent(workspaceId)}/files/sessions`,
+        { token, hostToken, method: "POST", body: { write: false } },
+      );
+      const sessionId = created.session.id;
+      try {
+        return await requestJson<OpenworkWorkspaceCatalog>(
+          baseUrl,
+          `/files/sessions/${encodeURIComponent(sessionId)}/catalog/snapshot?includeDirs=true&limit=10000&excludeHeavyDirectories=true`,
+          { token, hostToken },
+        );
+      } finally {
+        await requestJson<{ ok: boolean }>(baseUrl, `/files/sessions/${encodeURIComponent(sessionId)}`, {
+          token,
+          hostToken,
+          method: "DELETE",
+        }).catch(() => undefined);
+      }
+    },
 
     writeWorkspaceFile: (
       workspaceId: string,

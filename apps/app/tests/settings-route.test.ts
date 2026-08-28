@@ -6,6 +6,8 @@ import {
   parseSettingsPath,
   readStoredBoolean,
   SETTINGS_UPDATE_AUTO_DOWNLOAD_KEY,
+  settingsDeveloperModePaletteItem,
+  settingsReturnRoute,
   settingsPathForRoute,
 } from "../src/react-app/shell/settings-route";
 import {
@@ -117,5 +119,43 @@ describe("settings navigation", () => {
       true,
       { getItem: () => "0" },
     )).toBe(false);
+  });
+
+  test("returns to the originating session in the same workspace", () => {
+    expect(settingsReturnRoute("workspace_1", "workspace_1", "session_1")).toBe(
+      "/workspace/workspace_1/session/session_1",
+    );
+  });
+
+  test("does not carry a session into a different selected workspace", () => {
+    expect(settingsReturnRoute("workspace_2", "workspace_1", "session_1")).toBe(
+      "/workspace/workspace_2/session",
+    );
+  });
+
+  test("returns direct settings visits to the selected workspace root", () => {
+    expect(settingsReturnRoute("workspace_1", null, null)).toBe("/workspace/workspace_1/session");
+    expect(settingsReturnRoute("", null, null)).toBe("/session");
+  });
+
+  test("labels the developer mode palette toggle from its current state", () => {
+    let toggleCount = 0;
+    const enable = settingsDeveloperModePaletteItem(false, () => {
+      toggleCount += 1;
+    });
+    const disable = settingsDeveloperModePaletteItem(true, () => {
+      toggleCount += 1;
+    });
+
+    expect({ title: enable.title, meta: enable.meta }).toEqual({
+      title: "Enable Developer Mode",
+      meta: "Off",
+    });
+    expect({ title: disable.title, meta: disable.meta }).toEqual({
+      title: "Disable Developer Mode",
+      meta: "On",
+    });
+    enable.action();
+    expect(toggleCount).toBe(1);
   });
 });

@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 
 import {
+  normalizeReleaseRepository,
   preventPendingUpdaterInstall,
   registerUpdaterIpc,
   staleUpdaterStatePaths,
@@ -34,9 +35,26 @@ const desktopVersion = JSON.parse(
 
 let isolatedUpdaterImportId = 0;
 
+describe("normalizeReleaseRepository", () => {
+  it("keeps the upstream repository as the default", () => {
+    assert.equal(normalizeReleaseRepository(undefined), "different-ai/openwork");
+  });
+
+  it("accepts a packaged distribution repository", () => {
+    assert.equal(normalizeReleaseRepository("swupde/openwork"), "swupde/openwork");
+  });
+
+  it("rejects values that are not exact GitHub owner/repository identities", () => {
+    assert.throws(() => normalizeReleaseRepository("https://github.com/swupde/openwork"), /owner\/repository/);
+    assert.throws(() => normalizeReleaseRepository("swupde/openwork/releases"), /owner\/repository/);
+  });
+});
+
 function fakeUpdaterHarness({ version }) {
   const listeners = new Map();
   const calls = [];
+  const feeds = [];
+  const downloadFeeds = [];
   const updater = {
     autoDownload: true,
     autoInstallOnAppQuit: false,
@@ -44,16 +62,17 @@ function fakeUpdaterHarness({ version }) {
     allowPrerelease: false,
     allowDowngrade: false,
     on: (name, fn) => listeners.set(name, fn),
-    setFeedURL: () => {},
+    setFeedURL: (feed) => feeds.push(feed),
     checkForUpdates: async () => ({ updateInfo: { version } }),
     downloadUpdate: async () => {
       calls.push("download");
+      downloadFeeds.push(feeds.at(-1));
     },
     quitAndInstall: () => {
       calls.push("quitAndInstall");
     },
   };
-  return { updater, listeners, calls };
+  return { updater, listeners, calls, feeds, downloadFeeds };
 }
 
 async function registerFakeUpdaterIpc({ version }) {
@@ -98,6 +117,13 @@ describe("targetedStableUpdaterFeed", () => {
     assert.equal(
       targetedStableUpdaterFeed("0.17.22", "0.17.23"),
       "https://github.com/different-ai/openwork/releases/download/v0.17.23",
+    );
+  });
+
+  it("targets the packaged distribution repository", () => {
+    assert.equal(
+      targetedStableUpdaterFeed("0.18.39", "0.18.40", false, "swupde/openwork"),
+      "https://github.com/swupde/openwork/releases/download/v0.18.40",
     );
   });
 
@@ -243,6 +269,27 @@ describe("recovery metadata and candidates", () => {
         }), null);
       }
     }
+  });
+
+  it("binds managed recovery artifacts to the packaged distribution repository", () => {
+    assert.deepEqual(selectRecoveryArtifact(
+      [{ url: "openwork-cloud-mac-arm64-0.18.40.dmg", sha512: "verified" }],
+      {
+        version: "0.18.40",
+        platform: "darwin",
+        arch: "arm64",
+        distribution: "cloud",
+        releaseRepository: "swupde/openwork",
+      },
+    ), {
+      version: "0.18.40",
+      platform: "darwin",
+      arch: "arm64",
+      distribution: "cloud",
+      url: "https://github.com/swupde/openwork/releases/download/v0.18.40/openwork-cloud-mac-arm64-0.18.40.dmg",
+      sha512: "verified",
+      repository: "swupde/openwork",
+    });
   });
 
   it("parses representative builder manifests and selects published installer extensions", () => {
@@ -614,6 +661,121 @@ describe("release channel changes", () => {
       });
     } finally {
       await rm(userData, { recursive: true, force: true });
+    }
+  });
+
+  it("pins managed builds to their packaged release repository", async () => {
+    const handlers = new Map();
+    const userData = await mkdtemp(path.join(os.tmpdir(), "openwork-managed-updater-"));
+    try {
+      registerUpdaterIpc({
+        app: {
+          isPackaged: false,
+          getVersion: () => desktopVersion,
+          getPath: () => userData,
+        },
+        ipcMain: { handle: (name, handler) => handlers.set(name, handler) },
+        getMainWindow: () => null,
+        manifestChannel: "cloud",
+        releaseRepository: "swupde/openwork",
+      });
+
+      const getChannel = handlers.get("openwork:updater:getChannel");
+      assert.deepEqual(await getChannel(), {
+        channel: "stable",
+        feedUrl: "https://github.com/swupde/openwork/releases/latest/download",
+        currentVersion: desktopVersion,
+      });
+    } finally {
+      await rm(userData, { recursive: true, force: true });
+    }
+  });
+
+  it("does not let a check overwrite the selected channel", {
+    skip: process.platform !== "darwin",
+  }, async () => {
+    const { tempDir, handlers } = await registerFakeUpdaterIpc({
+      version: "0.18.0",
+    });
+    try {
+      const check = handlers.get("openwork:updater:check");
+      const setChannel = handlers.get("openwork:updater:setChannel");
+      const getChannel = handlers.get("openwork:updater:getChannel");
+
+      assert.equal((await setChannel(null, "alpha")).channel, "alpha");
+      assert.equal((await check(null, "stable")).channel, "stable");
+      assert.equal((await getChannel()).channel, "alpha");
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("downloads from the channel used by the successful check", {
+    skip: process.platform !== "darwin",
+  }, async () => {
+    const { tempDir, handlers, downloadFeeds } = await registerFakeUpdaterIpc({
+      version: "0.18.0-alpha.1",
+    });
+    try {
+      const check = handlers.get("openwork:updater:check");
+      const download = handlers.get("openwork:updater:download");
+
+      assert.equal((await check(null, "alpha")).channel, "alpha");
+      assert.deepEqual(await download(), { ok: true });
+      assert.equal(
+        downloadFeeds.at(-1)?.url,
+        "https://github.com/different-ai/openwork/releases/download/alpha-macos-latest",
+      );
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps Alpha selected when a Stable check is already in flight", {
+    skip: process.platform !== "darwin",
+  }, async () => {
+    const { tempDir, handlers, updater, feeds } = await registerFakeUpdaterIpc({
+      version: "0.18.0",
+    });
+    /** @type {{ finish: null | (() => void) }} */
+    const stableCheckControl = { finish: null };
+    const stableCheckStarted = new Promise((resolve) => {
+      updater.checkForUpdates = () => new Promise((finish) => {
+        stableCheckControl.finish = () => finish({ updateInfo: { version: "0.18.0" } });
+        resolve();
+        updater.checkForUpdates = async () => ({ updateInfo: { version: "0.18.0-alpha.1" } });
+      });
+    });
+    try {
+      const check = handlers.get("openwork:updater:check");
+      const setChannel = handlers.get("openwork:updater:setChannel");
+      const getChannel = handlers.get("openwork:updater:getChannel");
+
+      const stableCheck = check(null, "stable");
+      await stableCheckStarted;
+      const alphaSelection = setChannel(null, "alpha");
+      const alphaCheck = check(null, "alpha");
+      const finishStableCheck = stableCheckControl.finish;
+      if (!finishStableCheck) throw new Error("Stable update check did not start.");
+      finishStableCheck();
+
+      assert.equal((await stableCheck).channel, "stable");
+      assert.equal((await alphaSelection).channel, "alpha");
+      assert.equal((await alphaCheck).channel, "alpha");
+      assert.equal((await getChannel()).channel, "alpha");
+      assert.equal(
+        JSON.parse(await readFile(
+          path.join(tempDir, "userData", "electron-updater-channel.v1.json"),
+          "utf8",
+        )).channel,
+        "alpha",
+      );
+      assert.equal(
+        feeds.at(-1)?.url,
+        "https://github.com/different-ai/openwork/releases/download/alpha-macos-latest",
+      );
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
     }
   });
 });

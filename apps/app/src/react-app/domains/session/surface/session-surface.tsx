@@ -1,20 +1,22 @@
 /** @jsxImportSource react */
-import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useEffectEvent, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { UIMessage } from "ai";
 import { useQuery } from "@tanstack/react-query";
 import type { SessionStatus } from "@opencode-ai/sdk/v2/client";
 import type { WorkContext } from "@openwork/types/work-context";
-import { Check, Minimize2 } from "lucide-react";
+import { Check, CirclePause, Minimize2 } from "lucide-react";
 import { toast } from "@/components/ui/sonner";
 
 import { captureAnalyticsEvent } from "@/app/lib/analytics";
 import { createClient, unwrap } from "@/app/lib/opencode";
 import { abortSessionSafe } from "@/app/lib/opencode-session";
+import { setThemeMode } from "@/app/theme";
 import { t } from "@/i18n";
 import type { ComposerSettingsSection } from "@/react-app/domains/settings/library";
 import { type CloudImportedPlugin } from "@/app/cloud/import-state";
 import { createDenClient, readDenSettings } from "@/app/lib/den";
 import { denSettingsChangedEvent } from "@/app/lib/den-session-events";
+import { useSessionDraftState } from "@/react-app/domains/session/sync/draft-store";
 import type {
   OpenworkServerClient,
   OpenworkSessionSnapshot,
@@ -47,17 +49,33 @@ import { WorkContextBar } from "@/react-app/domains/session/work-context/work-co
 import { isModelEligible } from "@/react-app/domains/session/work-context/model-policy";
 import { useSessionModelSelection } from "./session-model-store";
 import type { ProviderCatalog } from "./use-model-behavior";
+import type { ModelAvailability } from "./model-availability";
 import { decodeComposerMentionValue, encodeComposerMentionValue, type ComposerMentionKind } from "./composer/mention-encoding";
 import { desktopBridge, openDesktopUrl } from "@/app/lib/desktop";
 import { parseSlashCommandInvocation } from "./composer/slash-command";
 import { connectSkillPrompt, parseConnectSkillToken } from "./composer/connect-skill-token";
 import { createPastedTextChip, resolvePastedTextPlaceholders } from "./composer/pasted-text";
+import {
+  canAdmitNextQueuedItem,
+  claimQueuedSend,
+  dispatchQueuedDrain,
+  getQueuedDrainState,
+  nextObservationProbeAt,
+  subscribeQueuedDrain,
+} from "./queued-drain-machine";
 import { DevProfiler } from "@/react-app/shell/dev-profiler";
 import { PaperGrainGradient } from "@openwork/ui/react";
 import { useShellConfig } from "@/react-app/shell/shell-config";
 import { useReactRenderWatchdog } from "@/react-app/shell/react-render-watchdog";
 import { SessionDebugPanel } from "./debug-panel";
 import { deriveRenderedSessionMessages, resolveRenderedSessionSnapshot } from "./session-render-state";
+import {
+  ADMISSION_OUTCOME_GRACE_MS,
+  createSingleFlight,
+  messageHasVisibleAssistantOutput,
+  resolveAdmissionOutcome,
+} from "./session-admission-outcome";
+import { interruptedTaskRecoveryPrompt } from "@/react-app/domains/session/sync/session-error";
 import { useLocal } from "@/react-app/kernel/local-provider";
 import { resolveAttachmentFileMetadata } from "@/react-app/domains/session/sync/attachment-file-part";
 import { deriveSessionRenderModel } from "@/react-app/domains/session/sync/transition-controller";
@@ -69,7 +87,7 @@ import { getSessionActivityStatusLabel, useSessionActivityStore, type SessionAct
 import { PermissionApprovalPanel } from "@/react-app/domains/session/chat/permission-approval-modal";
 import { QuestionPanel } from "@/react-app/domains/session/modals/question-modal";
 import { QueuedMessagesPanel } from "@/react-app/domains/session/modals/queued-messages-panel";
-import { deriveOpenTargets, selectAutoOpenTarget, type OpenTarget } from "@/react-app/domains/session/artifacts/open-target";
+import { deriveOpenTargets, sameOpenTargets, selectAutoOpenTarget, type OpenTarget } from "@/react-app/domains/session/artifacts/open-target";
 import { usePanelTabStore } from "@/react-app/domains/session/panel/panel-tab-store";
 import {
   markSessionSnapshotFetchStart,
@@ -80,6 +98,8 @@ import {
 } from "@/react-app/domains/session/sync/session-sync";
 import { resolveForkBoundaryId } from "@/react-app/domains/session/sync/transcript-reconcile";
 import {
+  claimComposerSessionDraftScope,
+  composerDraftNeedsHydration,
   getComposerAttachments,
   getComposerDraft,
   getComposerHistory,
@@ -87,6 +107,8 @@ import {
   getComposerPasteParts,
   getComposerQueuedDrafts,
   getComposerRevertMessageId,
+  getComposerSessionDraftScope,
+  persistableComposerDraftText,
   useComposerStateStore,
 } from "./composer-state-store";
 import { MessageList } from "@/components/chat/message-list";
@@ -97,6 +119,7 @@ import type {
   ChatToolReconnectResult,
 } from "@/components/tools/error-attribution";
 import { useChatMcpReconnectStore } from "@/components/tools/mcp-reconnect-state";
+import { MERMAID_LIMITS } from "@/components/markdown/mermaid";
 import {
   isChatMcpReconnectScopeCurrent,
   waitForFreshMcpAuthorization,
@@ -117,6 +140,8 @@ import {
 } from "@/react-app/domains/connections/cloud-inventory-cache";
 import { connectPluginsForComposer, EMPTY_CONNECT_CAPABILITY_INVENTORY } from "@/react-app/domains/session/surface/connect-capability-inventory";
 import { consumeComposerAutoSend } from "./composer-auto-send";
+import { useOrgMcpConnections } from "@/react-app/domains/connections/use-org-mcp-connections";
+import { buildConnectorToolIdentities } from "@/react-app/domains/connections/connector-tool-identity";
 
 const EMPTY_TRANSCRIPT: UIMessage[] = [];
 const IDLE_STATUS: SessionStatus = { type: "idle" };
@@ -129,6 +154,11 @@ This shared renderer keeps **bold proof text**, inline \`renderMarkdownHtml\`, a
 \`\`\`ts
 const pipeline = "shared markdown primitive";
 console.log(pipeline);
+\`\`\`
+
+\`\`\`mermaid
+flowchart LR
+  InlineStart[Inline Mermaid Start] --> InlineFinish[Inline Mermaid Finish]
 \`\`\`
 
 Search token: markdown-primitive-highlight.`;
@@ -166,6 +196,25 @@ type SessionError = {
 function createMarkdownPrimitiveEvalMessages(sessionId: string) {
   const userMessageId = `${sessionId}:eval-markdown-user`;
   const assistantMessageId = `${sessionId}:eval-markdown-assistant`;
+  const guardedDiagram = [
+    "flowchart TD",
+    ...Array.from({ length: MERMAID_LIMITS.maxNodes + 1 }, (_, index) => `Guard${index}[Guard node ${index}]`),
+  ].join("\n");
+  const proofText = `${MARKDOWN_PRIMITIVE_EVAL_TEXT}
+
+\`\`\`mermaid
+flowchart LR
+  Remote[No remote resources] --> Safe[Sanitized SVG]
+  click Remote "https://example.com/redirect"
+\`\`\`
+
+\`\`\`mermaid
+not-a-mermaid-diagram
+\`\`\`
+
+\`\`\`mermaid
+${guardedDiagram}
+\`\`\``;
   const messages: UIMessage[] = [
     {
       id: userMessageId,
@@ -176,7 +225,7 @@ function createMarkdownPrimitiveEvalMessages(sessionId: string) {
     {
       id: assistantMessageId,
       role: "assistant",
-      parts: [{ type: "text", text: MARKDOWN_PRIMITIVE_EVAL_TEXT }],
+      parts: [{ type: "text", text: proofText }],
       metadata: { opencode: { created: Date.now() + 1 } },
     },
   ];
@@ -298,12 +347,110 @@ function createChatTranscriptEvalMessages(sessionId: string) {
   return { messages };
 }
 
+function createConnectorToolCallEvalMessages(sessionId: string): UIMessage[] {
+  const now = Date.now();
+  return [
+    {
+      id: `${sessionId}:eval-connector-user`,
+      role: "user",
+      parts: [{ type: "text", text: "Check my next Google Workspace calendar event." }],
+      metadata: { opencode: { created: now } },
+    },
+    {
+      id: `${sessionId}:eval-connector-assistant`,
+      role: "assistant",
+      parts: [{
+        type: "dynamic-tool",
+        toolName: "openwork-cloud_execute_capability",
+        toolCallId: "eval-connector-google-workspace",
+        state: "output-available",
+        input: { name: "getCapabilitiesGoogleWorkspaceCalendarEvents", body: {} },
+        output: JSON.stringify({ events: 1 }),
+      }],
+      metadata: { opencode: { created: now + 1, completed: now + 2_000 } },
+    },
+  ];
+}
+
+function createSessionLifecycleEvalMessages(sessionId: string): UIMessage[] {
+  const now = Date.now();
+  return [
+    {
+      id: `${sessionId}:eval-lifecycle-user`,
+      role: "user",
+      parts: [{ type: "text", text: "Inspect the repository state." }],
+      metadata: { opencode: { created: now } },
+    },
+    {
+      id: `${sessionId}:eval-lifecycle-assistant`,
+      role: "assistant",
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolName: "bash",
+          toolCallId: "eval-lifecycle-bash",
+          state: "input-streaming",
+          input: { command: "git status --short --branch", description: "Check repository state" },
+        },
+        {
+          type: "dynamic-tool",
+          toolName: "read",
+          toolCallId: "eval-lifecycle-read",
+          state: "input-streaming",
+          input: { filePath: "/tmp/openwork-eval/brief.md" },
+        },
+      ],
+      metadata: { opencode: { created: now + 1 } },
+    },
+  ];
+}
+
+function createSubagentActivityEvalMessages(sessionId: string): UIMessage[] {
+  const now = Date.now();
+  return [
+    {
+      id: `${sessionId}:eval-subagent-user`,
+      role: "user",
+      parts: [{ type: "text", text: "Build an isolated Azure reproduction." }],
+      metadata: { opencode: { created: now } },
+    },
+    {
+      id: `${sessionId}:eval-subagent-assistant`,
+      role: "assistant",
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolName: "task",
+          toolCallId: "eval-subagent-activity",
+          state: "input-streaming",
+          input: {
+            description: "Build isolated Azure repro",
+            prompt: "Reproduce the Azure failure in isolation.",
+            subagent_type: "executor-deep",
+          },
+        },
+      ],
+      metadata: { opencode: { created: now + 1 } },
+    },
+  ];
+}
+
+function createChatLoadingEvalMessages(sessionId: string): UIMessage[] {
+  return [{
+    id: `${sessionId}:eval-chat-loading-user`,
+    role: "user",
+    parts: [{ type: "text", text: "Confirm the loading treatment." }],
+    metadata: { opencode: { created: Date.now() } },
+  }];
+}
+
 export type SessionSurfaceProps = {
   client: OpenworkServerClient;
   environmentClient?: OpenworkServerClient | null;
   workspaceId: string;
   workspaceRoot: string;
   sessionId: string;
+  draftScope: string | null;
   isControlTarget: boolean;
   opencodeBaseUrl: string;
   openworkToken: string;
@@ -313,6 +460,13 @@ export type SessionSurfaceProps = {
   modelPickerOpen: boolean;
   modelUnavailable?: boolean;
   modelUnavailableMessage?: string | null;
+  /**
+   * Resolves availability for one provider/model identity against the active
+   * workspace's settled catalogs. Each surface validates its OWN effective
+   * session model with it instead of inheriting the route-global default
+   * verdict; `props.modelUnavailable` is only the fallback when absent.
+   */
+  resolveModelAvailability?: (model: ModelRef | null) => ModelAvailability;
   organizationModelsEmpty?: boolean;
   selectedModel: ModelRef;
   modelOptions: ModelOption[];
@@ -363,6 +517,8 @@ export type SessionSurfaceProps = {
   onRevertToMessage?: (messageId: string, sessionId: string) => Promise<boolean>;
   onRestoreRevertedSession?: (sessionId: string) => Promise<boolean>;
   onForkAtMessage?: (messageId: string | null, sessionId: string) => void;
+  /** Open a sub-agent (child) session in the main chat surface. */
+  onOpenSubagentSession?: (sessionId: string) => void;
   onOpenTarget?: (target: OpenTarget, options?: OpenTargetOptions, sessionId?: string) => void;
   environmentRuntimeKey?: string | null;
   onApplyEnvironmentChanges?: () => Promise<ApplyEnvironmentChangesResult>;
@@ -452,14 +608,6 @@ function useSharedQueryState<T>(queryKey: readonly unknown[], fallback: T) {
   return query.data ?? fallback;
 }
 
-function messageHasVisibleAssistantOutput(message: UIMessage) {
-  if (message.role !== "assistant") return false;
-  return message.parts.some((part) => {
-    if ("text" in part && typeof part.text === "string") return part.text.trim().length > 0;
-    return part.type === "dynamic-tool" || part.type === "file";
-  });
-}
-
 function AssistantWaitingCard({ label = t("session.assistant_thinking") }: { label?: string }) {
   return (
     <div className="flex justify-start" role="status" aria-live="polite">
@@ -477,6 +625,34 @@ function AssistantWaitingCard({ label = t("session.assistant_thinking") }: { lab
           />
         </div>
         <span>{label}</span>
+      </div>
+    </div>
+  );
+}
+
+// Terminal recovery surface for an accepted admission that reached idle with
+// no assistant result. Styled after the interrupted-run status line: a quiet
+// pause, not a failure, with Resume as the single emphasized action.
+function AdmissionOutcomeUnknownCard(props: { resuming: boolean; onResume: () => void }) {
+  return (
+    <div
+      data-testid="admission-outcome-unknown"
+      role="status"
+      className="not-prose mx-auto flex w-full max-w-3xl flex-col items-start gap-2 px-2 md:px-10"
+    >
+      <div className="flex min-w-0 items-center gap-2 py-1 text-sm text-dls-secondary">
+        <CirclePause aria-hidden="true" className="size-4 shrink-0" />
+        <span className="min-w-0">{t("session.admission_outcome_unknown")}</span>
+        <span aria-hidden="true" className="text-dls-secondary/60">·</span>
+        <button
+          type="button"
+          data-testid="admission-outcome-resume"
+          disabled={props.resuming}
+          onClick={props.onResume}
+          className="shrink-0 cursor-pointer font-medium text-dls-text underline-offset-2 transition-colors hover:underline disabled:cursor-default disabled:opacity-60"
+        >
+          {t("session.resume_interrupted")}
+        </button>
       </div>
     </div>
   );
@@ -698,6 +874,45 @@ export function SessionSurface(props: SessionSurfaceProps) {
   const setComposerMentions = useComposerStateStore((state) => state.setMentions);
   const setComposerPasteParts = useComposerStateStore((state) => state.setPasteParts);
   const clearComposerSession = useComposerStateStore((state) => state.clearSession);
+  const {
+    scopeKey: persistedDraftKey,
+    snapshot: persistedDraftSnapshot,
+    save: persistDraft,
+  } = useSessionDraftState(props.draftScope, props.workspaceId, props.sessionId);
+  const appliedPersistedDraftRef = useRef<{
+    scopeKey: string;
+    snapshot: typeof persistedDraftSnapshot;
+  } | null>(null);
+
+  // Layout timing is intentional: an account/org boundary must replace the
+  // previous scope's in-memory Zustand draft before the browser can paint it.
+  useLayoutEffect(() => {
+    const applied = appliedPersistedDraftRef.current;
+    if (applied?.scopeKey === persistedDraftKey && applied.snapshot === persistedDraftSnapshot) return;
+
+    const claimedScopeKey = getComposerSessionDraftScope(props.sessionId);
+    claimComposerSessionDraftScope(props.sessionId, persistedDraftKey);
+    appliedPersistedDraftRef.current = {
+      scopeKey: persistedDraftKey,
+      snapshot: persistedDraftSnapshot,
+    };
+
+    const currentState = useComposerStateStore.getState();
+    const currentDraft = getComposerDraft(currentState, props.sessionId);
+    const nextDraft = persistedDraftSnapshot?.text ?? "";
+    if (!composerDraftNeedsHydration({
+      claimedScopeKey,
+      nextScopeKey: persistedDraftKey,
+      currentText: currentDraft,
+      storedText: nextDraft,
+    })) return;
+
+    for (const attachment of getComposerAttachments(currentState, props.sessionId)) {
+      revokeAttachmentPreview(attachment);
+    }
+    clearComposerSession(props.sessionId);
+    if (nextDraft) replaceComposerDraft(props.sessionId, nextDraft);
+  }, [clearComposerSession, persistedDraftKey, persistedDraftSnapshot, props.sessionId, replaceComposerDraft]);
   const inputHistory = useComposerStateStore((state) => getComposerHistory(state, props.sessionId));
   const appendComposerHistory = useComposerStateStore((state) => state.appendHistory);
   // Queued follow-up drafts live in the shared composer store keyed by session
@@ -753,16 +968,34 @@ export function SessionSurface(props: SessionSurfaceProps) {
   const workContextModelMessage = props.workContext.dataContext === "client"
     ? "Client data requires the approved EU-hosted Nemotron model."
     : "Choose one of the retained OpenAI or Claude models for Internal work.";
+  // Availability is scoped to THIS conversation's effective model. A missing
+  // global default must not disable a conversation that remembers a valid
+  // model, and a pending catalog (loading or superseded by a workspace
+  // switch) never renders "Model no longer available".
+  const sessionModelUnavailable = props.resolveModelAvailability
+    ? props.resolveModelAvailability(sessionModel.selectedModel).status === "unavailable"
+    : Boolean(props.modelUnavailable);
   const [error, setError] = useState<SessionError | null>(null);
   const [restoringRevertedMessages, setRestoringRevertedMessages] = useState(false);
   const [showDelayedLoading, setShowDelayedLoading] = useState(false);
   const [awaitingAssistantBaseline, setAwaitingAssistantBaseline] = useState<number | null>(null);
+  // Terminal invariant: an accepted admission that reached idle with no
+  // assistant result surfaces a bounded recovery card instead of plain idle.
+  const [admissionOutcomeUnresolved, setAdmissionOutcomeUnresolved] = useState(false);
   const [rendered, setRendered] = useState<{ sessionId: string; snapshot: OpenworkSessionSnapshot } | null>(null);
   const [toolSkills, setToolSkills] = useState<SkillCard[]>([]);
   const [toolMcpServers, setToolMcpServers] = useState<McpServerEntry[]>([]);
   const [toolMcpStatus, setToolMcpStatus] = useState<string | null>(null);
   const [toolMcpStatuses, setToolMcpStatuses] = useState<McpStatusMap>({});
   const [toolImportedPlugins, setToolImportedPlugins] = useState<CloudImportedPlugin[]>([]);
+  const orgMcpConnections = useOrgMcpConnections();
+  const connectorIdentities = useMemo(
+    () => buildConnectorToolIdentities({
+      mcpServers: toolMcpServers,
+      orgConnections: orgMcpConnections.connections,
+    }),
+    [orgMcpConnections.connections, toolMcpServers],
+  );
   const skillsConnectPushRef = useRef(0);
   const mcpConnectPushRef = useRef(0);
   const pluginConnectPushRef = useRef(0);
@@ -773,7 +1006,16 @@ export function SessionSurface(props: SessionSurfaceProps) {
   const cloudQueueBlockedRef = useRef(false);
   // Shared with promote-to-send so a manual send-now cannot race the idle drain.
   const drainingQueueRef = useRef(false);
-  const awaitingQueueBusyRef = useRef(false);
+  // Admission-aware drain state. It lives in a module-level per-session store
+  // (not a ref) so an in-flight admission survives navigating away and back.
+  const subscribeDrainState = useCallback(
+    (listener: () => void) => subscribeQueuedDrain(props.sessionId, listener),
+    [props.sessionId],
+  );
+  const readDrainState = useCallback(() => getQueuedDrainState(props.sessionId), [props.sessionId]);
+  const queuedDrainState = useSyncExternalStore(subscribeDrainState, readDrainState);
+  const lastObservationProbeAtRef = useRef<number | null>(null);
+  const [observationProbeVersion, setObservationProbeVersion] = useState(0);
   const composerShellRef = useRef<HTMLDivElement>(null);
   const hydratedKeyRef = useRef<string | null>(null);
   const autoOpenedTargetRef = useRef<string | null>(null);
@@ -808,7 +1050,18 @@ export function SessionSurface(props: SessionSurfaceProps) {
 
   const currentSnapshot = snapshotQuery.data?.session.id === props.sessionId ? snapshotQuery.data : null;
   const transcriptState = useSharedQueryState<UIMessage[]>(transcriptQueryKey, EMPTY_TRANSCRIPT);
-  const statusState = useSharedQueryState(statusQueryKey, currentSnapshot?.status ?? IDLE_STATUS);
+  const statusQuery = useQuery<SessionStatus, Error, SessionStatus, readonly unknown[]>({
+    queryKey: statusQueryKey,
+    queryFn: async () => currentSnapshot?.status ?? IDLE_STATUS,
+    enabled: false,
+  });
+  const statusState = statusQuery.data ?? currentSnapshot?.status ?? IDLE_STATUS;
+  // The shared status entry is written only by the session-status stream and
+  // its reconnect-time level reconciliation, so its presence marks the value
+  // as a real observed level instead of a render fallback. Queue-drain
+  // completion must never trust a fallback idle (a remount briefly renders
+  // idle before any status has been observed).
+  const statusIsObservedLevel = statusQuery.data !== undefined;
 
   useEffect(() => {
     if (!currentSnapshot) return;
@@ -822,6 +1075,7 @@ export function SessionSurface(props: SessionSurfaceProps) {
     setRestoringRevertedMessages(false);
     setShowDelayedLoading(false);
     setAwaitingAssistantBaseline(null);
+    setAdmissionOutcomeUnresolved(false);
     // Composer draft state lives in the shared store keyed by session id, so
     // switching sessions preserves each session's own in-progress composer.
     autoOpenedTargetRef.current = null;
@@ -912,7 +1166,9 @@ export function SessionSurface(props: SessionSurfaceProps) {
   useEffect(() => {
     if (!chatStreaming) setSteering(false);
   }, [chatStreaming]);
+  const [evalThreadStatus, setEvalThreadStatus] = useState<ThreadStatus | null>(null);
   const status = useMemo((): ThreadStatus => {
+    if (evalThreadStatus) return evalThreadStatus;
     if (sending) {
       return "submitted";
     }
@@ -926,10 +1182,11 @@ export function SessionSurface(props: SessionSurfaceProps) {
     }
 
     return "ready";
-  }, [liveStatus, sending]);
+  }, [evalThreadStatus, liveStatus, sending]);
   const [evalMarkdownMessages, setEvalMarkdownMessages] = useState<UIMessage[]>(EMPTY_TRANSCRIPT);
   useEffect(() => {
     setEvalMarkdownMessages(EMPTY_TRANSCRIPT);
+    setEvalThreadStatus(null);
   }, [props.sessionId]);
 
   const baseRenderedMessages = useMemo(
@@ -941,6 +1198,10 @@ export function SessionSurface(props: SessionSurfaceProps) {
 
     return [...baseRenderedMessages, ...evalMarkdownMessages];
   }, [baseRenderedMessages, evalMarkdownMessages]);
+  const renderedMessagesRef = useRef(renderedMessages);
+  useEffect(() => {
+    renderedMessagesRef.current = renderedMessages;
+  }, [renderedMessages]);
   const seedMarkdownPrimitiveControlAction = useMemo<OpenworkControlAction | null>(() => {
     if (!import.meta.env.DEV) return null;
 
@@ -962,6 +1223,24 @@ export function SessionSurface(props: SessionSurfaceProps) {
     };
   }, [props.sessionId]);
   useControlAction(props.isControlTarget ? seedMarkdownPrimitiveControlAction : null);
+  const setMermaidEvalThemeControlAction = useMemo<OpenworkControlAction | null>(() => {
+    if (!import.meta.env.DEV) return null;
+
+    return {
+      id: "eval.mermaid.set_theme",
+      label: "Set the Mermaid eval theme",
+      description: "Dev-only eval hook that changes the app theme through the production theme API.",
+      sideEffect: "mutation",
+      disabled: !props.sessionId,
+      execute: (args) => {
+        const mode = args && typeof args === "object" && "mode" in args ? args.mode : null;
+        if (mode !== "light" && mode !== "dark") throw new Error("Mermaid eval theme must be light or dark.");
+        setThemeMode(mode);
+        return { ok: true, mode };
+      },
+    };
+  }, [props.sessionId]);
+  useControlAction(props.isControlTarget ? setMermaidEvalThemeControlAction : null);
   const seedMarkdownMathControlAction = useMemo<OpenworkControlAction | null>(() => {
     if (!import.meta.env.DEV) return null;
 
@@ -1003,12 +1282,145 @@ export function SessionSurface(props: SessionSurfaceProps) {
     };
   }, [props.sessionId]);
   useControlAction(props.isControlTarget ? seedChatTranscriptControlAction : null);
+  const seedConnectorToolCallControlAction = useMemo<OpenworkControlAction | null>(() => {
+    if (!import.meta.env.DEV) return null;
+
+    return {
+      id: "eval.connector_tool_call.seed",
+      label: "Seed a branded connector tool call",
+      description: "Dev-only eval hook that renders a deterministic connector-backed capability call.",
+      sideEffect: "mutation",
+      disabled: !props.sessionId,
+      execute: () => {
+        setEvalMarkdownMessages(createConnectorToolCallEvalMessages(props.sessionId));
+        return { ok: true, connector: "Google Workspace" };
+      },
+    };
+  }, [props.sessionId]);
+  useControlAction(props.isControlTarget ? seedConnectorToolCallControlAction : null);
+  const seedSessionLifecycleControlAction = useMemo<OpenworkControlAction | null>(() => {
+    if (!import.meta.env.DEV) return null;
+
+    return {
+      id: "eval.session_lifecycle.seed_unfinished_tools",
+      label: "Seed unfinished tool lifecycle proof",
+      description: "Dev-only eval hook that reconciles unfinished current-turn tools with the active task lifecycle.",
+      sideEffect: "mutation",
+      disabled: !props.sessionId,
+      execute: (args) => {
+        const lifecycle = typeof args === "object" && args !== null && "lifecycle" in args
+          ? args.lifecycle
+          : "idle";
+        if (lifecycle !== "active" && lifecycle !== "waiting" && lifecycle !== "idle") {
+          throw new Error(`Unsupported lifecycle: ${String(lifecycle)}`);
+        }
+
+        setEvalMarkdownMessages(createSessionLifecycleEvalMessages(props.sessionId));
+        const activity = useSessionActivityStore.getState();
+        activity.replaceWaitingRequests(props.workspaceId, props.sessionId, "permission", []);
+        activity.replaceWaitingRequests(props.workspaceId, props.sessionId, "question", []);
+        activity.clearError(props.workspaceId, props.sessionId);
+        activity.setCompacting(props.workspaceId, props.sessionId, false);
+        activity.setRunStatus(
+          props.workspaceId,
+          props.sessionId,
+          lifecycle === "active" ? { type: "busy" } : { type: "idle" },
+        );
+        if (lifecycle === "waiting") {
+          activity.setWaitingRequest(
+            props.workspaceId,
+            props.sessionId,
+            "question",
+            "eval-session-lifecycle-question",
+            true,
+          );
+        }
+        return { ok: true, lifecycle };
+      },
+    };
+  }, [props.sessionId, props.workspaceId]);
+  useControlAction(props.isControlTarget ? seedSessionLifecycleControlAction : null);
+  const refreshCurrentSessionControlAction = useMemo<OpenworkControlAction | null>(() => {
+    if (!import.meta.env.DEV) return null;
+
+    return {
+      id: "eval.composer_focus.refresh_current_session",
+      label: "Refresh current session while composing",
+      description: "Dev-only eval hook that exercises a same-session snapshot refresh without changing tasks.",
+      sideEffect: "none",
+      disabled: !props.sessionId,
+      execute: async () => {
+        const editor = composerShellRef.current?.querySelector<HTMLElement>(
+          '[contenteditable="true"][data-lexical-editor="true"]',
+        );
+        const wasFocused = editor === document.activeElement;
+        const result = await snapshotQuery.refetch();
+        await new Promise<void>((resolve) => {
+          window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve()));
+        });
+
+        return {
+          ok: result.status === "success",
+          wasFocused,
+          remainsFocused: editor === document.activeElement,
+          editable: editor?.getAttribute("contenteditable") === "true",
+        };
+      },
+    };
+  }, [props.sessionId, snapshotQuery.refetch]);
+  useControlAction(props.isControlTarget ? refreshCurrentSessionControlAction : null);
+  const seedSubagentActivityControlAction = useMemo<OpenworkControlAction | null>(() => {
+    if (!import.meta.env.DEV) return null;
+
+    return {
+      id: "eval.task_activity.seed",
+      label: "Seed running delegated-task activity proof",
+      description: "Dev-only eval hook that renders a deterministic running delegated-task row.",
+      sideEffect: "mutation",
+      disabled: !props.sessionId,
+      execute: () => {
+        setEvalMarkdownMessages(createSubagentActivityEvalMessages(props.sessionId));
+        useSessionActivityStore.getState().setRunStatus(
+          props.workspaceId,
+          props.sessionId,
+          { type: "busy" },
+        );
+        return { ok: true };
+      },
+    };
+  }, [props.sessionId, props.workspaceId]);
+  useControlAction(props.isControlTarget ? seedSubagentActivityControlAction : null);
+  const seedChatLoadingControlAction = useMemo<OpenworkControlAction | null>(() => {
+    if (!import.meta.env.DEV) return null;
+
+    return {
+      id: "eval.chat_loading.seed",
+      label: "Seed chat loading shimmer proof",
+      description: "Dev-only eval hook that renders the main chat loading treatment.",
+      sideEffect: "mutation",
+      disabled: !props.sessionId,
+      execute: () => {
+        setEvalMarkdownMessages(createChatLoadingEvalMessages(props.sessionId));
+        setEvalThreadStatus("streaming");
+        useSessionActivityStore.getState().setRunStatus(
+          props.workspaceId,
+          props.sessionId,
+          { type: "busy" },
+        );
+        return { ok: true };
+      },
+    };
+  }, [props.sessionId, props.workspaceId]);
+  useControlAction(props.isControlTarget ? seedChatLoadingControlAction : null);
   const openTargets = useMemo(() => deriveOpenTargets(renderedMessages), [renderedMessages]);
   const openTargetsFingerprint = useMemo(
     () => openTargets.map((target) => `${target.kind}:${target.value}:${target.confidence}`).join("|"),
     [openTargets],
   );
   const autoOpenTarget = selectAutoOpenTarget(verifiedOpenTargets);
+  const handleOpenTarget = useCallback((target: OpenTarget, options?: OpenTargetOptions) => {
+    props.onOpenTarget?.(target, options, props.sessionId);
+  }, [props.onOpenTarget, props.sessionId]);
   const pendingSessionLoad = !snapshot && snapshotQuery.isLoading && renderedMessages.length === 0;
   const assistantOutputAfterAwaitStart = useMemo(() => {
     if (awaitingAssistantBaseline === null) return false;
@@ -1046,6 +1458,9 @@ export function SessionSurface(props: SessionSurfaceProps) {
 
   useEffect(() => {
     let cancelled = false;
+    const updateVerifiedOpenTargets = (targets: OpenTarget[]) => {
+      setVerifiedOpenTargets((current) => sameOpenTargets(current, targets) ? current : targets);
+    };
     function initializeAutoOpenState(targets: OpenTarget[]) {
       if (initializedAutoOpenSessionRef.current === props.sessionId) return;
       initializedAutoOpenSessionRef.current = props.sessionId;
@@ -1055,7 +1470,7 @@ export function SessionSurface(props: SessionSurfaceProps) {
     async function verifyTargets() {
       if (!openTargets.length) {
         initializeAutoOpenState([]);
-        setVerifiedOpenTargets([]);
+        updateVerifiedOpenTargets([]);
         return;
       }
       try {
@@ -1063,13 +1478,13 @@ export function SessionSurface(props: SessionSurfaceProps) {
         if (!cancelled) {
           const nextTargets = response.items as OpenTarget[];
           initializeAutoOpenState(nextTargets);
-          setVerifiedOpenTargets(nextTargets);
+          updateVerifiedOpenTargets(nextTargets);
         }
       } catch {
         if (!cancelled) {
           const nextTargets = openTargets.map((target) => ({ ...target, exists: target.kind === "url" }));
           initializeAutoOpenState(nextTargets);
-          setVerifiedOpenTargets(nextTargets);
+          updateVerifiedOpenTargets(nextTargets);
         }
       }
     }
@@ -1090,17 +1505,34 @@ export function SessionSurface(props: SessionSurfaceProps) {
     return () => window.clearTimeout(id);
   }, [pendingSessionLoad]);
 
+  // Terminal invariant for accepted admissions: idle with no assistant result
+  // must never silently clear the task. The transcript-length check alone is
+  // not an outcome — the newly appended user message satisfies it even when no
+  // assistant message exists. Deriving the outcome from the transcript (last
+  // user message answered by visible assistant output) also makes the recovery
+  // state survive a reload: rehydrating the same transcript recomputes it.
+  const admissionOutcome = useMemo(() => resolveAdmissionOutcome({
+    messages: renderedMessages,
+    statusType: liveStatus.type,
+    sending,
+    hasActiveQuestion: Boolean(props.activeQuestion),
+    hasActivePermission: Boolean(props.activePermission),
+    hasSessionError: error !== null,
+  }), [error, liveStatus.type, props.activePermission, props.activeQuestion, renderedMessages, sending]);
+
   useEffect(() => {
-    if (awaitingAssistantBaseline === null) return;
-    if (assistantOutputAfterAwaitStart) {
+    if (admissionOutcome !== "unresolved") {
+      setAdmissionOutcomeUnresolved(false);
       return;
     }
-    if (sending || liveStatus.type !== "idle" || renderedMessages.length <= awaitingAssistantBaseline) return;
     const id = window.setTimeout(() => {
+      // Swap the wait state for the recovery card in one step so the
+      // admission never terminates as plain idle without a result.
       setAwaitingAssistantBaseline(null);
-    }, 1200);
+      setAdmissionOutcomeUnresolved(true);
+    }, ADMISSION_OUTCOME_GRACE_MS);
     return () => window.clearTimeout(id);
-  }, [assistantOutputAfterAwaitStart, awaitingAssistantBaseline, liveStatus.type, renderedMessages.length, sending]);
+  }, [admissionOutcome]);
 
   const model = deriveSessionRenderModel({
     intendedSessionId: props.sessionId,
@@ -1254,11 +1686,11 @@ export function SessionSurface(props: SessionSurfaceProps) {
   useEffect(() => {
     if (model.transitionState !== "idle") return;
     if (chatStreaming) return;
-    if (props.modelUnavailable) return;
+    if (sessionModelUnavailable) return;
     if (!draft.trim()) return;
     if (!consumeComposerAutoSend(props.sessionId)) return;
     void handleSend();
-  }, [chatStreaming, draft, handleSend, model.transitionState, props.modelUnavailable, props.sessionId]);
+  }, [chatStreaming, draft, handleSend, model.transitionState, sessionModelUnavailable, props.sessionId]);
 
   const handleSteer = useCallback(async () => {
     setSteering(true);
@@ -1271,8 +1703,9 @@ export function SessionSurface(props: SessionSurfaceProps) {
       return;
     }
     cloudQueueBlockedRef.current = false;
+    dispatchQueuedDrain(props.sessionId, { type: "user_retry" });
     setCloudQueueRetryVersion((version) => version + 1);
-  }, [attachments.length, draft, handleSend]);
+  }, [attachments.length, draft, handleSend, props.sessionId]);
 
   // Queue: hold the draft locally and clear the composer. The drain effect
   // sends it once the session reports idle.
@@ -1337,6 +1770,7 @@ export function SessionSurface(props: SessionSurfaceProps) {
     // lands and the session reports idle (#2014).
     queuedItems.forEach((item) => item.draft.attachments.forEach(revokeAttachmentPreview));
     clearQueuedDrafts(props.sessionId);
+    dispatchQueuedDrain(props.sessionId, { type: "queue_cleared" });
     // The prompt was sent through a directory-scoped client (session-route
     // passes the workspace root), so the abort must target the same scope —
     // without it the server resolves the default project, finds no live run,
@@ -1365,67 +1799,122 @@ export function SessionSurface(props: SessionSurfaceProps) {
   }, [props.sessionId, props.workspaceId]);
 
   // Drain one queued follow-up each time the session goes idle, so prompts
-  // run as separate turns instead of one merged message. The busy-wait is
-  // grounded in the engine's own run status (liveStatus), not chatStreaming:
-  // the client-side `sending` pulse would release the wait before the engine
+  // run as separate turns instead of one merged message. Progress is grounded
+  // in the engine's own run status (liveStatus), not chatStreaming: the
+  // client-side `sending` pulse would release the wait before the engine
   // actually went busy and the next idle render could steer the following
-  // item into the still-starting turn.
+  // item into the still-starting turn. Feed status levels into the
+  // admission-aware machine: a busy level attaches the current admission to a
+  // running run, and an idle level completes an admission that was already
+  // observed running. An admission that never shows busy is released only by
+  // the authoritative probe below — never by a stale idle render.
   useEffect(() => {
     if (liveStatus.type !== "idle") {
-      awaitingQueueBusyRef.current = false;
+      dispatchQueuedDrain(props.sessionId, { type: "busy_observed" });
+      return;
     }
-  }, [liveStatus.type]);
+    if (!statusIsObservedLevel) return;
+    if (getQueuedDrainState(props.sessionId).phase.kind === "running") {
+      dispatchQueuedDrain(props.sessionId, { type: "idle_reconciled", observedAt: Date.now() });
+    }
+  }, [liveStatus.type, props.sessionId, statusIsObservedLevel]);
+
+  // Admission observation probe: when an admitted send has produced no busy
+  // observation within its window (dropped event, upstream dispatch failure
+  // after admission, or an event-stream reconnect), reconcile against an
+  // authoritative snapshot fetch instead of waiting on the missing edge
+  // forever. The probe's start time orders the observed level against the
+  // admission time inside the machine, so a stale idle can never release it.
+  useEffect(() => {
+    const probeAt = nextObservationProbeAt(queuedDrainState, lastObservationProbeAtRef.current);
+    if (probeAt === null) return;
+    const timer = window.setTimeout(() => {
+      const startedAt = Date.now();
+      lastObservationProbeAtRef.current = startedAt;
+      void (async () => {
+        try {
+          const result = await snapshotQuery.refetch();
+          const probed = result.data?.session.id === props.sessionId ? result.data.status : null;
+          if (!probed) return;
+          if (probed.type === "idle") {
+            dispatchQueuedDrain(props.sessionId, { type: "idle_reconciled", observedAt: startedAt });
+          } else {
+            dispatchQueuedDrain(props.sessionId, { type: "busy_observed" });
+          }
+        } catch {
+          // Probe failed (for example the local server was briefly
+          // unreachable); the version bump below re-arms a spaced retry.
+        } finally {
+          setObservationProbeVersion((version) => version + 1);
+        }
+      })();
+    }, Math.max(0, probeAt - Date.now()));
+    return () => window.clearTimeout(timer);
+  }, [observationProbeVersion, props.sessionId, queuedDrainState, snapshotQuery.refetch]);
 
   useEffect(() => {
     if (drainingQueueRef.current || sendingQueued) return;
     if (cloudQueueBlockedRef.current) return;
-    if (awaitingQueueBusyRef.current) return;
     if (queuedItems.length === 0) return;
     if (chatStreaming || liveStatus.type !== "idle") return;
+    if (!canAdmitNextQueuedItem(queuedDrainState)) return;
     const nextItem = queuedItems[0];
     if (!nextItem) return;
     const nextDraft = withoutRevertTarget(nextItem.draft);
     if (!nextDraft) return;
+    // Claim the send slot atomically BEFORE the send can resolve: the
+    // engine's busy status can render before the send promise's continuation
+    // runs, and claiming late would erase that observation. The claim is
+    // per-session (not per-surface), so a split view of this session cannot
+    // deliver the same queued item twice.
+    if (!claimQueuedSend(props.sessionId, nextItem.id)) return;
     drainingQueueRef.current = true;
     removeQueuedDraftFromStore(props.sessionId, nextItem.id);
-    // Arm the busy-wait BEFORE the send can resolve: the engine's busy status
-    // can render before the send promise's continuation runs, and arming late
-    // would erase that observation — the next idle would then never drain the
-    // following item. Failure paths below disarm so retries stay possible.
-    awaitingQueueBusyRef.current = true;
     void (async () => {
       try {
         const result = await sendDraft(nextDraft);
+        dispatchQueuedDrain(props.sessionId, {
+          type: "send_result",
+          itemId: nextItem.id,
+          outcome: result.outcome,
+          at: Date.now(),
+        });
         if (result.outcome === "blocked") {
           cloudQueueBlockedRef.current = true;
-          awaitingQueueBusyRef.current = false;
           prependQueuedDrafts(props.sessionId, [{ id: nextItem.id, draft: nextDraft }]);
         } else if (result.outcome === "cancelled") {
-          awaitingQueueBusyRef.current = false;
           prependQueuedDrafts(props.sessionId, [{ id: nextItem.id, draft: nextDraft }]);
         } else {
           nextDraft.attachments.forEach(revokeAttachmentPreview);
         }
       } catch {
-        awaitingQueueBusyRef.current = false;
+        dispatchQueuedDrain(props.sessionId, { type: "send_error", itemId: nextItem.id });
         prependQueuedDrafts(props.sessionId, [{ id: nextItem.id, draft: nextDraft }]);
       } finally {
         drainingQueueRef.current = false;
       }
     })();
-  }, [chatStreaming, cloudQueueRetryVersion, liveStatus.type, prependQueuedDrafts, props.sessionId, queuedItems, removeQueuedDraftFromStore, sendDraft, sendingQueued]);
+  }, [chatStreaming, cloudQueueRetryVersion, liveStatus.type, prependQueuedDrafts, props.sessionId, queuedDrainState, queuedItems, removeQueuedDraftFromStore, sendDraft, sendingQueued]);
 
   useEffect(() => {
     if (props.cloudMcpSubmissionState.status !== "failed") {
       cloudQueueBlockedRef.current = false;
+      // A cleared submission gate releases a drain halted on needs_input; a
+      // terminal_failure halt stays until the user explicitly retries.
+      const drain = getQueuedDrainState(props.sessionId);
+      if (drain.phase.kind === "halted" && drain.phase.reason === "needs_input") {
+        dispatchQueuedDrain(props.sessionId, { type: "user_retry" });
+      }
     }
-  }, [props.cloudMcpSubmissionState.status]);
+  }, [props.cloudMcpSubmissionState.status, props.sessionId]);
 
   useEffect(() => {
-    props.onDraftChange(buildDraft(draft, attachments));
-  }, [attachments, buildDraft, draft, props.onDraftChange]);
+    const nextDraft = buildDraft(draft, attachments);
+    persistDraft({ text: persistableComposerDraftText(nextDraft.text), mode: nextDraft.mode });
+    props.onDraftChange(nextDraft);
+  }, [attachments, buildDraft, draft, persistDraft, props.onDraftChange]);
 
-  const handleAttachFiles = (files: File[]) => {
+  const handleAttachFiles = useCallback((files: File[]) => {
     if (!props.attachmentsEnabled) {
       toast.warning(props.attachmentsDisabledReason ?? "Attachments are unavailable.");
       return;
@@ -1455,18 +1944,26 @@ export function SessionSurface(props: SessionSurfaceProps) {
       props.sessionId,
       `${draft}${next.map((attachment) => `[attachment ${attachment.id}]`).join("")}`,
     );
-  };
+  }, [
+    attachments,
+    draft,
+    props.attachmentsDisabledReason,
+    props.attachmentsEnabled,
+    props.sessionId,
+    setComposerAttachments,
+    setComposerDraft,
+  ]);
 
-  const handleRemoveAttachment = (id: string) => {
+  const handleRemoveAttachment = useCallback((id: string) => {
     const target = attachments.find((item) => item.id === id);
     if (target?.previewUrl) {
       URL.revokeObjectURL(target.previewUrl);
     }
     setComposerAttachments(props.sessionId, attachments.filter((item) => item.id !== id));
     setComposerDraft(props.sessionId, draft.replaceAll(`[attachment ${id}]`, ""));
-  };
+  }, [attachments, draft, props.sessionId, setComposerAttachments, setComposerDraft]);
 
-  const handleInsertMention = (kind: ComposerMentionKind, value: string) => {
+  const handleInsertMention = useCallback((kind: ComposerMentionKind, value: string) => {
     // @agent mentions switch the session agent instead of inserting an agent
     // part. Agent parts are treated as *subagent* (task tool) calls by the
     // engine, which silently fails for primary agents and left every reply
@@ -1499,32 +1996,32 @@ export function SessionSurface(props: SessionSurfaceProps) {
         }
       })();
     }
-  };
+  }, [draft, mentions, props.onSelectAgent, props.sessionId, setComposerDraft, setComposerMentions]);
 
-  const handlePasteText = (text: string) => {
+  const handlePasteText = useCallback((text: string) => {
     const pasted = createPastedTextChip(text);
     setComposerPasteParts(props.sessionId, [...pasteParts, pasted]);
     setComposerDraft(props.sessionId, `${draft}[pasted text ${pasted.label}]`);
-  };
+  }, [draft, pasteParts, props.sessionId, setComposerDraft, setComposerPasteParts]);
 
-  const handleExpandPastedText = (id: string) => {
+  const handleExpandPastedText = useCallback((id: string) => {
     const part = pasteParts.find((item) => item.id === id);
     if (!part) return;
     setComposerDraft(props.sessionId, draft.replace(`[pasted text ${part.label}]`, part.text));
     setComposerPasteParts(props.sessionId, pasteParts.filter((item) => item.id !== id));
-  };
+  }, [draft, pasteParts, props.sessionId, setComposerDraft, setComposerPasteParts]);
 
-  const handleRemovePastedText = (id: string) => {
+  const handleRemovePastedText = useCallback((id: string) => {
     const target = pasteParts.find((item) => item.id === id);
     if (!target) return;
     setComposerDraft(props.sessionId, draft.replace(`[pasted text ${target.label}]`, ""));
     setComposerPasteParts(props.sessionId, pasteParts.filter((item) => item.id !== id));
-  };
+  }, [draft, pasteParts, props.sessionId, setComposerDraft, setComposerPasteParts]);
 
-  const handleUnsupportedFileLinks = (links: string[]) => {
+  const handleUnsupportedFileLinks = useCallback((links: string[]) => {
     if (!links.length) return;
     setComposerDraft(props.sessionId, `${draft}${draft && !draft.endsWith("\n") ? "\n" : ""}${links.join("\n")}`);
-  };
+  }, [draft, props.sessionId, setComposerDraft]);
 
   const typeComposerText = useCallback(async (text: string, revertMessageId?: string | null) => {
     window.dispatchEvent(new Event("openwork:focusPrompt"));
@@ -1575,13 +2072,13 @@ export function SessionSurface(props: SessionSurfaceProps) {
     label: "Send the composer prompt",
     description: "Send the currently visible composer draft to the active session.",
     sideEffect: "mutation",
-    disabled: props.modelUnavailable || (!draft.trim() && attachments.length === 0) || model.transitionState !== "idle",
+    disabled: sessionModelUnavailable || (!draft.trim() && attachments.length === 0) || model.transitionState !== "idle",
     targetRef: composerShellRef,
     execute: async () => {
       await handleSend();
       return true;
     },
-  }), [attachments.length, draft, handleSend, model.transitionState, props.modelUnavailable]);
+  }), [attachments.length, draft, handleSend, model.transitionState, sessionModelUnavailable]);
   useControlAction(props.isControlTarget ? composerSendControlAction : null);
 
   const composerStopControlAction = useMemo<OpenworkControlAction>(() => ({
@@ -1598,7 +2095,7 @@ export function SessionSurface(props: SessionSurfaceProps) {
   }), [chatStreaming, handleAbort]);
   useControlAction(props.isControlTarget ? composerStopControlAction : null);
 
-  const listSkills = async (): Promise<SkillCard[]> => {
+  const listSkills = useCallback(async (): Promise<SkillCard[]> => {
     const pushId = ++skillsConnectPushRef.current;
     // Paint cached Connect inventory instantly; the fresh fan-out lands live.
     const scope = readCloudInventoryScope();
@@ -1620,9 +2117,9 @@ export function SessionSurface(props: SessionSurfaceProps) {
     const next = [...localSkills, ...cachedConnect.skills];
     setToolSkills(next);
     return next;
-  };
+  }, [props.client, props.workspaceId]);
 
-  const listMcp = async (): Promise<{ servers: McpServerEntry[]; statuses: McpStatusMap; status: string | null }> => {
+  const listMcp = useCallback(async (): Promise<{ servers: McpServerEntry[]; statuses: McpStatusMap; status: string | null }> => {
     const pushId = ++mcpConnectPushRef.current;
     const scope = readCloudInventoryScope();
     const cachedConnect = (scope ? readCachedConnectCapabilities(scope) : null) ?? EMPTY_CONNECT_CAPABILITY_INVENTORY;
@@ -1686,9 +2183,9 @@ export function SessionSurface(props: SessionSurfaceProps) {
     setToolMcpStatus(status);
 
     return { servers, statuses, status };
-  };
+  }, [opencodeClient, props.client, props.workspaceId, props.workspaceRoot]);
 
-  const listImportedPlugins = async (): Promise<CloudImportedPlugin[]> => {
+  const listImportedPlugins = useCallback(async (): Promise<CloudImportedPlugin[]> => {
     const pushId = ++pluginConnectPushRef.current;
     const scope = readCloudInventoryScope();
     const cachedConnect = (scope ? readCachedConnectCapabilities(scope) : null) ?? EMPTY_CONNECT_CAPABILITY_INVENTORY;
@@ -1700,9 +2197,9 @@ export function SessionSurface(props: SessionSurfaceProps) {
     const plugins = connectPluginsForComposer(cachedConnect.plugins);
     setToolImportedPlugins(plugins);
     return plugins;
-  };
+  }, []);
 
-  const handleUploadInboxFiles = async (files: File[]) => {
+  const handleUploadInboxFiles = useCallback(async (files: File[]) => {
     const input = files.filter(Boolean);
     if (!input.length) return;
     try {
@@ -1712,7 +2209,7 @@ export function SessionSurface(props: SessionSurfaceProps) {
       toast.warning(nextError instanceof Error ? nextError.message : "Shared folder upload failed");
       throw nextError;
     }
-  };
+  }, [props.client, props.workspaceId]);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -1775,6 +2272,35 @@ export function SessionSurface(props: SessionSurfaceProps) {
   const handleMessageListSetPrompt = useCallback((prompt: string) => {
     void typeComposerText(prompt);
   }, [typeComposerText]);
+
+  // Explicit user click on the interrupted-run error card or the
+  // outcome-unknown recovery card. Re-submits the classified recovery prompt
+  // through the normal send path so the agent continues the interrupted task
+  // in this session instead of restarting it. The single-flight guard drops
+  // (never queues) repeat clicks while one resume is in flight, so rapid
+  // clicking admits exactly one recovery prompt.
+  const resumeGuardRef = useRef(createSingleFlight());
+  const [resuming, setResuming] = useState(false);
+  const handleResumeInterrupted = useCallback(async (recoveryPrompt: string) => {
+    await resumeGuardRef.current.run(async () => {
+      setResuming(true);
+      try {
+        await sendDraft({
+          mode: "prompt",
+          parts: [{ type: "text", text: recoveryPrompt }],
+          attachments: [],
+          text: recoveryPrompt,
+        });
+      } catch {
+        // sendDraft already surfaced the failure on the session error state.
+      } finally {
+        setResuming(false);
+      }
+    });
+  }, [sendDraft]);
+  const handleResumeUnknownOutcome = useCallback(() => {
+    void handleResumeInterrupted(interruptedTaskRecoveryPrompt);
+  }, [handleResumeInterrupted]);
 
   useEffect(() => {
     const resetReconnectState = () => {
@@ -1905,8 +2431,8 @@ export function SessionSurface(props: SessionSurfaceProps) {
   const handleForkAtMessage = useCallback((messageId: string) => {
     // OpenCode's fork copies messages strictly before the given id, so pass
     // the next real message to make the branch include the clicked message.
-    props.onForkAtMessage?.(resolveForkBoundaryId(renderedMessages, messageId), props.sessionId);
-  }, [props.onForkAtMessage, props.sessionId, renderedMessages]);
+    props.onForkAtMessage?.(resolveForkBoundaryId(renderedMessagesRef.current, messageId), props.sessionId);
+  }, [props.onForkAtMessage, props.sessionId]);
 
   const handleEditUserMessage = useCallback((messageId: string, text: string) => {
     // Preserve the boundary with the draft; the destructive revert is deferred
@@ -2004,6 +2530,7 @@ export function SessionSurface(props: SessionSurfaceProps) {
     <DevProfiler id="SessionSurface">
     <div
       data-session-surface-id={props.sessionId}
+      data-session-surface-workspace-id={props.workspaceId}
       onPointerDownCapture={handleFindSurfaceInteraction}
       onFocusCapture={handleFindSurfaceInteraction}
       className="flex h-full min-h-0 flex-col"
@@ -2091,7 +2618,7 @@ export function SessionSurface(props: SessionSurfaceProps) {
               <DevProfiler id="MessageList">
                 <OpenTargetProvider
                   openTargets={verifiedOpenTargets}
-                  onOpenTarget={props.onOpenTarget}
+                  onOpenTarget={handleOpenTarget}
                 >
                   <EnvironmentVariableProvider
                     client={props.isRemoteWorkspace ? null : props.environmentClient ?? props.client}
@@ -2106,11 +2633,14 @@ export function SessionSurface(props: SessionSurfaceProps) {
                       developerMode={props.developerMode}
                       displaySuggestions={shellConfig.starterCards}
                       providerConnectedCount={props.providerConnectedCount ?? 0}
+                      connectorIdentities={connectorIdentities}
                       dispatchAction={handleMessageListDispatchAction}
                       setPrompt={handleMessageListSetPrompt}
                       onRevertToUserMessage={handleRevertToUserMessage}
                       onForkAtMessage={handleForkAtMessage}
                       onEditUserMessage={handleEditUserMessage}
+                      onOpenSubagentSession={props.onOpenSubagentSession}
+                      onResumeInterrupted={handleResumeInterrupted}
                       onMcpReconnect={handleMcpReconnect}
                       onMcpReopenAuthorization={handleMcpReopenAuthorization}
                       onMcpRetry={handleMcpRetry}
@@ -2118,6 +2648,7 @@ export function SessionSurface(props: SessionSurfaceProps) {
                       <MessageList
                         messages={renderedMessages}
                         status={status}
+                        activityStatus={effectiveActivityStatus}
                         retryStatus={liveStatus.type === "retry" ? liveStatus : null}
                       />
                     </MessageListProvider>
@@ -2125,6 +2656,12 @@ export function SessionSurface(props: SessionSurfaceProps) {
                 </OpenTargetProvider>
               </DevProfiler>
             )}
+            {admissionOutcomeUnresolved && renderedMessages.length > 0 ? (
+              <AdmissionOutcomeUnknownCard
+                resuming={resuming}
+                onResume={handleResumeUnknownOutcome}
+              />
+            ) : null}
           </div>
         </div>
         <SessionScrollOverlay
@@ -2159,7 +2696,6 @@ export function SessionSurface(props: SessionSurfaceProps) {
             <span className="text-amber-11/70">Add a provider to run tasks.</span>
           </button>
         ) : null}
-        <DevProfiler id="SessionComposer">
         {props.cloudMcpSubmissionState.status === "failed" ? (
           <div
             className="mx-3 mb-2 flex items-center gap-3 rounded-xl border border-red-7/40 bg-red-2/40 px-3 py-2 text-xs text-red-11"
@@ -2193,9 +2729,13 @@ export function SessionSurface(props: SessionSurfaceProps) {
         steering={steering}
         submissionPreparing={preparingCloudTools}
         queuedCount={queuedItems.length}
-        disabled={model.transitionState !== "idle" || Boolean(props.modelUnavailable) || props.workContextBusy || !workContextModelEligible}
-        modelUnavailable={Boolean(props.modelUnavailable) || !workContextModelEligible}
-        modelUnavailableMessage={props.modelUnavailableMessage ?? (!workContextModelEligible ? workContextModelMessage : null)}
+        disabled={model.transitionState !== "idle" || sessionModelUnavailable || props.workContextBusy || !workContextModelEligible}
+        modelUnavailable={sessionModelUnavailable || !workContextModelEligible}
+        modelUnavailableMessage={sessionModelUnavailable
+          ? props.modelUnavailableMessage
+          : !workContextModelEligible
+            ? workContextModelMessage
+            : null}
         organizationModelsEmpty={props.organizationModelsEmpty}
         statusLabel={statusLabel(snapshot ?? undefined, chatStreaming)}
         modelPickerOpen={modelPickerOpen}
@@ -2281,7 +2821,6 @@ export function SessionSurface(props: SessionSurfaceProps) {
             ) : null
           }
         />
-        </DevProfiler>
       </div>
       {/* Error display moved inline into the session conversation area */}
       {props.developerMode ? <SessionDebugPanel model={model} snapshot={snapshot} /> : null}
