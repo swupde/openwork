@@ -1,20 +1,164 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   commandMatchesPackagedSidecar,
+  createRuntimeManager,
   embeddedServerImportUrl,
+  migrateOpenworkServerTokenStore,
+  prepareRuntimeWorkspaceRoot,
   prioritizeWorkspacePaths,
+  resetRuntimeStatesAfterFailedServerStart,
   resolveEvalLocalServerDelayMs,
   resolveOpenworkServerConfigPath,
+  resolveOpenworkServerReuse,
   seedWorkspacePathsForEmbeddedServer,
   selectStickyOpenworkPortWorkspace,
   snapshotEngineState,
+  snapshotOpenworkServerState,
 } from "./runtime.mjs";
+
+describe("workspace root preparation", () => {
+  it("reports an inaccessible Windows drive as a controlled recoverable error", async () => {
+    const mkdirError = Object.assign(new Error("drive is unavailable"), { code: "ENOENT" });
+    let attemptedPath = null;
+
+    await assert.rejects(
+      prepareRuntimeWorkspaceRoot("\\\\?\\Z:\\Disconnected\\Workspace", {
+        platform: "win32",
+        mkdirImpl: async (workspaceRoot) => {
+          attemptedPath = workspaceRoot;
+          throw mkdirError;
+        },
+      }),
+      (error) => {
+        assert.ok(error instanceof Error);
+        assert.ok("code" in error);
+        assert.ok("workspacePath" in error);
+        assert.equal(error.code, "workspace_inaccessible");
+        assert.equal(error.workspacePath, "\\\\?\\Z:\\Disconnected\\Workspace");
+        assert.equal(error.cause, mkdirError);
+        return true;
+      },
+    );
+    assert.equal(attemptedPath, "Z:\\Disconnected\\Workspace");
+  });
+
+  it("returns the runtime lifecycle to idle after root preparation fails", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "openwork-runtime-root-"));
+    try {
+      const manager = createRuntimeManager({
+        app: {
+          getPath: (name) => name === "exe" ? path.join(root, "OpenWork.exe") : root,
+          isPackaged: false,
+        },
+        desktopRoot: path.dirname(fileURLToPath(import.meta.url)),
+        listLocalWorkspacePaths: async () => [],
+        localManagedMcpVaultKey: "test-key",
+        workspaceMkdir: async () => {
+          throw Object.assign(new Error("network share disconnected"), { code: "ENOENT" });
+        },
+        workspacePlatform: "win32",
+      });
+
+      await assert.rejects(
+        manager.engineStart("\\\\server\\share\\Workspace"),
+        (error) => error instanceof Error && "code" in error && error.code === "workspace_inaccessible",
+      );
+      const status = await manager.runtimeStatus();
+      assert.equal(status.lifecycleState, "idle");
+      assert.equal(status.engine.running, false);
+      assert.equal(status.engine.projectDir, null);
+      assert.equal(status.openworkServer.running, false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("bundled OpenCode runtime", () => {
+  it("pins the engine release containing the timestamp-based session loop repair", async () => {
+    const constantsPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../constants.json");
+    const constants = JSON.parse(await readFile(constantsPath, "utf8"));
+
+    // OpenCode #40990 stops old assistant messages with lexicographically
+    // later IDs from short-circuiting a newly appended user turn.
+    assert.equal(constants.opencodeVersion, "v1.18.18");
+  });
+});
+
+describe("openwork server snapshot", () => {
+  it("reports a running in-process server", () => {
+    const snapshot = snapshotOpenworkServerState({
+      child: null,
+      childExited: true,
+      inProcess: true,
+    });
+    assert.equal(snapshot.running, true);
+  });
+});
+
+describe("resolveOpenworkServerReuse", () => {
+  const healthy = {
+    forceRestart: undefined,
+    inProcess: true,
+    lifecycleState: "healthy",
+    remoteAccessEnabled: false,
+    requestedRemoteAccess: false,
+    currentProjectDir: "/Users/person/workspace-a",
+    requestedProjectDir: "/Users/person/workspace-a",
+    platform: "darwin",
+  };
+
+  it("reuses the running server for the same workspace", () => {
+    assert.deepEqual(resolveOpenworkServerReuse(healthy), { reuse: true, retarget: false });
+  });
+
+  it("retargets instead of restarting when a different workspace is requested", () => {
+    // Regression: a workspace switch (e.g. opening Settings while another
+    // workspace is routed) used to tear the server down here, aborting every
+    // in-flight run in the workspace being left.
+    assert.deepEqual(
+      resolveOpenworkServerReuse({ ...healthy, requestedProjectDir: "/Users/person/workspace-b" }),
+      { reuse: true, retarget: true },
+    );
+  });
+
+  it("treats case-only path differences as the same workspace on win32", () => {
+    assert.deepEqual(
+      resolveOpenworkServerReuse({
+        ...healthy,
+        platform: "win32",
+        currentProjectDir: "C:\\Work\\Space",
+        requestedProjectDir: "c:\\work\\space",
+      }),
+      { reuse: true, retarget: false },
+    );
+  });
+
+  it("gives up the server only for an explicit restart, host rebind, or unhealthy runtime", () => {
+    assert.deepEqual(
+      resolveOpenworkServerReuse({ ...healthy, forceRestart: true }),
+      { reuse: false, retarget: false },
+    );
+    assert.deepEqual(
+      resolveOpenworkServerReuse({ ...healthy, requestedRemoteAccess: true }),
+      { reuse: false, retarget: false },
+    );
+    assert.deepEqual(
+      resolveOpenworkServerReuse({ ...healthy, lifecycleState: "starting" }),
+      { reuse: false, retarget: false },
+    );
+    assert.deepEqual(
+      resolveOpenworkServerReuse({ ...healthy, inProcess: false }),
+      { reuse: false, retarget: false },
+    );
+  });
+});
 
 describe("prioritizeWorkspacePaths", () => {
   it("keeps the active runtime workspace first", () => {
@@ -156,6 +300,45 @@ describe("resolveOpenworkServerConfigPath", () => {
   });
 });
 
+describe("OpenWork server credential persistence", () => {
+  it("deterministically migrates legacy workspace credentials into one server bundle", () => {
+    const migrated = migrateOpenworkServerTokenStore({
+      version: 1,
+      workspaces: {
+        "/workspace/z": {
+          clientToken: "client-z",
+          hostToken: "host-z",
+          ownerToken: "owner-z",
+          updatedAt: 20,
+        },
+        "/workspace/a": {
+          clientToken: "client-a",
+          hostToken: "host-a",
+          ownerToken: "owner-a",
+          updatedAt: 20,
+        },
+        "/workspace/old": {
+          clientToken: "client-old",
+          hostToken: "host-old",
+          ownerToken: "owner-old",
+          updatedAt: 10,
+        },
+      },
+    });
+
+    assert.deepEqual(migrated, {
+      version: 2,
+      credentials: {
+        clientToken: "client-a",
+        hostToken: "host-a",
+        ownerToken: "owner-a",
+        updatedAt: 20,
+      },
+    });
+    assert.deepEqual(migrateOpenworkServerTokenStore(migrated), migrated);
+  });
+});
+
 describe("snapshotEngineState", () => {
   it("reports server-managed OpenCode liveness and pid without a child handle", () => {
     const snapshot = snapshotEngineState({
@@ -180,5 +363,87 @@ describe("snapshotEngineState", () => {
     assert.equal(snapshot.running, true);
     assert.equal(snapshot.managedByServer, true);
     assert.equal(snapshot.pid, 12345);
+  });
+});
+
+describe("resetRuntimeStatesAfterFailedServerStart", () => {
+  function staleServerState() {
+    return {
+      child: null,
+      childExited: true,
+      inProcess: true,
+      remoteAccessEnabled: true,
+      host: "127.0.0.1",
+      port: 4141,
+      baseUrl: "http://127.0.0.1:4141",
+      connectUrl: null,
+      mdnsUrl: null,
+      lanUrl: null,
+      clientToken: "client-token",
+      ownerToken: "owner-token",
+      hostToken: "host-token",
+      managedOpencodeBinPath: "/usr/local/bin/opencode",
+      managedOpencodeBinSource: "known-location",
+      lastStdout: "server stdout",
+      lastStderr: "server stderr",
+      managedOpencodeExecution: { command: "opencode" },
+    };
+  }
+
+  function staleEngineState() {
+    return {
+      child: null,
+      childExited: false,
+      runtime: "direct",
+      projectDir: "/workspace/current",
+      hostname: "127.0.0.1",
+      port: 4097,
+      baseUrl: "http://127.0.0.1:4097",
+      opencodeUsername: "user",
+      opencodePassword: "pass",
+      opencodeBinPath: "/usr/local/bin/opencode",
+      opencodeBinSource: "known-location",
+      managedByServer: true,
+      managedPid: 12345,
+      managedIsAlive: () => true,
+      lastStdout: "engine stdout",
+      lastStderr: "engine stderr",
+      execution: { command: "opencode" },
+    };
+  }
+
+  it("clears a dead managed runtime so snapshots cannot report it running", () => {
+    const serverState = staleServerState();
+    const engineState = staleEngineState();
+
+    resetRuntimeStatesAfterFailedServerStart(serverState, engineState, { manageOpencode: true });
+
+    assert.equal(serverState.inProcess, false);
+    assert.equal(serverState.port, null);
+    assert.equal(serverState.baseUrl, null);
+    assert.equal(serverState.ownerToken, null);
+    // Diagnostics survive the reset.
+    assert.equal(serverState.lastStdout, "server stdout");
+    assert.equal(serverState.lastStderr, "server stderr");
+
+    assert.equal(engineState.baseUrl, null);
+    assert.equal(engineState.managedByServer, false);
+    assert.equal(engineState.managedPid, null);
+    assert.equal(snapshotEngineState(engineState).running, false);
+    // A retry via engineRestart still knows its workspace.
+    assert.equal(engineState.projectDir, "/workspace/current");
+    assert.equal(engineState.lastStderr, "engine stderr");
+  });
+
+  it("leaves an external engine untouched when the failed start did not manage it", () => {
+    const serverState = staleServerState();
+    const engineState = staleEngineState();
+    engineState.managedByServer = false;
+
+    resetRuntimeStatesAfterFailedServerStart(serverState, engineState, { manageOpencode: false });
+
+    assert.equal(serverState.inProcess, false);
+    assert.equal(engineState.baseUrl, "http://127.0.0.1:4097");
+    assert.equal(engineState.projectDir, "/workspace/current");
   });
 });

@@ -7,11 +7,12 @@ import {
   type DenSettings,
 } from "../../../app/lib/den";
 import { recordInspectorEvent } from "../../../app/lib/app-inspector";
-import type {
-  OpenworkCloudMcpFailure,
-  OpenworkCloudMcpHealth,
-  OpenworkCloudMcpProviderModelContext,
-  OpenworkServerClient,
+import {
+  OpenworkServerError,
+  type OpenworkCloudMcpFailure,
+  type OpenworkCloudMcpHealth,
+  type OpenworkCloudMcpProviderModelContext,
+  type OpenworkServerClient,
 } from "../../../app/lib/openwork-server";
 import { unwrap } from "../../../app/lib/opencode";
 import type { Client, McpServerEntry, McpStatusMap } from "../../../app/types";
@@ -198,7 +199,17 @@ export async function syncCloudControlMcpInBackground(input: {
     orgId,
     workspaceId,
   };
-  const listed = await input.client.listMcp(workspaceId);
+  // A structured server error (e.g. secure storage unavailable) must surface
+  // its own message instead of collapsing into the generic maintenance banner.
+  let listed: Awaited<ReturnType<CloudMcpMaintenanceClient["listMcp"]>>;
+  try {
+    listed = await input.client.listMcp(workspaceId);
+  } catch (error) {
+    if (error instanceof OpenworkServerError) {
+      return failedCloudMcpBackgroundSync({ health: null, code: error.code, message: error.message });
+    }
+    throw error;
+  }
   const configured = listed.items.find((entry) => entry.name === CLOUD_MCP_SERVER_NAME);
   if (configured?.config.enabled === false) {
     return { outcome: "skipped", status: "skipped", reason: "disabled", health: null };
@@ -230,6 +241,14 @@ export async function syncCloudControlMcpInBackground(input: {
       ? async () => input.mintToken?.() ?? null
       : mintCloudControlMcpToken,
     force: input.force,
+    // Session maintenance is the automatic upgrade path for already-signed-in
+    // desktops. OpenCode can keep reporting a stale Cloud MCP entry as
+    // connected even after the hosted API moved origins, while actual tool
+    // calls fail at the remote endpoint with `missing_mcp_token` when the
+    // persisted Authorization header is no longer delivered. Include the
+    // server-side direct probe here so those auth failures trigger a silent
+    // re-mint instead of waiting for the user to open Settings → Repair.
+    probe: true,
     refreshMarginMs: CLOUD_MCP_REFRESH_MARGIN_MS,
     now: input.now,
     configuredEnabled: configured === undefined ? null : configured.config.enabled !== false,

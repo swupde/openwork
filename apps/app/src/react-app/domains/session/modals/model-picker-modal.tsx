@@ -6,8 +6,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { ArrowRight, Check, ChevronDown, ChevronRight, RefreshCw, Search, Sparkles, Star, X } from "lucide-react";
-import { useNavigate } from "react-router-dom";
+import { Check, ChevronDown, ChevronRight, RefreshCw, Search, Star } from "lucide-react";
 
 import {
   Dialog,
@@ -28,15 +27,10 @@ import { ProviderIcon } from "../../../design-system/provider-icon";
 import { useDenAuth } from "../../cloud/den-auth-provider";
 import { usePlatform } from "../../../kernel/platform";
 import {
-  getOpenWorkModelsActionUrl,
-  hasOpenWorkModelsProvider,
-  hideOpenWorkModelsPromo,
-  useOpenWorkModelsPromoEligibility,
-  isOpenWorkModelsPromoHidden,
   OPENWORK_MODELS_PROVIDER_ID,
   OPENWORK_MODELS_PROVIDER_NAME,
-  openWorkModelsPromoChangedEvent,
 } from "../../cloud/openwork-models-promo";
+import { shouldShowTechnicalModelId } from "../work-context/model-policy";
 
 export const MODEL_PICKER_DEFAULT_SUBTITLE = "Select a model for this session.";
 export const MODEL_PICKER_UNAVAILABLE_SUBTITLE = "The model you were using is no longer available, please select a different model for this session.";
@@ -61,9 +55,10 @@ export type ModelPickerModalProps = {
   onToggleProvider?: (providerId: string, enabled: boolean) => void;
   onOpenSettings: () => void;
   onClose: (options?: { restorePromptFocus?: boolean }) => void;
-  /** Den entitlement present; used to avoid a false Subscribe CTA while models sync. */
+  /** Den entitlement present. Picker no longer upsells here; callers still pass it. */
   openWorkModelsEntitled?: boolean;
-  onRefreshOpenWorkModels?: () => void | Promise<void>;
+  /** The server is waiting to reload this workspace with OpenWork Models. */
+  openWorkModelsSyncing?: boolean;
   onRefreshOrganizationModels?: () => void | Promise<void>;
   restrictToCloud?: boolean;
 };
@@ -121,12 +116,9 @@ export function resolveModelPickerEmptyState(input: {
 export function ModelPickerModal(props: ModelPickerModalProps) {
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const [expandedProviders, setExpandedProviders] = useState<Set<string>>(new Set());
-  const [promoHidden, setPromoHidden] = useState(isOpenWorkModelsPromoHidden);
   const [refreshingOrganizationModels, setRefreshingOrganizationModels] = useState(false);
   const denAuth = useDenAuth();
-  const navigate = useNavigate();
   const platform = usePlatform();
-  const openWorkModelsPromoEligible = useOpenWorkModelsPromoEligibility();
   const organizationModelsSettingsUrl = props.organizationModelsSettingsUrl;
   const organizationProviderLabel = useMemo(
     () => readDenSettings().activeOrgName?.trim() || t("settings.provider_source_organization"),
@@ -144,12 +136,6 @@ export function ModelPickerModal(props: ModelPickerModalProps) {
       props.setQuery("");
     }
   }, [props.open]);
-
-  useEffect(() => {
-    const handlePromoChanged = () => setPromoHidden(isOpenWorkModelsPromoHidden());
-    window.addEventListener(openWorkModelsPromoChangedEvent, handlePromoChanged);
-    return () => window.removeEventListener(openWorkModelsPromoChangedEvent, handlePromoChanged);
-  }, []);
 
   // Focus search
   useEffect(() => {
@@ -254,35 +240,6 @@ export function ModelPickerModal(props: ModelPickerModalProps) {
     });
   }, []);
 
-  const openWorkModelsAvailable = useMemo(
-    () => hasOpenWorkModelsProvider(props.options.map((option) => option.providerID)),
-    [props.options],
-  );
-  const showOpenWorkModelsSyncing = Boolean(props.openWorkModelsEntitled) && !openWorkModelsAvailable;
-  const showOpenWorkModelsPromo = useMemo(
-    () =>
-      openWorkModelsPromoEligible &&
-      !promoHidden &&
-      !openWorkModelsAvailable &&
-      !props.openWorkModelsEntitled,
-    [openWorkModelsPromoEligible, openWorkModelsAvailable, promoHidden, props.openWorkModelsEntitled],
-  );
-
-  const openOpenWorkModels = useCallback(() => {
-    props.onClose();
-    if (!denAuth.isSignedIn) {
-      navigate("/settings/cloud-account");
-    }
-    window.setTimeout(() => {
-      platform.openLink(getOpenWorkModelsActionUrl(denAuth.isSignedIn));
-    }, 0);
-  }, [denAuth.isSignedIn, navigate, platform, props.onClose]);
-
-  const hideOpenWorkModels = useCallback(() => {
-    hideOpenWorkModelsPromo();
-    setPromoHidden(true);
-  }, []);
-
   const handleSelect = useCallback(
     (opt: ModelOption) => props.onSelect({ providerID: opt.providerID, modelID: opt.modelID }),
     [props.onSelect],
@@ -345,7 +302,7 @@ export function ModelPickerModal(props: ModelPickerModalProps) {
             />
           </div>
 
-          {showOpenWorkModelsSyncing ? (
+          {props.openWorkModelsSyncing ? (
             <div className="mb-3 flex shrink-0 items-center overflow-hidden rounded-2xl border border-amber-6/60 bg-amber-2/40">
               <div className="flex min-w-0 flex-1 items-center gap-3 px-3 py-2.5">
                 <ProviderIcon providerId={OPENWORK_MODELS_PROVIDER_ID} providerName={OPENWORK_MODELS_PROVIDER_NAME} size={18} className="shrink-0 text-amber-11" />
@@ -354,52 +311,10 @@ export function ModelPickerModal(props: ModelPickerModalProps) {
                     <span>{OPENWORK_MODELS_PROVIDER_NAME}</span>
                   </div>
                   <div className="truncate text-[11px] text-dls-secondary">
-                    Included on your plan — finish syncing to choose a model.
+                    Included on your plan — pending workspace reload.
                   </div>
                 </div>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="shrink-0"
-                  onClick={() => void props.onRefreshOpenWorkModels?.()}
-                >
-                  <RefreshCw className="mr-1 size-3" />
-                  Refresh
-                </Button>
               </div>
-            </div>
-          ) : null}
-
-          {showOpenWorkModelsPromo ? (
-            <div className="mb-3 flex shrink-0 items-center overflow-hidden rounded-2xl border border-blue-6/60 bg-blue-2/60 shadow-[0_12px_30px_-20px_rgba(var(--dls-accent-rgb),0.45)]">
-              <button
-                type="button"
-                className="flex min-w-0 flex-1 items-center gap-3 px-3 py-2.5 text-left transition-colors hover:bg-blue-3/70"
-                onClick={openOpenWorkModels}
-              >
-                <ProviderIcon providerId={OPENWORK_MODELS_PROVIDER_ID} providerName={OPENWORK_MODELS_PROVIDER_NAME} size={18} className="shrink-0 text-blue-11" />
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-1.5 text-[13px] font-medium text-dls-text">
-                    <Sparkles className="size-3.5 text-blue-11" />
-                    <span>{OPENWORK_MODELS_PROVIDER_NAME}</span>
-                  </div>
-                  <div className="truncate text-[11px] text-dls-secondary">
-                    {denAuth.isSignedIn ? "Subscribe to use hosted frontier models in this workspace." : "Sign in to unlock hosted frontier models for your team."}
-                  </div>
-                </div>
-                <span className="flex shrink-0 items-center gap-1 rounded-full border border-blue-6 bg-blue-3 px-2 py-0.5 text-[11px] font-medium text-blue-11">
-                  {denAuth.isSignedIn ? "Subscribe" : "Sign in"}
-                  <ArrowRight className="size-3" />
-                </span>
-              </button>
-              <button
-                type="button"
-                className="flex size-9 shrink-0 items-center justify-center border-l border-blue-6/60 text-blue-11 transition-colors hover:bg-blue-3/70"
-                onClick={hideOpenWorkModels}
-                aria-label="Hide OpenWork Models"
-              >
-                <X className="size-3.5" />
-              </button>
             </div>
           ) : null}
 
@@ -575,6 +490,7 @@ function DefaultModelRow({
   return (
     <button
       type="button"
+      data-model-id={opt.modelID}
       className={[
         "flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left transition-colors",
         active ? "bg-green-3/50" : "hover:bg-dls-hover",
@@ -584,7 +500,9 @@ function DefaultModelRow({
       {recommended ? <Star size={12} className="shrink-0 text-amber-9" /> : <div className="w-3 shrink-0" />}
       <div className="min-w-0 flex-1">
         <span className={["text-[12px]", active ? "font-medium text-dls-text" : "text-dls-text"].join(" ")}>{opt.title}</span>
-        <span className="ml-2 font-mono text-[10px] text-dls-secondary/60">{opt.modelID}</span>
+        {shouldShowTechnicalModelId(opt) ? (
+          <span className="ml-2 font-mono text-[10px] text-dls-secondary/60">{opt.modelID}</span>
+        ) : null}
       </div>
       {active ? <Check size={14} className="shrink-0 text-green-11" /> : null}
     </button>

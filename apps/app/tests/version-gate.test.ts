@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import {
   isAlphaChannelAllowedByDesktopConfig,
   isAlphaUpdateAllowed,
+  isUpdateAllowedByDesktopConfig,
+  isAlphaUpdateAllowedByVersionCeiling,
   resolveAutomaticStableDesktopUpdate,
   resolveDesktopUpdateChannel,
   resolveFreshStableDesktopUpdate,
@@ -34,9 +36,48 @@ describe("alpha desktop update policy", () => {
       isAlphaUpdateAllowed("999.0.0-alpha.1", { allowAlphaUpdates: false }),
     ).resolves.toBe(false);
   });
+
+  test("lets an installed alpha advance within its release while Den metadata lags", () => {
+    expect(isAlphaUpdateAllowedByVersionCeiling({
+      updateVersion: "0.18.37-alpha.2492+4921a02",
+      currentVersion: "0.18.37-alpha.2491+64d2d37",
+      denLatestAppVersion: "0.18.35",
+      desktopConfig: { allowAlphaUpdates: true },
+    })).toBe(true);
+  });
+
+  test("does not let an installed alpha bypass the ceiling for a newer release", () => {
+    expect(isAlphaUpdateAllowedByVersionCeiling({
+      updateVersion: "0.18.38-alpha.2493+abcdef0",
+      currentVersion: "0.18.37-alpha.2491+64d2d37",
+      denLatestAppVersion: "0.18.35",
+      desktopConfig: { allowAlphaUpdates: true },
+    })).toBe(false);
+  });
+
+  test("keeps an explicit organization ceiling in force", () => {
+    expect(isAlphaUpdateAllowedByVersionCeiling({
+      updateVersion: "0.18.37-alpha.2492+4921a02",
+      currentVersion: "0.18.37-alpha.2491+64d2d37",
+      denLatestAppVersion: "0.18.35",
+      desktopConfig: {
+        allowAlphaUpdates: true,
+        allowedDesktopVersions: ["0.18.35"],
+      },
+    })).toBe(false);
+  });
 });
 
 describe("selectStableDesktopUpdate", () => {
+  test("treats a missing version policy as unrestricted", () => {
+    expect(isUpdateAllowedByDesktopConfig("99.0.0", {
+      allowedDesktopVersions: undefined,
+    })).toBe(true);
+    expect(isUpdateAllowedByDesktopConfig("99.0.0", {
+      allowedDesktopVersions: ["98.0.0"],
+    })).toBe(false);
+  });
+
   test("selects the highest approved published release above the installed version", () => {
     expect(selectStableDesktopUpdate({
       currentVersion: "0.17.22",

@@ -1,5 +1,25 @@
 # OpenWork Host (Docker)
 
+## Pull-only evaluation stack
+
+Run Den API, Den web, and MySQL from published images without cloning or building the repository:
+
+```bash
+curl -fsSLo docker-compose.eval.yml \
+  https://raw.githubusercontent.com/different-ai/openwork/9f8645ebc482c15ab99c0cf155aabaa411e1ca6a/packaging/docker/docker-compose.eval.yml
+printf '%s  %s\n' \
+  '69cc7f2666157b7697ebf69b31b0c83887dd99e796c7d956f9ccaab8fa8bf2fc' \
+  'docker-compose.eval.yml' | shasum -a 256 --check
+umask 077
+printf 'OPENWORK_AUTH_SECRET=%s\nOPENWORK_DB_ENCRYPTION_KEY=%s\n' \
+  "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" > .env
+docker compose -f docker-compose.eval.yml up -d --wait
+```
+
+Open `http://localhost:3005` and create an account. See the [evaluation guide](../../packages/docs/self-host/evaluate-with-docker-compose.mdx) for configuration, secure remote access, limitations, and cleanup.
+
+This stack is for evaluation only. Its HTTP ports bind to loopback, but it still enables public signup, uses development credentials, and does not provide production workers, sandboxes, or email delivery.
+
 ## Den local stack (Docker)
 
 One command for the Den control plane, local MySQL, and the cloud web app.
@@ -189,9 +209,11 @@ OTEL_TRACES_SAMPLER=parentbased_traceidratio OTEL_TRACES_SAMPLER_ARG=0.25
 `docker-compose.den-dev.yml` forwards the full OTLP runtime surface to both Den
 services: base and per-signal endpoints, base and per-signal protocol values,
 headers, per-signal exporters, and sampler settings. It also forwards runtime
-Sentry settings (`SENTRY_DSN`, `SENTRY_TRACES_SAMPLE_RATE`,
+Sentry settings (`SENTRY_DSN`, `SENTRY_TRACES_SAMPLE_RATE`, `SENTRY_LOG_LEVEL`,
 `SENTRY_ENVIRONMENT`, `SENTRY_RELEASE`, and `SENTRY_DIST`) while keeping
-distinct `OTEL_SERVICE_NAME` defaults for Den API and Den Web.
+distinct `OTEL_SERVICE_NAME` defaults for Den API and Den Web. Sentry tracing
+defaults to `0.01`; `SENTRY_LOG_LEVEL` defaults to `warn` so successful request
+logs stay on stdout unless explicitly enabled for Sentry.
 
 Sentry source-map upload is build-time only. Runtime Compose and Helm settings
 cannot upload maps after the image is built. The Dockerfiles default their
@@ -354,7 +376,7 @@ docker compose up --build
 
 Then open:
 
-- `http://127.0.0.1:8787/ui`
+- `http://127.0.0.1:8787/health`
 
 ### Config
 

@@ -30,7 +30,7 @@ import type {
   ModelRef,
 } from "../../../../app/types";
 import { addOpencodeCacheHint, safeStringify } from "../../../../app/utils";
-import { clearSessionDraft, saveSessionDraft } from "./draft-store";
+import { clearSessionDraft, LOCAL_SESSION_DRAFT_SCOPE, saveSessionDraft } from "./draft-store";
 import { firstLineLocalFileParts } from "./prompt-file-parts";
 import { composerAttachmentToFilePart } from "./attachment-file-part";
 import { appMentionInstruction } from "../surface/composer/app-mentions";
@@ -396,12 +396,12 @@ export function createSessionActionsStore(options: {
 
       const session = unwrap(rawResult);
       if (initialPrompt) {
-        saveSessionDraft(id, session.id, {
+        saveSessionDraft(LOCAL_SESSION_DRAFT_SCOPE, id, session.id, {
           text: initialPrompt,
           mode: "prompt",
         });
       } else {
-        clearSessionDraft(id, session.id);
+        clearSessionDraft(LOCAL_SESSION_DRAFT_SCOPE, id, session.id);
       }
 
       options.setBusyLabel("status.loading_session");
@@ -527,7 +527,7 @@ export function createSessionActionsStore(options: {
       if (!compactCommand) {
         setLastPromptSent(content);
       }
-      clearSessionDraft(options.selectedWorkspaceId().trim(), sessionID);
+      clearSessionDraft(LOCAL_SESSION_DRAFT_SCOPE, options.selectedWorkspaceId().trim(), sessionID);
       if (!hasExplicitDraft) {
         options.setPrompt("");
       }
@@ -618,7 +618,11 @@ export function createSessionActionsStore(options: {
     if (!c) return;
     const id = (sessionID ?? options.selectedSessionId() ?? "").trim();
     if (!id) return;
-    await abortSessionTyped(c, id);
+    await abortSessionTyped(c, id, undefined, {
+      source: "session.actions.abort_session",
+      initiator: "user",
+      reason: "session action requested abort",
+    });
   }
 
   function retryLastPrompt() {
@@ -683,7 +687,11 @@ export function createSessionActionsStore(options: {
     const sessionID = (options.selectedSessionId() ?? "").trim();
     if (!c || !sessionID) return;
 
-    await abortSessionSafe(c, sessionID);
+    await abortSessionSafe(c, sessionID, undefined, {
+      source: "session.undo_last_user_message.before_revert",
+      initiator: "user",
+      reason: "abort active run before undoing last user message",
+    });
 
     const users = options.messages().filter((message) => {
       const role = (message.info as { role?: string }).role;
@@ -711,7 +719,11 @@ export function createSessionActionsStore(options: {
     const sessionID = (options.selectedSessionId() ?? "").trim();
     if (!c || !sessionID) return;
 
-    await abortSessionSafe(c, sessionID);
+    await abortSessionSafe(c, sessionID, undefined, {
+      source: "session.redo_last_user_message.before_revert",
+      initiator: "user",
+      reason: "abort active run before redoing last user message",
+    });
 
     const revertMessageID = options.selectedSession()?.revert?.messageID ?? null;
     if (!revertMessageID) return;
@@ -779,7 +791,7 @@ export function createSessionActionsStore(options: {
     const directory = toSessionTransportDirectory(root);
     const params = directory ? { sessionID: trimmed, directory } : { sessionID: trimmed };
     unwrap(await c.session.delete(params));
-    clearSessionDraft(options.selectedWorkspaceId().trim(), trimmed);
+    clearSessionDraft(LOCAL_SESSION_DRAFT_SCOPE, options.selectedWorkspaceId().trim(), trimmed);
 
     options.setSessions(options.sessions().filter((s) => s.id !== trimmed));
     const activeWsId = options.selectedWorkspaceId();

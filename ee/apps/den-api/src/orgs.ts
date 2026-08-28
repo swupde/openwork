@@ -5,9 +5,12 @@ import {
   ConnectedAccountTable,
   InvitationTable,
   LlmProviderAccessTable,
+  LlmProviderMemberCredentialTable,
   MemberTable,
   OrganizationRoleTable,
   OrganizationTable,
+  ScimProviderTable,
+  ScimUserTombstoneTable,
   SsoConnectionTable,
   SsoProviderTable,
   TeamMemberTable,
@@ -15,6 +18,7 @@ import {
 } from "@openwork-ee/den-db/schema"
 import { createDenTypeId, normalizeDenTypeId } from "@openwork-ee/utils/typeid"
 import { revokeOrganizationApiKeysForMember } from "./api-keys.js"
+import { cache } from "./cache.js"
 import { revokeMembershipSessionCredentials } from "./credential-revocation.js"
 import { db } from "./db.js"
 import { env } from "./env.js"
@@ -42,8 +46,10 @@ import {
 } from "./organization-access.js"
 import { ensureDefaultDesktopPolicyForOrganization } from "./desktop-policies.js"
 import { isProtectedOrganizationRoleName, shouldRevokeSessionsForRoleChange } from "./organization-role-hierarchy.js"
+import { appLogger } from "./observability/logger.js"
 import { isSingleOrgOwnerEmailEligible, resolveSingleOrgMembershipRole } from "./single-org-policy.js"
-import { isOrganizationSsoReady } from "./sso-readiness.js"
+
+const logger = appLogger.child({ component: "organizations" })
 
 type UserId = typeof AuthUserTable.$inferSelect.id
 type SessionId = typeof AuthSessionTable.$inferSelect.id
@@ -60,6 +66,9 @@ export type AcceptInvitationForUserResult = {
   member: MemberRow
 } | {
   status: "membership_removed"
+  invitation: InvitationRow
+} | {
+  status: "scim_deprovisioned"
   invitation: InvitationRow
 }
 
@@ -503,8 +512,6 @@ function normalizeAssignableRole(input: string, availableRoles: Set<string>, fal
 }
 
 export async function listAssignableRoles(orgId: OrgId) {
-  await ensureDefaultDynamicRoles(orgId)
-
   const rows = await db
     .select({ role: OrganizationRoleTable.role })
     .from(OrganizationRoleTable)
@@ -537,6 +544,10 @@ async function insertMemberIfMissing(input: {
     defaultRole: input.role,
   })
   if (invitedMember) {
+    // Accepting an invite materializes membership data; cached org/member reads
+    // must be invalidated here because hot cache hits do not re-check the DB.
+    await cache.org.deleteMemberList(input.organizationId)
+    await cache.org.deleteMembership({ organizationId: input.organizationId, userId: input.userId })
     return invitedMember
   }
 
@@ -556,6 +567,9 @@ async function insertMemberIfMissing(input: {
       role: input.role,
       joinedAt: new Date(),
     })
+    // Joining an org changes both the aggregate list and this user's membership cache.
+    await cache.org.deleteMemberList(input.organizationId)
+    await cache.org.deleteMembership({ organizationId: input.organizationId, userId: input.userId })
   } catch {}
 
   const created = await db
@@ -628,7 +642,7 @@ export async function acceptPendingInvitationForBootstrapMembership(input: {
   // Bootstrap paths already grant same-org membership before email verification.
   // organization-join-verification.ts keeps that gate on the explicit accept endpoint.
   const accepted = await acceptInvitation(invitation, input.userId, { fallbackRole: input.defaultRole })
-  return accepted?.member ?? null
+  return accepted?.status === "accepted" ? accepted.member : null
 }
 
 export async function reconcilePendingInvitationsForUser(userId: UserId) {
@@ -671,7 +685,7 @@ export async function reconcilePendingInvitationsForUser(userId: UserId) {
     }
 
     const accepted = await acceptInvitation(invitation, userId)
-    if (accepted) {
+    if (accepted?.status === "accepted") {
       acceptedCount += 1
     }
   }
@@ -680,6 +694,29 @@ export async function reconcilePendingInvitationsForUser(userId: UserId) {
 }
 
 async function acceptInvitation(invitation: InvitationRow, userId: UserId, options?: { fallbackRole?: string }) {
+  const scimConnections = await db
+    .select({ id: ScimProviderTable.id })
+    .from(ScimProviderTable)
+    .where(eq(ScimProviderTable.organizationId, invitation.organizationId))
+    .limit(1)
+  if (scimConnections[0]) {
+    const tombstones = await db
+      .select({ id: ScimUserTombstoneTable.id })
+      .from(ScimUserTombstoneTable)
+      .where(and(
+        eq(ScimUserTombstoneTable.organizationId, invitation.organizationId),
+        eq(ScimUserTombstoneTable.email, invitation.email.trim().toLowerCase()),
+      ))
+      .limit(1)
+    if (tombstones[0]) {
+      logger.info("skipped invitation acceptance for SCIM-deprovisioned member", {
+        organization_id: invitation.organizationId,
+        invitation_id: invitation.id,
+      })
+      return { status: "scim_deprovisioned" as const, invitation }
+    }
+  }
+
   const availableRoles = await listAssignableRoles(invitation.organizationId)
   return db.transaction(async (tx) => {
     const lockedInvitations = await tx
@@ -705,7 +742,7 @@ async function acceptInvitation(invitation: InvitationRow, userId: UserId, optio
     const invitationStatus = getInvitationStatus(currentInvitation)
     if (invitationStatus !== "pending") {
       return invitationStatus === "accepted" && existingMember
-        ? { invitation: currentInvitation, member: existingMember, newlyAccepted: false }
+        ? { status: "accepted" as const, invitation: currentInvitation, member: existingMember, newlyAccepted: false }
         : null
     }
 
@@ -854,7 +891,7 @@ async function acceptInvitation(invitation: InvitationRow, userId: UserId, optio
       .set({ status: "accepted" })
       .where(and(eq(InvitationTable.id, currentInvitation.id), eq(InvitationTable.status, "pending")))
 
-    return { invitation: currentInvitation, member, newlyAccepted: true }
+    return { status: "accepted" as const, invitation: currentInvitation, member, newlyAccepted: true }
   })
 }
 
@@ -936,6 +973,9 @@ export async function acceptInvitationForUser(input: {
       }
     }
     return null
+  }
+  if (accepted.status === "scim_deprovisioned") {
+    return accepted
   }
   if (accepted.newlyAccepted) {
     await runPostOrganizationMemberChangeHooks({
@@ -1073,27 +1113,22 @@ export async function getSingletonSsoStatus() {
   }
 
   const rows = await db
-    .select({
-      signInPath: SsoConnectionTable.signInPath,
-      status: SsoConnectionTable.status,
-      domainVerified: SsoProviderTable.domainVerified,
-    })
+    .select({ signInPath: SsoConnectionTable.signInPath })
     .from(SsoConnectionTable)
     .innerJoin(SsoProviderTable, and(
       eq(SsoConnectionTable.providerId, SsoProviderTable.providerId),
       eq(SsoConnectionTable.organizationId, SsoProviderTable.organizationId),
+      eq(SsoProviderTable.domainVerified, true),
     ))
-    .where(eq(SsoConnectionTable.organizationId, organization.id))
+    .where(and(
+      eq(SsoConnectionTable.organizationId, organization.id),
+      eq(SsoConnectionTable.status, "enabled"),
+    ))
     .limit(1)
-  const connection = rows[0]
-  const configured = isOrganizationSsoReady({
-    connection: connection ? { status: connection.status } : null,
-    provider: connection ? { domainVerified: connection.domainVerified } : null,
-  })
-  const signInPath = connection?.signInPath || fallbackSignInPath
+  const signInPath = rows[0]?.signInPath || fallbackSignInPath
 
   return {
-    configured,
+    configured: Boolean(rows[0]),
     organizationSlug,
     signInPath,
   }
@@ -1108,7 +1143,7 @@ async function countActiveOwners(organizationId: OrgId) {
   return rows.filter((row) => roleIncludesOwner(row.role)).length
 }
 
-export async function ensureSingletonOrganizationForUser(userId: UserId) {
+export async function ensureSingletonOrganizationForUser(userId: UserId, options?: { forceOwner?: boolean }) {
   const userRows = await db
     .select({
       email: AuthUserTable.email,
@@ -1120,7 +1155,7 @@ export async function ensureSingletonOrganizationForUser(userId: UserId) {
 
   let organization = await getSingletonOrganization()
   if (!organization) {
-    if (!isSingleOrgOwnerEmailEligible({
+    if (!options?.forceOwner && !isSingleOrgOwnerEmailEligible({
       email: userEmail,
       ownerEmails: env.singleOrg.ownerEmails,
     })) {
@@ -1143,11 +1178,13 @@ export async function ensureSingletonOrganizationForUser(userId: UserId) {
   }
 
   const activeOwnerCount = await countActiveOwners(organization.id)
-  const role = resolveSingleOrgMembershipRole({
-    activeOwnerCount,
-    email: userEmail,
-    ownerEmails: env.singleOrg.ownerEmails,
-  })
+  const role = options?.forceOwner && activeOwnerCount === 0
+    ? "owner"
+    : resolveSingleOrgMembershipRole({
+        activeOwnerCount,
+        email: userEmail,
+        ownerEmails: env.singleOrg.ownerEmails,
+      })
   if (!role) {
     return null
   }
@@ -1166,7 +1203,6 @@ export async function ensureSingletonOrganizationForUser(userId: UserId) {
     organizationId: organization.id,
     createdByOrgMemberId: member.id,
   })
-  await ensureDefaultDynamicRoles(organization.id)
 
   return organization.id
 }
@@ -1180,8 +1216,6 @@ export async function ensureUserOrgAccess(input: {
 
   const memberships = await listMembershipRows(input.userId)
   if (memberships.length > 0) {
-    const organizationIds = [...new Set(memberships.map((membership) => membership.organizationId))]
-    await Promise.all(organizationIds.map((organizationId) => ensureDefaultDynamicRoles(organizationId)))
     return memberships[0].organizationId
   }
 
@@ -1376,6 +1410,17 @@ export async function setSessionActiveOrganization(sessionId: SessionId, organiz
     .update(AuthSessionTable)
     .set({ activeOrganizationId: organizationId })
     .where(eq(AuthSessionTable.id, sessionId))
+
+  const rows = await db
+    .select({ token: AuthSessionTable.token })
+    .from(AuthSessionTable)
+    .where(eq(AuthSessionTable.id, sessionId))
+    .limit(1)
+  const session = rows[0]
+  if (session) {
+    await cache.auth.deleteSession(session.token)
+  }
+  await cache.auth.deleteSessionId(sessionId)
 }
 
 export async function listUserOrgs(userId: UserId) {
@@ -1499,31 +1544,7 @@ export async function getOrganizationContextForUser(input: {
     return null
   }
 
-  await ensureDefaultDynamicRoles(organization.id)
-
-  const members = await db
-    .select({
-      id: MemberTable.id,
-      userId: MemberTable.userId,
-      inviteId: MemberTable.inviteId,
-      role: MemberTable.role,
-      createdAt: MemberTable.createdAt,
-      joinedAt: MemberTable.joinedAt,
-      user: {
-        id: AuthUserTable.id,
-        email: AuthUserTable.email,
-        name: AuthUserTable.name,
-        image: AuthUserTable.image,
-      },
-      invitation: {
-        email: InvitationTable.email,
-      },
-    })
-    .from(MemberTable)
-    .leftJoin(AuthUserTable, eq(MemberTable.userId, AuthUserTable.id))
-    .leftJoin(InvitationTable, eq(MemberTable.inviteId, InvitationTable.id))
-    .where(and(eq(MemberTable.organizationId, organization.id), isNull(MemberTable.removedAt)))
-    .orderBy(asc(MemberTable.createdAt))
+  const members = await cache.org.members(organization.id)
 
   const invitations = await db
     .select({
@@ -1566,25 +1587,7 @@ export async function getOrganizationContextForUser(input: {
       joinedAt: currentMember.joinedAt,
       isOwner: roleIncludesOwner(currentMember.role),
     },
-    members: members.map((member) => {
-      const email = member.user?.email ?? member.invitation?.email ?? "invited@example.com"
-      const name = member.user?.name ?? getInvitedMemberName(email)
-      return {
-        id: member.id,
-        userId: member.userId,
-        inviteId: member.inviteId,
-        role: member.role,
-        createdAt: member.createdAt,
-        joinedAt: member.joinedAt,
-        isOwner: roleIncludesOwner(member.role),
-        user: {
-          id: member.user?.id ?? member.id,
-          email,
-          name,
-          image: member.user?.image ?? null,
-        },
-      }
-    }),
+    members,
     invitations,
     roles: [
       {
@@ -1642,6 +1645,9 @@ async function listOrganizationTeams(organizationId: OrgId) {
 
   const memberIdsByTeamId = new Map<typeof TeamTable.$inferSelect.id, MemberId[]>()
   for (const membership of memberships) {
+    if (!membership.orgMembershipId) {
+      continue
+    }
     const existing = memberIdsByTeamId.get(membership.teamId) ?? []
     existing.push(membership.orgMembershipId)
     memberIdsByTeamId.set(membership.teamId, existing)
@@ -1784,6 +1790,11 @@ export async function updateOrganizationMemberRole(input: {
   })
 
   if (updated.ok && updated.changed) {
+    // Role edits change authorization decisions served from membership cache.
+    await cache.org.deleteMemberList(input.organizationId)
+    if (updated.member.userId) {
+      await cache.org.deleteMembership({ organizationId: input.organizationId, userId: updated.member.userId })
+    }
     await revokeOrganizationApiKeysForMember({
       organizationId: input.organizationId,
       orgMembershipId: updated.member.id,
@@ -1918,6 +1929,9 @@ export async function transferOrganizationOwnership(input: {
     return transfer
   }
 
+  // Ownership transfer edits multiple member roles; clear all org membership keys.
+  await cache.org.deleteMembers(input.organizationId)
+
   for (const ownerRow of transfer.demotedOwners) {
     await revokeOrganizationApiKeysForMember({
       organizationId: input.organizationId,
@@ -1987,6 +2001,13 @@ export async function removeOrganizationMember(input: {
       .where(and(
         eq(ConnectedAccountTable.organizationId, input.organizationId),
         eq(ConnectedAccountTable.orgMembershipId, member.id),
+      ))
+
+    await tx
+      .delete(LlmProviderMemberCredentialTable)
+      .where(and(
+        eq(LlmProviderMemberCredentialTable.organizationId, input.organizationId),
+        eq(LlmProviderMemberCredentialTable.orgMembershipId, member.id),
       ))
 
     await tx

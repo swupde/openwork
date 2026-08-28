@@ -9,6 +9,8 @@ import { ensureDir, exists, shortId } from "../utils.js";
 import { defaultWorkspaceOpenworkConfig, ensureWorkspaceFiles } from "../workspace-init.js";
 import { seedOpenworkWorkspaceConfigIfEmpty } from "../openwork-workspace-config-store.js";
 import { workspaceIdForPath, workspaceIdForRemote } from "../workspaces.js";
+import { getWorkspaceWorkContext, setWorkspaceWorkContext } from "../work-context.js";
+import { workContextSchema } from "@openwork/types/work-context";
 import { addRoute, type Route } from "./registry.js";
 
 type JsonResponse = (data: unknown, status?: number) => Response;
@@ -26,7 +28,11 @@ interface RegisterWorkspaceRoutesOptions {
   ensureWritable: (config: ServerConfig) => void;
   resolveWorkspace: (config: ServerConfig, id: string) => Promise<WorkspaceInfo>;
   serializeWorkspace: (workspace: ServerConfig["workspaces"][number]) => unknown;
-  reloadOpencodeEngine: (config: ServerConfig, workspace: WorkspaceInfo) => Promise<void>;
+  reloadOpencodeEngine: (
+    config: ServerConfig,
+    workspace: WorkspaceInfo,
+    options?: { awaitPostRefreshSync?: boolean },
+  ) => Promise<void>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -264,6 +270,34 @@ export function registerWorkspaceRoutes(options: RegisterWorkspaceRoutesOptions)
     return resolveWorkspace(config, id);
   };
 
+  addRoute(routes, "GET", "/workspace/:id/work-context", "client", async (ctx) => {
+    const workspace = await resolveWorkspaceForRegistry(ctx.params.id);
+    return jsonResponse(await getWorkspaceWorkContext(config, workspace.id));
+  });
+
+  addRoute(routes, "PUT", "/workspace/:id/work-context", "client", async (ctx) => {
+    ensureWritable(config);
+    const workspace = await resolveWorkspaceForRegistry(ctx.params.id);
+    const body = await readJsonBody(ctx.request);
+    const parsed = workContextSchema.safeParse(body);
+    if (!parsed.success) {
+      throw new ApiError(400, "invalid_payload", "dataContext and workMode must be supported values", {
+        issues: parsed.error.issues,
+      });
+    }
+    await setWorkspaceWorkContext(config, workspace.id, parsed.data);
+    await recordAudit(workspace.path, {
+      id: shortId(),
+      workspaceId: workspace.id,
+      actor: ctx.actor ?? { type: "remote" },
+      action: "workspace.work_context.update",
+      target: "work-context",
+      summary: `Set ${parsed.data.dataContext} data context and ${parsed.data.workMode} work mode`,
+      timestamp: Date.now(),
+    });
+    return jsonResponse(parsed.data);
+  });
+
   addRoute(routes, "POST", "/workspaces/local", "host", async (ctx) => {
     ensureWritable(config);
     const body = await readJsonBody(ctx.request);
@@ -475,7 +509,7 @@ export function registerWorkspaceRoutes(options: RegisterWorkspaceRoutesOptions)
     });
     // Re-activating the already-active workspace must not dispose its engine instance; switch reloads stay (#870).
     if (!wasActive && workspace.workspaceType === "local" && resolveWorkspaceOpencodeConnection(config, workspace).baseUrl?.trim()) {
-      await reloadOpencodeEngine(config, workspace);
+      await reloadOpencodeEngine(config, workspace, { awaitPostRefreshSync: false });
     }
     return jsonResponse({ activeId: workspace.id, workspace: serializeWorkspace(workspace), persisted });
   });

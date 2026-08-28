@@ -9,6 +9,10 @@ data:
   NODE_ENV: "production"
   OPENWORK_DEV_MODE: {{ .Values.config.openworkDevMode | quote }}
   DEN_API_NODE_OPTIONS: {{ .Values.config.denApiNodeOptions | quote }}
+  # SECURITY: Enables non-local redis:// DATABASE_REDIS_URL values only for
+  # trusted private networks. Keep false for public or cross-network Redis;
+  # prefer rediss:// whenever the provider supports TLS.
+  DATABASE_REDIS_ALLOW_INSECURE_INTERNAL: {{ ternary "1" "0" .Values.redis.allowInsecureInternal | quote }}
   DB_MODE: {{ .Values.config.databaseMode | quote }}
   DEN_ORG_MODE: {{ .Values.config.tenancy.mode | quote }}
   DEN_SINGLE_ORG_NAME: {{ .Values.config.tenancy.singleOrgName | quote }}
@@ -19,25 +23,49 @@ data:
   DEN_PASSWORD_BREACH_SCREENING_ENABLED: {{ .Values.config.auth.passwordBreachScreeningEnabled | quote }}
   GITHUB_CONNECTOR_APP_ID: {{ .Values.config.githubConnector.appId | quote }}
   GITHUB_CONNECTOR_APP_CLIENT_ID: {{ .Values.config.githubConnector.clientId | quote }}
+  DEN_BASE_URL: {{ .Values.config.public.webOrigin | quote }}
+  {{ if .Values.config.public.webOrigin }}
+  # Compatibility alias for older Den builds; current den-api derives it from DEN_BASE_URL.
   BETTER_AUTH_URL: {{ .Values.config.public.webOrigin | quote }}
+  {{ end }}
+  {{ if .Values.config.public.mcpResourceUrl }}
   DEN_MCP_RESOURCE_URL: {{ .Values.config.public.mcpResourceUrl | quote }}
+  {{ end }}
   # Extra MCP resource URLs beyond the DEN_API_PUBLIC_URL API origin and web-app defaults.
   {{ if .Values.config.public.mcpAdditionalResources }}
   DEN_MCP_ADDITIONAL_RESOURCES: {{ .Values.config.public.mcpAdditionalResources | quote }}
   {{ end }}
   DEN_MCP_CLAIM_NAMESPACE: {{ .Values.config.public.mcpClaimNamespace | quote }}
+  {{ if .Values.config.public.betterAuthTrustedOrigins }}
   DEN_BETTER_AUTH_TRUSTED_ORIGINS: {{ .Values.config.public.betterAuthTrustedOrigins | quote }}
+  {{ end }}
+  {{ if .Values.config.public.betterAuthCookieDomain }}
+  DEN_BETTER_AUTH_COOKIE_DOMAIN: {{ .Values.config.public.betterAuthCookieDomain | quote }}
+  {{ end }}
+  {{ if .Values.config.public.webAppHosts }}
   DEN_WEB_APP_HOSTS: {{ .Values.config.public.webAppHosts | quote }}
+  {{ end }}
   DEN_BOOTSTRAP_ADMIN_EMAILS: {{ .Values.config.public.bootstrapAdminEmails | quote }}
   DEN_INSTALL_LINKS_GATING_ENABLED: {{ .Values.config.public.installLinksGatingEnabled | quote }}
+  DEN_AUTOMATIONS_ENABLED: {{ .Values.config.public.automationsEnabled | quote }}
+  DEN_DASHBOARDS_ENABLED: {{ .Values.config.public.dashboardsEnabled | quote }}
+  DEN_OPENWORK_WEB_ENABLED: {{ .Values.config.public.openworkWebEnabled | quote }}
+  DEN_AUTOMATIONS_RUNTIME_ENABLED: {{ .Values.config.public.automationsRuntimeEnabled | quote }}
+  DEN_GENERATED_ARTIFACT_VIEWS_ENABLED: {{ .Values.config.public.generatedArtifactViewsEnabled | quote }}
   DEN_CONNECT_LINK_MODE: {{ .Values.config.public.connectLinkMode | quote }}
   {{ if .Values.config.public.connectLinkKeyId }}
   DEN_CONNECT_LINK_KEY_ID: {{ .Values.config.public.connectLinkKeyId | quote }}
   {{ end }}
+  {{ if .Values.config.public.corsOrigins }}
   CORS_ORIGINS: {{ .Values.config.public.corsOrigins | quote }}
   DEN_CORS_ORIGINS: {{ .Values.config.public.corsOrigins | quote }}
+  {{ end }}
+  {{ if .Values.config.public.apiOrigin }}
   DEN_API_PUBLIC_URL: {{ .Values.config.public.apiOrigin | quote }}
+  {{ end }}
+  {{ if .Values.config.public.desktopDenBaseUrl }}
   DEN_DESKTOP_DEN_BASE_URL: {{ .Values.config.public.desktopDenBaseUrl | quote }}
+  {{ end }}
   {{ if .Values.config.public.installerReleaseTag }}
   OPENWORK_INSTALLER_RELEASE_TAG: {{ .Values.config.public.installerReleaseTag | quote }}
   {{ end }}

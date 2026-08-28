@@ -1,12 +1,9 @@
-import { automationsEnglish } from "./automations";
-
 /**
  * French translations (Français)
  * Professional terms (Skills, Plugins, Commands, Sessions, OpenCode, OpenPackage, OpenWork) are NOT translated
  */
 
 export default {
-  ...automationsEnglish,
   "app.compact_command_desc": "Résumez cette session pour réduire la taille du contexte.",
   "app.error_audit_load": "Échec du chargement du journal d'audit.",
   "app.error_auth_failed": "Échec de l'authentification",
@@ -636,6 +633,10 @@ export default {
   "session.redo_aria_label": "Rétablir le dernier message annulé",
   "session.redo_label": "Rétablir",
   "session.redo_title": "Rétablir le dernier message annulé",
+  "session.reverted_messages_hidden": "{count} messages précédents sont masqués",
+  "session.restore": "Restaurer",
+  "session.restoring": "Restauration...",
+  "session.restore_failed": "Impossible de restaurer les messages masqués. Réessayez.",
   "session.rename_description": "Mettez à jour le nom de cette session.",
   "session.rename_label": "Nom de la session",
   "session.rename_placeholder": "Entrez un nouveau nom",
@@ -945,14 +946,14 @@ export default {
   "settings.tab_advanced": "Avancé",
   "settings.tab_appearance": "Apparence",
   "settings.tab_cloud_account": "Account",
-  "settings.tab_cloud_marketplaces": "Marketplaces & Plugins",
+  "settings.tab_cloud_marketplaces": "Collections",
   "settings.tab_cloud_providers": "Cloud Providers",
   "settings.tab_debug": "Débogage",
   "settings.tab_description_advanced": "Inspectez la santé du runtime, l'état de connexion et les contrôles destinés aux développeurs.",
   "settings.tab_description_appearance": "Ajustez l'apparence d'OpenWork sur desktop, thème système et cadre de l'application.",
   "settings.tab_description_debug": "Consultez les diagnostics du runtime, les journaux et les utilitaires de débogage bas niveau.",
   "settings.tab_description_cloud_account": "Sign in, manage your organization, and configure your cloud connection.",
-  "settings.tab_description_cloud_marketplaces": "Browse and import plugins from your organization's marketplaces.",
+  "settings.tab_description_cloud_marketplaces": "Parcourez les collections de plugins de votre organisation et importez-les dans votre espace de travail.",
   "settings.tab_description_cloud_providers": "Consultez l'état de synchronisation des fournisseurs LLM de l'organisation.",
   "settings.tab_description_environment": "Save API keys and tokens for local agents, skills, and MCP servers. Secrets stay on this device.",
   "settings.tab_description_extensions": "Les skills, connexions et outils que votre agent peut utiliser.",
@@ -1081,7 +1082,7 @@ export default {
   "skills.share_team_uploading": "Téléversement…",
   "skills.share_team_sign_in": "Connectez-vous pour partager avec l'équipe",
   "skills.share_team_sign_in_hint": "OpenWork Cloud s'ouvre dans votre navigateur. Revenez ici après vous être connecté.",
-  "skills.share_team_uploaded_success": "Téléversé vers {org}. Il apparaîtra dans le Marketplace.",
+  "skills.share_team_uploaded_success": "Téléversé vers {org}. Il apparaîtra dans Collections.",
   "skills.share_title": "Partager le Skill",
   "skills.shown_count": "{count} affichés",
   "skills.skill_creator_already_installed": "Le créateur de Skills est déjà installé.",

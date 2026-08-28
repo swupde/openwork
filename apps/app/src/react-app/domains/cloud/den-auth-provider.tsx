@@ -25,7 +25,8 @@ import {
   type DenUser,
 } from "../../../app/lib/den";
 import { exchangeHandoffAndSignIn } from "../../../app/lib/den-handoff";
-import { readDesktopDistributionInfo } from "../../../app/lib/desktop";
+import { readOrgSelectionPending } from "../../../app/lib/den-sign-in-intent";
+import { desktopBridge, readDesktopDistributionInfo } from "../../../app/lib/desktop";
 import {
   denSessionUpdatedEvent,
   denSettingsChangedEvent,
@@ -87,6 +88,21 @@ export function hasRetainedDenSession(status: DenAuthStatus): boolean {
   return status === "signed_in" || status === "unavailable";
 }
 
+/**
+ * True while a retained session has not produced a confirmed user yet: the
+ * initial check is still running, or it failed with a transient error
+ * ("unavailable") before the first success — e.g. the control plane or a
+ * local proxy is unreachable during an app update or server restart. Account
+ * UI must show a restoring state in this window, never "Sign in".
+ */
+export function isDenSessionRestoring(input: {
+  status: DenAuthStatus;
+  hasUser: boolean;
+}): boolean {
+  if (input.status === "checking") return true;
+  return hasRetainedDenSession(input.status) && !input.hasUser;
+}
+
 export function shouldRetryDenAuthOnSignal(input: {
   status: DenAuthStatus;
   online: boolean;
@@ -101,6 +117,7 @@ export function shouldRetryDenAuthOnSignal(input: {
 export type DenAuthStore = {
   status: DenAuthStatus;
   user: DenUser | null;
+  verifiedIdentity: { principalId: string; organizationId: string } | null;
   error: string | null;
   isSignedIn: boolean;
   refresh: () => Promise<void>;
@@ -171,6 +188,11 @@ function pendingServerSwitchForDeepLink(input: {
 export function DenAuthProvider({ children }: DenAuthProviderProps) {
   const [status, setStatus] = useState<DenAuthStatus>("checking");
   const [user, setUser] = useState<DenUser | null>(null);
+  const [verifiedIdentity, setVerifiedIdentity] = useState<{
+    principalId: string;
+    organizationId: string;
+  } | null>(null);
+  const verifiedCredentialRef = useRef<{ token: string; organizationId: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
   // Monotonic token so stale async refreshes can't clobber a newer result.
   const refreshTokenRef = useRef(0);
@@ -185,16 +207,43 @@ export function DenAuthProvider({ children }: DenAuthProviderProps) {
     setStatus(nextStatus);
   }, []);
 
+  const syncDesktopSentrySession = useCallback((nextUser: DenUser | null) => {
+    if (typeof window === "undefined" || !window.__OPENWORK_ELECTRON__) return;
+    const settings = readDenSettings();
+    const userId = nextUser?.id?.trim() ?? "";
+    const orgId = settings.activeOrgId?.trim() ?? "";
+    if (!settings.authToken?.trim() || !userId || !orgId) return;
+    void desktopBridge.desktopSentrySetSession({ userId, orgId }).catch(() => undefined);
+  }, []);
+
+  const clearDesktopSentrySession = useCallback(() => {
+    if (typeof window === "undefined" || !window.__OPENWORK_ELECTRON__) return;
+    void desktopBridge.desktopSentryClearSession().catch(() => undefined);
+  }, []);
+
   const refresh = useCallback(async () => {
     const currentRun = ++refreshTokenRef.current;
     const settings = readDenSettings();
     const token = settings.authToken?.trim() ?? "";
+    const organizationId = settings.activeOrgId?.trim() ?? "";
+    const verifiedCredential = verifiedCredentialRef.current;
+
+    if (
+      !verifiedCredential
+      || verifiedCredential.token !== token
+      || verifiedCredential.organizationId !== organizationId
+    ) {
+      verifiedCredentialRef.current = null;
+      setVerifiedIdentity(null);
+    }
 
     if (!token) {
       setUser(null);
+      setVerifiedIdentity(null);
       setError(null);
       lastSignalRetryAtRef.current = null;
       updateStatus("signed_out");
+      clearDesktopSentrySession();
       return;
     }
 
@@ -213,19 +262,36 @@ export function DenAuthProvider({ children }: DenAuthProviderProps) {
 
       if (currentRun !== refreshTokenRef.current) return;
 
-      await resolveDenActiveOrganizationWithRetry(() =>
-        ensureDenActiveOrganization({
-          forceServerSync:
-            !settings.activeOrgId?.trim() || !settings.activeOrgSlug?.trim(),
-        })
-      );
+      // While a desktop-initiated sign-in is waiting for the user's explicit
+      // organization choice, do not auto-resolve a default — that would
+      // silently commit an org the chooser is still asking about.
+      if (!readOrgSelectionPending().pending) {
+        await resolveDenActiveOrganizationWithRetry(() =>
+          ensureDenActiveOrganization({
+            forceServerSync:
+              !settings.activeOrgId?.trim() || !settings.activeOrgSlug?.trim(),
+          })
+        );
+      }
 
       if (currentRun !== refreshTokenRef.current) return;
 
+      const confirmedSettings = readDenSettings();
+      const confirmedToken = confirmedSettings.authToken?.trim() ?? "";
+      const confirmedOrganizationId = confirmedSettings.activeOrgId?.trim() ?? "";
+      const principalId = nextUser.id.trim();
+      if (confirmedToken === token && principalId && confirmedOrganizationId) {
+        verifiedCredentialRef.current = { token, organizationId: confirmedOrganizationId };
+        setVerifiedIdentity({ principalId, organizationId: confirmedOrganizationId });
+      } else {
+        verifiedCredentialRef.current = null;
+        setVerifiedIdentity(null);
+      }
       setUser(nextUser);
       setError(null);
       lastSignalRetryAtRef.current = null;
       updateStatus("signed_in");
+      syncDesktopSentrySession(nextUser);
     } catch (nextError) {
       if (currentRun !== refreshTokenRef.current) return;
 
@@ -233,7 +299,10 @@ export function DenAuthProvider({ children }: DenAuthProviderProps) {
       if (failureStatus === "signed_out") {
         clearDenSession();
         setUser(null);
+        verifiedCredentialRef.current = null;
+        setVerifiedIdentity(null);
         lastSignalRetryAtRef.current = null;
+        clearDesktopSentrySession();
       }
 
       setError(
@@ -243,7 +312,7 @@ export function DenAuthProvider({ children }: DenAuthProviderProps) {
       );
       updateStatus(failureStatus);
     }
-  }, [updateStatus]);
+  }, [clearDesktopSentrySession, syncDesktopSentrySession, updateStatus]);
 
   useEffect(() => {
     void refresh();
@@ -255,10 +324,26 @@ export function DenAuthProvider({ children }: DenAuthProviderProps) {
     };
 
     window.addEventListener(denSessionUpdatedEvent, handleSessionUpdated);
+    window.addEventListener(denSettingsChangedEvent, handleSessionUpdated);
     return () => {
       window.removeEventListener(denSessionUpdatedEvent, handleSessionUpdated);
+      window.removeEventListener(denSettingsChangedEvent, handleSessionUpdated);
     };
   }, [refresh]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!window.__OPENWORK_ELECTRON__) return;
+
+    if (status === "signed_out") return clearDesktopSentrySession();
+
+    const settings = readDenSettings();
+    const userId = user?.id?.trim() ?? "";
+    const orgId = settings.activeOrgId?.trim() ?? "";
+    if (!hasRetainedDenSession(status) || !userId || !orgId || !settings.authToken?.trim()) return;
+
+    syncDesktopSentrySession(user);
+  }, [clearDesktopSentrySession, status, syncDesktopSentrySession, user, user?.id]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -292,9 +377,11 @@ export function DenAuthProvider({ children }: DenAuthProviderProps) {
     );
     // A signed-in session without an organization is a stranded first
     // sign-in (e.g. org discovery was rate limited during a handoff). Keep
-    // repairing in the background until an organization resolves.
+    // repairing in the background until an organization resolves — unless the
+    // missing org is deliberate because the chooser is waiting for the user.
     const repairMissingOrganization = () => {
       if (statusRef.current !== "signed_in") return;
+      if (readOrgSelectionPending().pending) return;
       const settings = readDenSettings();
       if (!settings.authToken?.trim() || settings.activeOrgId?.trim()) return;
       void resolveDenActiveOrganizationWithRetry(() =>
@@ -453,11 +540,12 @@ export function DenAuthProvider({ children }: DenAuthProviderProps) {
     () => ({
       status,
       user,
+      verifiedIdentity,
       error,
       isSignedIn: hasRetainedDenSession(status),
       refresh,
     }),
-    [error, refresh, status, user],
+    [error, refresh, status, user, verifiedIdentity],
   );
 
   return (

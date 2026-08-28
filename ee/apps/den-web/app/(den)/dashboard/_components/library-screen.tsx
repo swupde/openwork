@@ -12,7 +12,7 @@ import { DenInput } from "../../_components/ui/input";
 import { DenList, DenListRow } from "../../_components/ui/list-row";
 import { DenNotice } from "../../_components/ui/notice";
 import { type TabItem, UnderlineTabs } from "../../_components/ui/tabs";
-import { getOrgAccessFlags, getPluginRoute, getYourConnectionsRoute } from "../../_lib/den-org";
+import { getLibraryPluginRoute, getYourConnectionsRoute } from "../../_lib/den-org";
 import { useOrgDashboard } from "../_providers/org-dashboard-provider";
 import {
   type LibraryConnectionItem,
@@ -23,12 +23,13 @@ import {
 
 type LibraryStateTab = "all" | "needs_signin" | "needs_admin_setup" | "ready";
 type LibrarySectionState = Exclude<LibraryStateTab, "all">;
-type KindFilter = "all" | "connections" | "skills" | "mcps" | "plugins";
+type KindFilter = "all" | "workflows" | "connections" | "skills" | "mcps" | "plugins";
 type FromFilter = "anyone" | "mine" | "shared" | "team" | "everyone";
-type RowKind = "connection" | "skill" | "plugin";
+type RowKind = "workflow" | "connection" | "skill" | "plugin";
 
 const KIND_FILTERS: readonly { value: KindFilter; label: string }[] = [
   { value: "all", label: "All kinds" },
+  { value: "workflows", label: "Workflows" },
   { value: "connections", label: "Connections" },
   { value: "skills", label: "Skills" },
   { value: "mcps", label: "MCPs" },
@@ -57,12 +58,13 @@ function matchesFrom(item: LibraryItem, from: FromFilter): boolean {
   return item.edges.some((edge) => edge.kind === "org_wide" || edge.kind === "catalog");
 }
 
-function hasComponentKind(item: LibraryPluginItem, kind: "skill" | "mcp"): boolean {
+function hasComponentKind(item: LibraryPluginItem, kind: "app" | "skill" | "mcp"): boolean {
   return item.componentKinds.some((componentKind) => componentKind.toLowerCase() === kind);
 }
 
 function matchesKind(item: LibraryItem, kind: KindFilter): boolean {
   if (kind === "all") return true;
+  if (kind === "workflows") return item.type === "workflow";
   if (kind === "connections") return item.type === "connection";
   if (kind === "plugins") return item.type === "plugin";
   if (kind === "skills") return item.type === "plugin" && hasComponentKind(item, "skill");
@@ -73,6 +75,8 @@ function matchesKind(item: LibraryItem, kind: KindFilter): boolean {
 function getSectionState(item: LibraryItem): LibrarySectionState {
   if (item.type === "connection" && item.state === "needs_signin") return "needs_signin";
   if (item.type === "connection" && item.state === "needs_admin_setup") return "needs_admin_setup";
+  if (item.type === "workflow" && item.state === "needs_signin") return "needs_signin";
+  if (item.type === "workflow" && item.state === "needs_admin_setup") return "needs_admin_setup";
   return "ready";
 }
 
@@ -81,11 +85,13 @@ function matchesState(item: LibraryItem, state: LibraryStateTab): boolean {
 }
 
 function getRowKind(item: LibraryItem): RowKind {
+  if (item.type === "workflow") return "workflow";
   if (item.type === "connection") return "connection";
   return hasComponentKind(item, "skill") ? "skill" : "plugin";
 }
 
 function getKindLabel(kind: RowKind): string {
+  if (kind === "workflow") return "Workflow";
   if (kind === "skill") return "Skill";
   if (kind === "plugin") return "Plugin";
   return "Connection";
@@ -93,7 +99,7 @@ function getKindLabel(kind: RowKind): string {
 
 function KindChip({ kind }: { kind: RowKind }) {
   return (
-    <DenChip data-library-chip="" tone={kind === "connection" ? "info" : "neutral"}>
+    <DenChip data-library-chip="" tone={kind === "connection" ? "info" : kind === "workflow" ? "teal" : "neutral"}>
       {getKindLabel(kind)}
     </DenChip>
   );
@@ -165,7 +171,7 @@ function getGitHubOwnerAvatar(sourceRepositoryUrl: string | null): string | unde
   }
 }
 
-function LibraryRow({ item, isAdmin, isFocused, orgName, orgSlug }: { item: LibraryItem; isAdmin: boolean; isFocused: boolean; orgName: string; orgSlug: string | null }) {
+function LibraryRow({ item, isFocused, orgName, orgSlug }: { item: LibraryItem; isFocused: boolean; orgName: string; orgSlug: string | null }) {
   const sectionState = getSectionState(item);
   const rowKind = getRowKind(item);
   const source = getSource(item, orgName);
@@ -173,7 +179,13 @@ function LibraryRow({ item, isAdmin, isFocused, orgName, orgSlug }: { item: Libr
   const connectionHref = item.type === "connection"
     ? `${getYourConnectionsRoute(orgSlug)}?connectionId=${encodeURIComponent(item.id)}`
     : undefined;
-  const rowHref = item.type === "plugin" && isAdmin ? getPluginRoute(orgSlug, item.id) : undefined;
+  const rowHref = item.type === "workflow"
+    ? `/dashboard/library/workflows/${encodeURIComponent(item.id)}`
+    : item.type === "plugin"
+      ? getLibraryPluginRoute(orgSlug, item.id)
+      : item.type === "connection"
+        ? connectionHref
+        : undefined;
   const iconUrl = item.type === "connection" && item.provider === "google-workspace"
     ? "/integrations/google.svg"
     : item.type === "plugin"
@@ -216,6 +228,16 @@ function LibraryRow({ item, isAdmin, isFocused, orgName, orgSlug }: { item: Libr
         <>
           <KindChip kind={rowKind} />
           {item.type === "connection" ? <TransportChip transport={item.transport} /> : null}
+          {item.type === "workflow" ? (
+            <>
+              <DenChip data-library-chip="" tone={item.resultState === "fresh" ? "success" : item.resultState === "needs_attention" ? "danger" : "warning"}>
+                {item.resultState.replace("_", " ")}
+              </DenChip>
+              <DenChip data-library-chip="" tone={item.viewState === "custom_active" ? "info" : item.viewState === "build_failed" ? "danger" : "neutral"}>
+                {item.viewState === "custom_active" ? item.activeViewTitle ?? "Custom view" : item.viewState.replace("_", " ")}
+              </DenChip>
+            </>
+          ) : null}
           {sectionState !== "ready" ? (
             <DenChip data-library-chip="" tone="warning">
               {sectionState === "needs_signin" ? "Connect your account" : "Waiting on your admin"}
@@ -228,9 +250,15 @@ function LibraryRow({ item, isAdmin, isFocused, orgName, orgSlug }: { item: Libr
           ) : null}
         </>
       )}
-      meta={item.description || nonPersonSource ? (
+      meta={item.description || nonPersonSource || item.type === "workflow" ? (
         <>
           {item.description}
+          {item.type === "workflow" ? (
+            <>
+              {item.description ? <span aria-hidden> · </span> : null}
+              <span>{item.plugin ? `Plugin ${item.plugin.name} · ` : ""}{item.latestSuccessfulAt ? `Last run ${new Date(item.latestSuccessfulAt).toLocaleString()}` : "Not run yet"} · {item.automationCount} Automation{item.automationCount === 1 ? "" : "s"}</span>
+            </>
+          ) : null}
           {nonPersonSource ? (
             <>
               {item.description ? <span aria-hidden> · </span> : null}
@@ -244,7 +272,7 @@ function LibraryRow({ item, isAdmin, isFocused, orgName, orgSlug }: { item: Libr
       focused={isFocused}
       dataAttributes={{
         "data-library-item-type": item.type,
-        "data-library-item-state": item.type === "connection" ? item.state : undefined,
+        "data-library-item-state": item.type === "connection" || item.type === "workflow" ? item.state : undefined,
         "data-library-item-key": rowKey,
         "data-library-focused": isFocused ? "" : undefined,
       }}
@@ -261,7 +289,6 @@ function LibrarySection({
   state,
   items,
   expanded,
-  isAdmin,
   orgName,
   orgSlug,
   focusedKey,
@@ -270,7 +297,6 @@ function LibrarySection({
   state: LibrarySectionState;
   items: LibraryItem[];
   expanded: boolean;
-  isAdmin: boolean;
   orgName: string;
   orgSlug: string | null;
   focusedKey: string | null;
@@ -299,7 +325,6 @@ function LibrarySection({
             <LibraryRow
               key={`${item.type}-${item.id}`}
               item={item}
-              isAdmin={isAdmin}
               isFocused={focusedKey === `${item.type}-${item.id}`}
               orgName={orgName}
               orgSlug={orgSlug}
@@ -335,17 +360,12 @@ export function LibraryScreen() {
     needs_admin_setup: false,
     ready: false,
   });
-  const access = getOrgAccessFlags(
-    orgContext?.currentMember.role ?? "member",
-    orgContext?.currentMember.isOwner ?? false,
-    orgContext?.roles,
-  );
   const orgName = orgContext?.organization.name ?? "your organization";
   const requestedFocus = searchParams.get("focus");
 
   useEffect(() => {
     if (!requestedFocus || handledFocusRef.current === requestedFocus) return;
-    if (!/^(plugin|connection)-.+$/.test(requestedFocus)) return;
+    if (!/^(workflow|plugin|connection)-.+$/.test(requestedFocus)) return;
     const item = items.find((candidate) => `${candidate.type}-${candidate.id}` === requestedFocus);
     if (!item) return;
     handledFocusRef.current = requestedFocus;
@@ -369,12 +389,14 @@ export function LibraryScreen() {
   const normalizedQuery = query.trim().toLowerCase();
   const kindCounts = useMemo(() => {
     const counts: Record<Exclude<KindFilter, "all">, number> = {
+      workflows: 0,
       connections: 0,
       skills: 0,
       mcps: 0,
       plugins: 0,
     };
     for (const item of items) {
+      if (matchesKind(item, "workflows")) counts.workflows += 1;
       if (matchesKind(item, "connections")) counts.connections += 1;
       if (matchesKind(item, "skills")) counts.skills += 1;
       if (matchesKind(item, "mcps")) counts.mcps += 1;
@@ -447,13 +469,7 @@ export function LibraryScreen() {
   return (
     <DashboardPageTemplate
       icon={LibraryBig}
-      badgeLabel="Member library"
-      badgeCompanion={(
-        <DenChip tone="success">
-          {stateCounts.ready} ready to use
-        </DenChip>
-      )}
-      title="Library"
+      title="My Library"
       description="Everything you can use in chat — yours, shared with you, from your teams, and org-wide."
       descriptionPlacement="hero"
       colors={["#DBEAFE", "#1E3A8A", "#2563EB", "#A7F3D0"]}
@@ -545,7 +561,6 @@ export function LibraryScreen() {
                 state={state}
                 items={sectionItems[state]}
                 expanded={expandedSections[state]}
-                isAdmin={access.isAdmin}
                 orgName={orgName}
                 orgSlug={orgSlug}
                 focusedKey={focusedKey}

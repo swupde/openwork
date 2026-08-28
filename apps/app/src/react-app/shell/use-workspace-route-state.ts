@@ -6,7 +6,7 @@
 // session-route.tsx as the final step of its decomposition; the route keeps
 // composition, handlers, and JSX.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useLocation, useNavigate, useParams } from "react-router-dom";
+import { useLocation, useNavigate, useParams } from "react-router";
 import type { Session } from "@opencode-ai/sdk/v2/client";
 
 import {
@@ -17,6 +17,8 @@ import {
 import {
   resolveWorkspaceListSelectedId,
   workspaceBootstrap,
+  workspaceSetRuntimeActive,
+  workspaceSetSelected,
   type OpenworkServerInfo,
   type WorkspaceList,
 } from "@/app/lib/desktop";
@@ -40,15 +42,25 @@ import {
 import { useLocal } from "@/react-app/kernel/local-provider";
 import { useDenAuth } from "@/react-app/domains/cloud/den-auth-provider";
 import { useBootState } from "./boot-state";
-import { ensureDesktopLocalOpenworkConnection } from "./desktop-local-openwork";
+import {
+  ensureDesktopLocalOpenworkConnection,
+  shouldAttemptDesktopLocalReconnect,
+} from "./desktop-local-openwork";
 import { resolveOpenworkConnection } from "./openwork-connection";
+import {
+  commitRouteWorkspaceSelection,
+  createRouteRefreshLifecycle,
+  mapRouteWorkspaceLoads,
+  planRouteConnectionGap,
+  planRouteWorkspaceLoads,
+  routeWorkspaceSelectionCommitter,
+} from "./route-refresh-control";
 import {
   classifyRouteSessionReadError,
   describeRouteError,
-  isTransientStartupError,
   mapDesktopWorkspace,
-  orderRouteWorkspaces,
   refreshRouteWorkspaceListState,
+  stabilizeRouteWorkspaceOrder,
   type RouteSession,
   type RouteWorkspace,
 } from "./route-workspaces";
@@ -56,6 +68,7 @@ import {
   readActiveWorkspaceId,
   readWorkspaceOrderIds,
   writeActiveWorkspaceId,
+  writeWorkspaceOrderIds,
 } from "./session-memory";
 import {
   legacySessionRoute,
@@ -64,13 +77,14 @@ import {
   removeWorkspaceRouteSession,
   sessionIdForLegacyWorkspaceInference,
   automationsRoute,
+  dashboardRoute,
   workspaceExtensionsRoute,
   workspaceSessionRoute,
 } from "./workspace-routes";
 
 export type UseWorkspaceRouteStateInput = {
   developerMode: boolean;
-  workspaceRoute?: "session" | "automations";
+  workspaceRoute?: "session" | "automations" | "dashboard";
   /** Invoked when the openwork-server settings-changed event fires (the route bumps its settings version). */
   onServerSettingsChanged: () => void;
   /** Receives the local openwork-server host info discovered during refresh. */
@@ -85,6 +99,7 @@ type ModernRouteSessionResolution =
  * bridge or unresponsive server otherwise leaves `loading` true forever,
  * which the session pane renders as an indefinite loading state. */
 const ROUTE_REFRESH_STEP_TIMEOUT_MS = 15_000;
+const ROUTE_WORKSPACE_ACTIVATION_SETTLE_MS = 750;
 
 function withRouteRefreshTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -122,6 +137,11 @@ export function useWorkspaceRouteState(input: UseWorkspaceRouteStateInput) {
       .replace(/^\/+|\/+$/g, "")
     : "";
   const workspaceInferenceSessionId = sessionIdForLegacyWorkspaceInference(routeWorkspaceId, selectedSessionId);
+  const legacyWorkspaceInferenceKey = routeWorkspaceId ? "" : workspaceInferenceSessionId;
+  const routeWorkspaceIdRef = useRef(routeWorkspaceId);
+  routeWorkspaceIdRef.current = routeWorkspaceId;
+  const workspaceInferenceSessionIdRef = useRef(workspaceInferenceSessionId);
+  workspaceInferenceSessionIdRef.current = workspaceInferenceSessionId;
   const navigateToWorkspaceSession = useCallback((workspaceId: string, sessionId?: string | null, options?: { replace?: boolean }) => {
     const id = workspaceId.trim();
     if (!id) {
@@ -140,10 +160,19 @@ export function useWorkspaceRouteState(input: UseWorkspaceRouteStateInput) {
       navigate(automationsRoute(), options);
       return;
     }
+    if (workspaceRoute === "dashboard") {
+      if (/^\/dashboard(?:\/|$)/.test(location.pathname)) return;
+      navigate(dashboardRoute(), options);
+      return;
+    }
     navigateToWorkspaceSession(workspaceId, sessionId, options);
   }, [extensionsRouteActive, extensionsRoutePath, location.pathname, navigate, navigateToWorkspaceSession, workspaceRoute]);
 
-  const { markRouteReady: markBootRouteReady } = useBootState();
+  const {
+    markRouteReady: markBootRouteReady,
+    phase: bootPhase,
+    routeReady: bootRouteReady,
+  } = useBootState();
   const [loading, setLoading] = useState(true);
   const [client, setClient] = useState<OpenworkServerClient | null>(null);
   const [baseUrl, setBaseUrl] = useState("");
@@ -154,6 +183,10 @@ export function useWorkspaceRouteState(input: UseWorkspaceRouteStateInput) {
   const [errorsByWorkspaceId, setErrorsByWorkspaceId] = useState<Record<string, string | null>>({});
   const [workspaceConnectionOverrides, setWorkspaceConnectionOverrides] = useState<Record<string, WorkspaceConnectionState>>({});
   const [routeError, setRouteError] = useState<string | null>(null);
+  // True while the desktop local server has not (re)published a usable base
+  // URL/token — a restart or boot gap. The route retains its last usable
+  // connection state during this window instead of clearing it.
+  const [connectionPending, setConnectionPending] = useState(false);
   const [modernRouteSessionResolution, setModernRouteSessionResolution] = useState<ModernRouteSessionResolution | null>(null);
   const [routeRefreshVersion, setRouteRefreshVersion] = useState(0);
   const [legacySelectedWorkspaceId, setLegacySelectedWorkspaceId] = useState<string>(() => readActiveWorkspaceId() ?? "");
@@ -187,7 +220,7 @@ export function useWorkspaceRouteState(input: UseWorkspaceRouteStateInput) {
       workspaceServerClientResolverRef.current(workspace),
     [],
   );
-  const refreshInFlightRef = useRef(false);
+  const refreshLifecycleRef = useRef(createRouteRefreshLifecycle());
   const workspacesRef = useRef<RouteWorkspace[]>([]);
   const workspaceOrderIdsRef = useRef(workspaceOrderIds);
   const remoteWorkspaceCheckRunRef = useRef<Record<string, string>>({});
@@ -197,9 +230,25 @@ export function useWorkspaceRouteState(input: UseWorkspaceRouteStateInput) {
   const hydratedRouteSessionIdsRef = useRef<Record<string, string>>({});
   const startupRetryTimerRef = useRef<number | null>(null);
   const [retryingWorkspaceIds, setRetryingWorkspaceIds] = useState<string[]>([]);
-  const launchActivatedWorkspaceIdsRef = useRef(new Set<string>());
   const reconnectAttemptedWorkspaceIdRef = useRef("");
   const backgroundSessionLoadInFlight = useRef<Map<string, number>>(new Map());
+  const loadedWorkspaceIdsRef = useRef(new Set<string>());
+  const serverActiveWorkspaceIdRef = useRef("");
+  const workspaceSelectionCommitTimerRef = useRef<number | null>(null);
+  const commitStableWorkspaceOrder = useCallback((nextWorkspaces: RouteWorkspace[]) => {
+    const currentOrderIds = workspaceOrderIdsRef.current;
+    const stable = stabilizeRouteWorkspaceOrder(nextWorkspaces, currentOrderIds);
+    const orderChanged = stable.orderIds.length !== currentOrderIds.length
+      || stable.orderIds.some((id, index) => id !== currentOrderIds[index]);
+
+    if (orderChanged) {
+      workspaceOrderIdsRef.current = stable.orderIds;
+      setWorkspaceOrderIds(stable.orderIds);
+      writeWorkspaceOrderIds(stable.orderIds);
+    }
+
+    return stable.workspaces;
+  }, []);
   const rememberPendingCreatedSession = useCallback((workspaceId: string, sessionId: string) => {
     const id = sessionId.trim();
     if (!workspaceId || !id) return;
@@ -307,6 +356,7 @@ export function useWorkspaceRouteState(input: UseWorkspaceRouteStateInput) {
             sessionsByWorkspaceIdRef.current = next;
             return next;
           });
+          loadedWorkspaceIdsRef.current.add(workspace.id);
           setErrorsByWorkspaceId((current) => ({ ...current, [workspace.id]: null }));
           setWorkspaceConnectionOverrides((current) => {
             if (isRemoteOpenworkWorkspace) {
@@ -348,7 +398,7 @@ export function useWorkspaceRouteState(input: UseWorkspaceRouteStateInput) {
           // or run out of attempts — the sidebar keeps its "loading" state
           // in the meantime instead of flashing "error" next to the
           // workspace name.
-          if (attempt + 1 < MAX_ATTEMPTS && isTransientStartupError(message)) {
+          if (attempt + 1 < MAX_ATTEMPTS && classifyRouteSessionReadError(error) === "retryable") {
             if (backgroundSessionLoadInFlight.current.get(workspace.id) === requestStartedAt) {
               backgroundSessionLoadInFlight.current.delete(workspace.id);
             }
@@ -381,18 +431,38 @@ export function useWorkspaceRouteState(input: UseWorkspaceRouteStateInput) {
         }
       };
 
-      await Promise.all(workspaces.map((workspace) => fetchOnce(workspace, 0)));
+      await mapRouteWorkspaceLoads(workspaces, (workspace) => fetchOnce(workspace, 0));
     },
     [endpointForWorkspace, mergeFetchedSessionsWithPending],
   );
+  const workspaceSelectionCommitRef = useRef<(workspaceId: string) => Promise<void>>(async () => undefined);
+  workspaceSelectionCommitRef.current = async (workspaceId) => {
+    await commitRouteWorkspaceSelection({
+      workspaceId,
+      desktopRuntime: isDesktopRuntime(),
+      setDesktopSelected: workspaceSetSelected,
+      setDesktopRuntimeActive: workspaceSetRuntimeActive,
+      activateWorkspace: async (selectedId) => {
+        const workspace = workspacesRef.current.find((item) => item.id === selectedId) ?? null;
+        const endpoint = endpointForWorkspace(workspace);
+        if (!endpoint) throw new Error(`Workspace endpoint unavailable for ${selectedId}.`);
+        if (workspace?.workspaceType === "local" && serverActiveWorkspaceIdRef.current === selectedId) return;
+        await endpoint.client.activateWorkspace(endpoint.workspaceId, { persist: true });
+        if (workspace?.workspaceType === "local") serverActiveWorkspaceIdRef.current = selectedId;
+      },
+    });
+  };
 
-  const refreshRouteState = useCallback(async () => {
+  const refreshRouteState = useCallback(async (options?: { supersede?: boolean }) => {
     // Dedupe: if a refresh is already running, skip this call. Fast workspace
     // switches used to fire 5-6 overlapping refreshRouteState() calls which
     // each fetched workspaces + sessions for every workspace. That workload
     // multiplied quickly on the event loop and caused the UI to freeze.
-    if (refreshInFlightRef.current) return;
-    refreshInFlightRef.current = true;
+    // Callers reacting to changed connection info pass `supersede` instead of
+    // resetting the in-flight guard: the running attempt goes stale (its
+    // remaining writes are discarded) rather than racing the new one.
+    const attempt = refreshLifecycleRef.current.begin(options);
+    if (!attempt) return;
     setLoading(true);
     setRouteError(null);
     let desktopList: WorkspaceList | null = null;
@@ -414,13 +484,42 @@ export function useWorkspaceRouteState(input: UseWorkspaceRouteStateInput) {
           desktopWorkspaces = workspacesRef.current;
         }
       }
+      if (!attempt.isCurrent()) return;
 
       const { normalizedBaseUrl, resolvedToken, resolvedHostToken, hostInfo } = await withRouteRefreshTimeout(
         resolveOpenworkConnection(),
         "OpenWork server connection",
       );
-      onHostInfo(hostInfo);
+      if (!attempt.isCurrent()) return;
       if (!normalizedBaseUrl || !resolvedToken) {
+        const gapPlan = planRouteConnectionGap({ desktopRuntime: isDesktopRuntime() });
+        routeReadyAfterRefresh = gapPlan.markRouteReady;
+        if (gapPlan.retainExistingState) {
+          // Transient desktop gap: the local server is booting or restarting
+          // (app update, remote-access toggle, slow cold start) and has not
+          // republished its ephemeral base URL/tokens yet. Retain the
+          // workspaces, session lists, and host info as display state, but
+          // quarantine the live connection: the previous loopback port is no
+          // longer owned by our server, and a request there would hand the
+          // stale bearer token to whatever process binds the freed port.
+          // Boot or the reconnect effect publishes fresh info and supersedes
+          // this refresh. Only seed workspaces when the route has none so a
+          // fresh renderer still shows the sidebar under the boot overlay.
+          setConnectionPending(true);
+          updateLocalServer({ baseUrl: "", token: "" });
+          setClient(null);
+          setBaseUrl("");
+          setToken("");
+          if (workspacesRef.current.length === 0 && desktopWorkspaces.length > 0) {
+            const orderedDesktopWorkspaces = commitStableWorkspaceOrder(desktopWorkspaces);
+            setWorkspaces(orderedDesktopWorkspaces);
+            setLegacySelectedWorkspaceId(
+              (current) => current || resolveWorkspaceListSelectedId(desktopList) || orderedDesktopWorkspaces[0]?.id || "",
+            );
+          }
+          return;
+        }
+        onHostInfo(hostInfo);
         // Keep the workspace endpoint resolver in lockstep with the disconnected state.
         // Otherwise a previously-cached baseUrl/token would still resolve a
         // (now invalid) endpoint for any callback that consults the resolver ref.
@@ -428,7 +527,7 @@ export function useWorkspaceRouteState(input: UseWorkspaceRouteStateInput) {
         setClient(null);
         setBaseUrl("");
         setToken("");
-        const orderedDesktopWorkspaces = orderRouteWorkspaces(desktopWorkspaces, workspaceOrderIdsRef.current);
+        const orderedDesktopWorkspaces = commitStableWorkspaceOrder(desktopWorkspaces);
         setWorkspaces(orderedDesktopWorkspaces);
         sessionsByWorkspaceIdRef.current = {};
         setSessionsByWorkspaceId({});
@@ -436,16 +535,16 @@ export function useWorkspaceRouteState(input: UseWorkspaceRouteStateInput) {
         setLegacySelectedWorkspaceId(resolveWorkspaceListSelectedId(desktopList) || orderedDesktopWorkspaces[0]?.id || "");
         return;
       }
+      onHostInfo(hostInfo);
 
       // Update the local-server resolver synchronously, BEFORE we kick off any
       // workspace-scoped requests below. `endpointForWorkspace` reads from
       // this resolver synchronously; the render that mirrors `[baseUrl,
       // token]` into the resolver doesn't run until after the next React commit,
-      // which is too late for the `activateWorkspace` and
-      // `loadWorkspaceSessionsInBackground` calls that fire later in this
-      // function. Stale ref => `resolveWorkspaceEndpoint` returns null for
+      // which is too late for the `loadWorkspaceSessionsInBackground` call
+      // later in this function. Stale ref => `resolveWorkspaceEndpoint` returns null for
       // local workspaces => sidebar gets stuck in "loading" forever.
-      const routeWorkspaceServerClientResolver = updateLocalServer({ baseUrl: normalizedBaseUrl, token: resolvedToken });
+      updateLocalServer({ baseUrl: normalizedBaseUrl, token: resolvedToken });
 
       const openworkClient = createOpenworkServerClient({
         baseUrl: normalizedBaseUrl,
@@ -459,6 +558,7 @@ export function useWorkspaceRouteState(input: UseWorkspaceRouteStateInput) {
         orderIds: workspaceOrderIdsRef.current,
         retryDelaysMs: [250, 750, 1_500],
       });
+      if (!attempt.isCurrent()) return;
       if (!workspaceListState.usable || workspaceListState.error) {
         const message = workspaceListState.error
           ? describeRouteError(workspaceListState.error)
@@ -471,11 +571,12 @@ export function useWorkspaceRouteState(input: UseWorkspaceRouteStateInput) {
         });
         setRouteError(message);
       }
-      const nextWorkspaces = workspaceListState.workspaces;
+      const nextWorkspaces = commitStableWorkspaceOrder(workspaceListState.workspaces);
+      serverActiveWorkspaceIdRef.current = workspaceListState.activeId ?? "";
 
       // Preserve any sessions we already have cached so switching routes
       // doesn't erase the sidebar while we refetch.
-      const alreadyLoadedWorkspaceIds = new Set(Object.keys(sessionsByWorkspaceIdRef.current));
+      const alreadyLoadedWorkspaceIds = new Set(loadedWorkspaceIdsRef.current);
       const cachedEntries = nextWorkspaces.map((workspace) => ({
         workspaceId: workspace.id,
         sessions: sessionsByWorkspaceIdRef.current[workspace.id] ?? [],
@@ -485,8 +586,8 @@ export function useWorkspaceRouteState(input: UseWorkspaceRouteStateInput) {
       // activeId, the server's activeId, then the first known workspace.
       const persistedActiveId = readActiveWorkspaceId();
       let nextWorkspaceId =
-        (routeWorkspaceId && nextWorkspaces.some((w) => w.id === routeWorkspaceId)
-          ? routeWorkspaceId
+        (routeWorkspaceIdRef.current && nextWorkspaces.some((w) => w.id === routeWorkspaceIdRef.current)
+          ? routeWorkspaceIdRef.current
           : "") ||
         (persistedActiveId && nextWorkspaces.some((w) => w.id === persistedActiveId)
           ? persistedActiveId
@@ -495,15 +596,21 @@ export function useWorkspaceRouteState(input: UseWorkspaceRouteStateInput) {
         workspaceListState.activeId ||
         nextWorkspaces[0]?.id ||
         "";
-      if (workspaceInferenceSessionId) {
+      if (workspaceInferenceSessionIdRef.current) {
         const match = cachedEntries.find((entry) =>
-          entry.sessions.some((session) => session?.id === workspaceInferenceSessionId),
+          entry.sessions.some((session) => session?.id === workspaceInferenceSessionIdRef.current),
         );
         if (match?.workspaceId) nextWorkspaceId = match.workspaceId;
       }
+      const backgroundWorkspaceIds = planRouteWorkspaceLoads(
+        nextWorkspaces.map((workspace) => workspace.id),
+        nextWorkspaceId,
+        alreadyLoadedWorkspaceIds,
+      );
 
       updateLocalServer({ baseUrl: normalizedBaseUrl, token: resolvedToken });
 
+      setConnectionPending(false);
       setClient(openworkClient);
       setBaseUrl(normalizedBaseUrl);
       setToken(resolvedToken);
@@ -518,28 +625,9 @@ export function useWorkspaceRouteState(input: UseWorkspaceRouteStateInput) {
         }
         return next;
       });
-      setRetryingWorkspaceIds(
-        cachedEntries.flatMap((entry) =>
-          entry.sessions.length === 0 &&
-          (entry.workspaceId === nextWorkspaceId || !alreadyLoadedWorkspaceIds.has(entry.workspaceId))
-            ? [entry.workspaceId]
-            : [],
-        ),
-      );
+      setRetryingWorkspaceIds(backgroundWorkspaceIds);
       setLegacySelectedWorkspaceId(nextWorkspaceId);
       writeActiveWorkspaceId(nextWorkspaceId || null);
-      // Mark the chosen workspace as active on the server so that the
-      // OpenCode engine bound to it re-reads opencode.jsonc and applies
-      // permissions. Fire-and-forget; the route is idempotent and any
-      // transport failure is non-fatal. See issue #870.
-      if (nextWorkspaceId && workspaceListState.activeId !== nextWorkspaceId && !launchActivatedWorkspaceIdsRef.current.has(nextWorkspaceId)) {
-        launchActivatedWorkspaceIdsRef.current.add(nextWorkspaceId);
-        const nextWorkspace = nextWorkspaces.find((workspace) => workspace.id === nextWorkspaceId) ?? null;
-        const nextEndpoint = routeWorkspaceServerClientResolver(nextWorkspace);
-        if (nextEndpoint) {
-          void nextEndpoint.client.activateWorkspace(nextEndpoint.workspaceId).catch(() => undefined);
-        }
-      }
       recordInspectorEvent("route.refresh.complete", {
         workspaces: nextWorkspaces.length,
         selectedWorkspaceId: nextWorkspaceId,
@@ -550,17 +638,12 @@ export function useWorkspaceRouteState(input: UseWorkspaceRouteStateInput) {
       // boot. Kick it off in the background instead of blocking the route
       // so the UI is interactive immediately; the sidebar shows a
       // loading state per-workspace until the list arrives.
-      const selectedWorkspace = nextWorkspaces.find((workspace) => workspace.id === nextWorkspaceId);
-      const backgroundWorkspaces = nextWorkspaces.filter(
-        (workspace) => workspace.id === nextWorkspaceId || !alreadyLoadedWorkspaceIds.has(workspace.id),
-      );
+      const backgroundWorkspaces = nextWorkspaces.filter((workspace) => backgroundWorkspaceIds.includes(workspace.id));
       if (backgroundWorkspaces.length > 0) {
-        const orderedWorkspaces = selectedWorkspace
-          ? [selectedWorkspace, ...backgroundWorkspaces.filter((workspace) => workspace.id !== selectedWorkspace.id)]
-          : backgroundWorkspaces;
-        void loadWorkspaceSessionsInBackground(orderedWorkspaces);
+        void loadWorkspaceSessionsInBackground(backgroundWorkspaces);
       }
     } catch (error) {
+      if (!attempt.isCurrent()) return;
       const message = describeRouteError(error);
       console.error("[session-route] refreshRouteState failed", error);
       recordInspectorEvent("route.refresh.error", {
@@ -570,24 +653,73 @@ export function useWorkspaceRouteState(input: UseWorkspaceRouteStateInput) {
       });
       setRouteError(message);
       if (desktopWorkspaces.length > 0) {
-        const orderedDesktopWorkspaces = orderRouteWorkspaces(desktopWorkspaces, workspaceOrderIdsRef.current);
+        const orderedDesktopWorkspaces = commitStableWorkspaceOrder(desktopWorkspaces);
         setWorkspaces(orderedDesktopWorkspaces);
         setLegacySelectedWorkspaceId((current) =>
           current || resolveWorkspaceListSelectedId(desktopList) || orderedDesktopWorkspaces[0]?.id || "",
         );
       }
     } finally {
-      setLoading(false);
-      refreshInFlightRef.current = false;
-      setRouteRefreshVersion((current) => current + 1);
-      // Tell the boot overlay the first route data load has completed so
-      // the overlay dismisses after BOTH the desktop boot and the workspace
-      // list/sessions are ready.
-      if (routeReadyAfterRefresh) {
-        markBootRouteReady();
+      attempt.finish();
+      // A superseded attempt changes nothing here: the newer attempt owns
+      // loading, the refresh version, and boot-overlay readiness.
+      if (attempt.isCurrent()) {
+        setLoading(false);
+        setRouteRefreshVersion((current) => current + 1);
+        // Tell the boot overlay the first route data load has completed so
+        // the overlay dismisses after BOTH the desktop boot and the workspace
+        // list/sessions are ready. A transient desktop connection gap does
+        // not count: the overlay must outlast the restart recovery.
+        if (routeReadyAfterRefresh) {
+          markBootRouteReady();
+        }
       }
     }
-  }, [loadWorkspaceSessionsInBackground, markBootRouteReady, routeWorkspaceId, updateLocalServer, workspaceInferenceSessionId]);
+  }, [commitStableWorkspaceOrder, legacyWorkspaceInferenceKey, loadWorkspaceSessionsInBackground, markBootRouteReady, updateLocalServer]);
+
+  const routeWorkspaceKnown = Boolean(
+    routeWorkspaceId && workspaces.some((workspace) => workspace.id === routeWorkspaceId),
+  );
+  useEffect(() => {
+    if (workspaceSelectionCommitTimerRef.current !== null) {
+      window.clearTimeout(workspaceSelectionCommitTimerRef.current);
+      workspaceSelectionCommitTimerRef.current = null;
+    }
+    if (!routeWorkspaceId) return;
+
+    // The URL is the user's newest selection. Persist it synchronously so a
+    // slow refresh or activation can never leave storage on an older route.
+    setLegacySelectedWorkspaceId(routeWorkspaceId);
+    writeActiveWorkspaceId(routeWorkspaceId);
+    if (!routeWorkspaceKnown) return;
+
+    workspaceSelectionCommitTimerRef.current = window.setTimeout(() => {
+      workspaceSelectionCommitTimerRef.current = null;
+      routeWorkspaceSelectionCommitter.request(
+        routeWorkspaceId,
+        (workspaceId) => workspaceSelectionCommitRef.current(workspaceId),
+      );
+    }, ROUTE_WORKSPACE_ACTIVATION_SETTLE_MS);
+    // On navigation only the routed workspace needs a load: boot already
+    // scheduled background loads for every other unloaded workspace.
+    const workspaceIdsToLoad = planRouteWorkspaceLoads(
+      workspacesRef.current.map((workspace) => workspace.id),
+      routeWorkspaceId,
+      loadedWorkspaceIdsRef.current,
+    );
+    const workspace = workspaceIdsToLoad.includes(routeWorkspaceId)
+      ? workspacesRef.current.find((item) => item.id === routeWorkspaceId)
+      : undefined;
+    if (workspace) {
+      setRetryingWorkspaceIds((current) => Array.from(new Set([...current, workspace.id])));
+      void loadWorkspaceSessionsInBackground([workspace]);
+    }
+    return () => {
+      if (workspaceSelectionCommitTimerRef.current === null) return;
+      window.clearTimeout(workspaceSelectionCommitTimerRef.current);
+      workspaceSelectionCommitTimerRef.current = null;
+    };
+  }, [loadWorkspaceSessionsInBackground, routeWorkspaceId, routeWorkspaceKnown]);
   const handleRuntimeSessionUpdated = useCallback((update: { sessionId: string; info: Record<string, unknown> }) => {
     if (!selectedWorkspaceId) return;
     setSessionsByWorkspaceId((current) => {
@@ -684,11 +816,11 @@ export function useWorkspaceRouteState(input: UseWorkspaceRouteStateInput) {
 
     const handleSettingsChange = () => {
       onServerSettingsChanged();
-      // Self-heal: if the previous refresh got stuck mid-flight (e.g. macOS
-      // backgrounded the webview and never let a fetch resolve), clear the
-      // guard so a re-entry after resume actually goes through.
-      refreshInFlightRef.current = false;
-      void refreshRouteState();
+      // Fresh connection info was published (boot, restart, or reconnect).
+      // Supersede any in-flight refresh — including one stuck mid-flight
+      // (e.g. macOS backgrounded the webview and never let a fetch resolve) —
+      // so its stale resolution cannot overwrite the new connection state.
+      void refreshRouteState({ supersede: true });
     };
     window.addEventListener("openwork-server-settings-changed", handleSettingsChange);
 
@@ -697,8 +829,7 @@ export function useWorkspaceRouteState(input: UseWorkspaceRouteStateInput) {
     const handleVisibility = () => {
       if (typeof document === "undefined") return;
       if (document.visibilityState !== "visible") return;
-      refreshInFlightRef.current = false;
-      void refreshRouteState();
+      void refreshRouteState({ supersede: true });
     };
     if (typeof document !== "undefined") {
       document.addEventListener("visibilitychange", handleVisibility);
@@ -728,6 +859,7 @@ export function useWorkspaceRouteState(input: UseWorkspaceRouteStateInput) {
       baseUrl,
       tokenPresent: token.length > 0,
       connected: Boolean(client),
+      connectionPending,
       routeError,
       selectedSessionId,
       selectedWorkspaceId,
@@ -756,6 +888,7 @@ export function useWorkspaceRouteState(input: UseWorkspaceRouteStateInput) {
   }, [
     baseUrl,
     client,
+    connectionPending,
     errorsByWorkspaceId,
     loading,
     retryingWorkspaceIds,
@@ -820,13 +953,23 @@ export function useWorkspaceRouteState(input: UseWorkspaceRouteStateInput) {
   // can be reintroduced later as a one-shot triggered from a button or from
   // the onboarding flow, not from the route effect loop.
   useEffect(() => {
-    if (!isDesktopRuntime()) return;
-    if (loading) return;
-    if (client) {
+    if (client && !connectionPending) {
       reconnectAttemptedWorkspaceIdRef.current = "";
+    }
+    if (
+      !shouldAttemptDesktopLocalReconnect({
+        desktopRuntime: isDesktopRuntime(),
+        bootPhase,
+        bootRouteReady,
+        routeLoading: loading,
+        hasClient: Boolean(client),
+        connectionPending,
+        workspaceType: selectedWorkspace?.workspaceType ?? null,
+      })
+    ) {
       return;
     }
-    if (!selectedWorkspace || selectedWorkspace.workspaceType !== "local") return;
+    if (!selectedWorkspace) return;
     const workspaceId = selectedWorkspace.id?.trim() ?? "";
     if (!workspaceId || reconnectAttemptedWorkspaceIdRef.current === workspaceId) return;
     reconnectAttemptedWorkspaceIdRef.current = workspaceId;
@@ -838,8 +981,12 @@ export function useWorkspaceRouteState(input: UseWorkspaceRouteStateInput) {
     }).catch((error) => {
       const message = error instanceof Error ? error.message : describeRouteError(error);
       setRouteError(message);
+      // Recovery definitively failed. Release the boot overlay so the
+      // retained route (with this error surfaced) is visible instead of the
+      // overlay wedging forever.
+      markBootRouteReady();
     });
-  }, [client, loading, selectedWorkspace, workspaces]);
+  }, [bootPhase, bootRouteReady, client, connectionPending, loading, markBootRouteReady, selectedWorkspace, workspaces]);
 
   const selectedWorkspaceRoot = selectedWorkspace?.path?.trim() || "";
   // Single source of truth for the selected workspace's server URL/token/id.
@@ -1077,7 +1224,6 @@ export function useWorkspaceRouteState(input: UseWorkspaceRouteStateInput) {
     setLegacySelectedWorkspaceId,
     retryingWorkspaceIds,
     setRetryingWorkspaceIds,
-    refreshInFlightRef,
     startupRetryTimerRef,
     selectedWorkspaceId,
     selectedWorkspace,

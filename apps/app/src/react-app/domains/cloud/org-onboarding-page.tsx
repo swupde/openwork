@@ -1,7 +1,7 @@
 /** @jsxImportSource react */
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { useMutation, useQueries, useQuery } from "@tanstack/react-query";
-import { useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router";
 import {
   ArrowRight,
   ArrowUpRightIcon,
@@ -38,6 +38,7 @@ import {
   exchangeHandoffAndSignIn,
 } from "@/app/lib/den-handoff";
 import { denSettingsChangedEvent } from "@/app/lib/den-session-events";
+import { clearOrgSelectionPending, readOrgSelectionPending } from "@/app/lib/den-sign-in-intent";
 import { usePlatform } from "../../kernel/platform";
 import { useBootState } from "../../shell/boot-state";
 import { resolveModelDisplayName, resolveProviderDisplayName } from "@/app/utils";
@@ -137,7 +138,11 @@ async function stageOnboardingUpdate(
   if (
     channelState.channel === "alpha" &&
     update.latestVersion &&
-    !(await isAlphaUpdateAllowed(update.latestVersion, desktopConfig))
+    !(await isAlphaUpdateAllowed(
+      update.latestVersion,
+      desktopConfig,
+      channelState.currentVersion,
+    ))
   ) {
     return false;
   }
@@ -239,6 +244,8 @@ function PreparedWorkspacePage({ prepared }: { prepared: PreparedBootstrapSummar
       const result = await exchangeHandoffAndSignIn(grant, {
         baseUrl: settings.baseUrl,
         client: createDenClient({ baseUrl: settings.baseUrl }),
+        // A pasted one-time code is a desktop-initiated sign-in.
+        desktopInitiated: true,
       });
       if (!result.ok) setSignInError(result.error);
     } finally {
@@ -401,6 +408,9 @@ export function OrgOnboardingPage() {
   );
   const [autoSelectFailedOrgId, setAutoSelectFailedOrgId] = useState<string | null>(null);
   const autoSelectingOrgIdRef = useRef<string | null>(null);
+  // A desktop-initiated sign-in parks the exchange-reported org here instead
+  // of committing it; the chooser pre-highlights it as its default.
+  const [suggestedOrgId] = useState(() => readOrgSelectionPending().suggestion?.id ?? "");
 
   useEffect(() => {
     window.dispatchEvent(new CustomEvent(orgOnboardingVisibilityEvent, { detail: { visible: true } }));
@@ -440,7 +450,7 @@ export function OrgOnboardingPage() {
   const orgs = data?.orgs ?? [];
   const postListStep = resolveOrgOnboardingPostListStep({
     orgs,
-    activeOrgId: orgId,
+    activeOrgId: orgId || suggestedOrgId,
     hasSelectedOrganization,
     autoContinueResources,
     autoSelectFailedOrgId,
@@ -459,6 +469,7 @@ export function OrgOnboardingPage() {
       .setActiveOrganization({ organizationId: autoSelectOrg.id })
       .then(() => {
         if (cancelled) return;
+        clearOrgSelectionPending();
         writeDenSettings({
           ...settings,
           authToken: authToken || null,
@@ -906,7 +917,7 @@ export function ResourceSelectionPage({ autoContinue = false }: { autoContinue?:
                   {marketplaces.length > 0 ? (
                     <Section
                       icon={<Square3Stack3DIcon className="size-5 text-foreground/60" />}
-                      title="Marketplaces"
+                      title="Collections"
                       description="App stores with extensions and plugins for your workspace."
                       count={`${marketplaces.length} marketplace${marketplaces.length === 1 ? "" : "s"}`}
                     >
@@ -933,7 +944,7 @@ export function ResourceSelectionPage({ autoContinue = false }: { autoContinue?:
           {/* Footer hint */}
           {!loading && hasResources ? (
             <p className="text-center text-xs text-muted-foreground text-balance leading-relaxed tracking-wide">
-              Providers are added to your workspace automatically. Marketplaces are available from Cloud settings.
+              Providers are added to your workspace automatically. Collections are available from Cloud settings.
             </p>
           ) : null}
           <Button
@@ -1127,6 +1138,7 @@ function OrganizationSelectionPage({
       return nextOrg;
     },
     onSuccess: (nextOrg) => {
+      clearOrgSelectionPending();
       writeDenSettings({
         ...settings,
         authToken: authToken || null,

@@ -116,7 +116,10 @@ test("agent MCP server exposes steering instructions during initialize", async (
   await client.connect(transports.client)
 
   expect(client.getInstructions()).toBe(agentModule.AGENT_MCP_INSTRUCTIONS)
-  expect(client.getInstructions()).toContain("search_capabilities and execute_capability")
+  expect(client.getInstructions()).toContain("Use create_skill")
+  expect(client.getInstructions()).toContain("do not route these flows through execute_capability, postPlugins, or postConfigObjectsVersions")
+  expect(client.getInstructions()).toContain("update_skill to publish a new immutable version")
+  expect(client.getInstructions()).toContain("execute that exact match once: it returns the live status and renders an actionable connection card")
   expect(client.getInstructions()).toContain("create-skill")
   expect(client.getInstructions()).toContain("share-plugin")
   expect(client.getInstructions()).toContain("add-to-marketplace")
@@ -137,6 +140,14 @@ test("agent MCP server exposes steering instructions during initialize", async (
 
   await client.close()
   await server.close()
+})
+
+test("capability-search tool description requires bounded search variants", () => {
+  const searchDescription = (agentModule as unknown as { SEARCH_CAPABILITIES_DESCRIPTION?: string }).SEARCH_CAPABILITIES_DESCRIPTION
+
+  expect(searchDescription).toContain("2-4 keyword variants")
+  expect(searchDescription).toContain("execute_capability")
+  expect(searchDescription).toContain("Always search first")
 })
 
 test("agent MCP server exposes a standards-shaped remote skill index", () => {
@@ -178,10 +189,11 @@ test("built-in cloud skills are searchable and executable as skill capabilities"
     provenance: "Built into OpenWork Cloud.",
   })
   expect(createSkill?.content).toContain("name: create-skill")
-  expect(createSkill?.content).toContain("postPlugins")
-  expect(createSkill?.content).toContain("409 duplicate_plugin")
+  expect(createSkill?.content).toContain("openwork-cloud_create_skill")
+  expect(createSkill?.content).toContain("Do not route this flow through `execute_capability` or `postPlugins`")
+  expect(createSkill?.content).toContain("`duplicate_plugin`")
   expect(createSkill?.content).toContain("share-plugin")
-  expect(createSkill?.content).toContain("Do not send `marketplaceId` or `orgWide`")
+  expect(createSkill?.content).toContain("Do not attach it to a marketplace or grant org-wide access")
   expect(createSkill?.content).not.toContain("Set organization-wide access or a marketplace")
 
   const addToMarketplace = executeBuiltinSkillCapability(BUILTIN_ADD_TO_MARKETPLACE_CAPABILITY)
@@ -455,7 +467,7 @@ test("capability discovery is marked read-only while generic execution remains g
   })
 })
 
-test("connection status ranks above unrelated callable tools without distorting relevance scores", () => {
+test("connection status only outranks equally relevant callable tools", () => {
   type ConnectionStatusMatch = CapabilityMatch & { kind: "connection_status" }
   const callableMatch: CapabilityMatch = {
     name: "slack_search_emojis",
@@ -482,6 +494,12 @@ test("connection status ranks above unrelated callable tools without distorting 
 
   matches.sort(compareCapabilityMatches)
 
+  expect(matches[0]?.name).toBe("slack_search_emojis")
+  expect(matches[0]?.score).toBe(20)
+
+  statusMatch.score = callableMatch.score
+  matches.sort(compareCapabilityMatches)
+
   expect(matches[0]?.kind).toBe("connection_status")
-  expect(matches[0]?.score).toBe(7)
+  expect(matches[0]?.score).toBe(20)
 })

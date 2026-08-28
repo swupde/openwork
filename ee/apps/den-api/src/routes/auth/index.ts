@@ -1,40 +1,62 @@
 import { oauthProviderAuthServerMetadata, oauthProviderOpenIdConfigMetadata } from "@better-auth/oauth-provider"
 import { createHash } from "node:crypto"
-import { eq, sql } from "@openwork-ee/den-db/drizzle"
-import { AuthAccountTable, AuthUserTable, OAuthClientTable } from "@openwork-ee/den-db/schema"
+import { and, eq, gt, sql } from "@openwork-ee/den-db/drizzle"
+import { AuthAccountTable, AuthUserTable, InvitationTable, OAuthClientTable } from "@openwork-ee/den-db/schema"
 import type { Hono } from "hono"
+import type { Context } from "hono"
 import { describeRoute } from "hono-openapi"
 import { z } from "zod"
 import { auth, DEN_MCP_OAUTH_RESOURCE, normalizeMcpOAuthResource } from "../../auth.js"
-import { normalizeLoginEmail, resolveLoginOptionKind } from "../../auth-login-options.js"
+import { buildLoginOptionsSessionCookieClearHeaders, normalizeLoginEmail, resolveLoginOptionKind } from "../../auth-login-options.js"
 import { verifyBotProtection } from "../../bot-protection.js"
 import {
+  EMAIL_PASSWORD_SIGN_UP_PATH,
   getBreachedPasswordResponse,
   getEmailPasswordLockoutResponse,
-  getShortPasswordResponse,
-  readEmailPasswordSignInAttempt,
-  recordEmailPasswordSignInResult,
+  getPasswordPolicyResponse,
+  getWeakPasswordResponse,
+  readEmailSignInAttempt,
+  recordEmailSignInResult,
 } from "../../auth-protection.js"
 import { db } from "../../db.js"
 import { env } from "../../env.js"
 import { findEnterpriseAuthRequirementForEmailDomain } from "../../enterprise-auth-requirement.js"
+import {
+  authorizeInitialAdminBootstrapSignup,
+  completeInitialAdminBootstrapSignup,
+  getInitialAdminBootstrapAvailability,
+  initialAdminBootstrapSignupRejectedResponse,
+  readInitialAdminBootstrapGrantFromBody,
+  verifyInitialAdminBootstrap,
+} from "../../initial-admin-bootstrap.js"
 import { getInvalidMcpOAuthRedirectUris, isAllowedMcpOAuthRedirectUri, MCP_OAUTH_REDIRECT_URI_ERROR_DESCRIPTION } from "../../mcp/oauth-client-policy.js"
 import { normalizeMcpOAuthClientScope } from "../../mcp/scopes.js"
 import { publicRoute, queryValidator, tokenRoute } from "../../middleware/index.js"
+import { checkOAuthTokenRateLimit, recordOAuthTokenFailure } from "../../oauth-token-rate-limit.js"
+import { getOAuthTokenRateLimitLogFields, readBasicAuthClientId } from "../../oauth-token-rate-limit-observability.js"
 import { emptyResponse, jsonResponse } from "../../openapi.js"
 import { getSingletonSsoStatus } from "../../orgs.js"
+import { cache } from "../../cache.js"
+import { appLogger } from "../../observability/logger.js"
 import { getAuthRequestEmail, getSingleOrgEmailSignupPolicyViolation, type SingleOrgEmailSignupPolicyViolation } from "../../single-org-signup-policy.js"
 import { samlResponsePolicyMiddleware } from "../../sso-saml-response-middleware.js"
-import { revokeBearerSession, type AuthContextVariables } from "../../session.js"
+import { getRequestSession, readSignedSessionCookieToken, revokeBearerSession, type AuthContextVariables } from "../../session.js"
 import { checkRateLimit } from "../../utils/rate-limit.js"
 import { registerDesktopAuthRoutes } from "./desktop-handoff.js"
 import { normalizeOAuthAuthorizeRedirect } from "./oauth-redirect.js"
 import { registerScimAuthRoutes } from "./scim.js"
 
+const logger = appLogger.child({ component: "auth" })
+
 function rewriteAuthRequest(request: Request, path: string) {
   const url = new URL(request.url)
   url.pathname = path
   return new Request(url, request)
+}
+
+function normalizedPath(request: Request) {
+  const path = new URL(request.url).pathname
+  return path !== "/" ? path.replace(/\/+$/, "") : path
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -76,20 +98,6 @@ function readStoredOAuthClientScopes(scopes: string | null) {
     // Better Auth has used both JSON arrays and space-delimited strings for scopes.
   }
   return readOAuthScopeList(scopes)
-}
-
-function readBasicAuthClientId(headers: Headers) {
-  const authorization = headers.get("authorization")?.trim() ?? ""
-  const match = authorization.match(/^Basic\s+(.+)$/i)
-  if (!match?.[1]) return null
-
-  try {
-    const decoded = atob(match[1])
-    const separator = decoded.indexOf(":")
-    return separator > 0 ? decoded.slice(0, separator) : null
-  } catch {
-    return null
-  }
 }
 
 async function registeredClientHasMcpScope(clientId: string) {
@@ -227,6 +235,17 @@ function singleOrgEmailSignupPolicyResponse(violation: SingleOrgEmailSignupPolic
   return Response.json(violation, { status: 403 })
 }
 
+async function getInitialAdminBootstrapGrantFromRequest(request: Request) {
+  if (!isBetterAuthEmailSignupRequest(request)) {
+    return null
+  }
+  try {
+    return readInitialAdminBootstrapGrantFromBody(await request.clone().json())
+  } catch {
+    return null
+  }
+}
+
 export function getBetterAuthProxyPath(pathname: string) {
   const prefix = "/api/auth"
   if (!pathname.startsWith(prefix)) {
@@ -296,13 +315,13 @@ async function readSetActiveOrganizationBody(request: Request) {
   }
 }
 
-async function getCurrentActiveOrganizationId(request: Request) {
-  const session = await auth.api.getSession({ headers: request.headers })
+async function getCurrentActiveOrganizationId(request: Request, context: Context) {
+  const session = await getRequestSession(request.headers, context)
   const activeOrganizationId = session?.session.activeOrganizationId
   return typeof activeOrganizationId === "string" ? activeOrganizationId : null
 }
 
-async function getSingleOrgAuthGuardResponse(request: Request) {
+async function getSingleOrgAuthGuardResponse(request: Request, context: Context, options?: { invitationSignupAllowed?: boolean }) {
   if (env.orgMode !== "single_org") {
     return null
   }
@@ -312,7 +331,9 @@ async function getSingleOrgAuthGuardResponse(request: Request) {
   }
 
   if (isBetterAuthEmailSignupRequest(request)) {
-    const violation = await getSingleOrgEmailSignupPolicyViolation(await getAuthRequestEmail(request))
+    const violation = options?.invitationSignupAllowed
+      ? null
+      : await getSingleOrgEmailSignupPolicyViolation(await getAuthRequestEmail(request))
     if (violation) {
       return singleOrgEmailSignupPolicyResponse(violation)
     }
@@ -334,7 +355,7 @@ async function getSingleOrgAuthGuardResponse(request: Request) {
     return null
   }
 
-  const activeOrganizationId = await getCurrentActiveOrganizationId(request)
+  const activeOrganizationId = await getCurrentActiveOrganizationId(request, context)
   return canSetActiveOrganizationInSingleOrgMode({
     activeOrganizationId,
     singleOrganizationSlug: env.singleOrg.slug,
@@ -444,6 +465,7 @@ const authPasswordScreeningUnavailableSchema = z.object({
 
 const loginOptionsQuerySchema = z.object({
   email: z.string().trim().email().transform(normalizeLoginEmail),
+  invite: z.string().trim().min(1).optional(),
 })
 
 const loginOptionKindSchema = z.union([
@@ -458,6 +480,7 @@ const loginOptionsResponseSchema = z.object({
   email: z.string().email(),
   nextStep: loginOptionKindSchema,
   allowPublicSignup: z.boolean().optional(),
+  allowInvitationSignup: z.boolean().optional(),
   organizationSlug: z.string().optional(),
   signInPath: z.string().optional(),
   signInUrl: z.string().url().optional(),
@@ -484,6 +507,8 @@ const LOGIN_OPTIONS_RATE_LIMIT_WINDOW_MS = 60_000
 const LOGIN_OPTIONS_DOMAIN_RATE_LIMIT_WINDOW_MS = 600_000
 const LOGIN_OPTIONS_DOMAIN_RATE_LIMIT_MAX = 120
 const LOGIN_OPTIONS_DOMAIN_MISS_RATE_LIMIT_MAX = 30
+const INITIAL_ADMIN_BOOTSTRAP_VERIFY_RATE_LIMIT_MAX = 5
+const INITIAL_ADMIN_BOOTSTRAP_VERIFY_RATE_LIMIT_WINDOW_MS = 300_000
 // A generous domain bucket bounds distributed enumeration without recreating coworker lockouts;
 // only unresolved addresses pay the tighter miss bucket.
 
@@ -523,6 +548,10 @@ function checkLoginOptionsMissRateLimit(key: string) {
   return checkRateLimit(key, LOGIN_OPTIONS_DOMAIN_MISS_RATE_LIMIT_MAX, LOGIN_OPTIONS_DOMAIN_RATE_LIMIT_WINDOW_MS, Date.now())
 }
 
+function initialAdminBootstrapVerifyRateLimitKey(email: string) {
+  return `auth-bootstrap:verify:email:${sha256Hex(email)}`
+}
+
 async function getLoginOptionAccounts(email: string) {
   const rows = await db
     .select({
@@ -531,7 +560,7 @@ async function getLoginOptionAccounts(email: string) {
     })
     .from(AuthUserTable)
     .innerJoin(AuthAccountTable, eq(AuthUserTable.id, AuthAccountTable.userId))
-    .where(sql`lower(${AuthUserTable.email}) = ${email}`)
+    .where(eq(AuthUserTable.email, email))
 
   return rows.map((row) => ({
     providerId: row.providerId,
@@ -539,32 +568,106 @@ async function getLoginOptionAccounts(email: string) {
   }))
 }
 
-async function handleAuthRequest(request: Request) {
-  const authRequest = await normalizeMcpOAuthRequest(request)
-  if (authRequest instanceof Response) {
-    return authRequest
-  }
-  const singleOrgAuthGuardResponse = await getSingleOrgAuthGuardResponse(authRequest)
-  if (singleOrgAuthGuardResponse) {
-    return singleOrgAuthGuardResponse
+async function hasPendingInvitationForEmail(invitationIdOrToken: string | undefined, email: string) {
+  if (!invitationIdOrToken) {
+    return false
   }
 
-  const emailPasswordAttempt = await readEmailPasswordSignInAttempt(authRequest)
-  if (emailPasswordAttempt) {
-    const lockoutResponse = await getEmailPasswordLockoutResponse(emailPasswordAttempt)
+  const [invitation] = await db
+    .select({ inviteToken: InvitationTable.inviteToken })
+    .from(InvitationTable)
+    .where(and(
+      sql`(${InvitationTable.id} = ${invitationIdOrToken} or ${InvitationTable.inviteToken} = ${invitationIdOrToken})`,
+      eq(InvitationTable.status, "pending"),
+      gt(InvitationTable.expiresAt, new Date()),
+      sql`lower(${InvitationTable.email}) = ${email}`,
+    ))
+    .limit(1)
+
+  return Boolean(invitation)
+}
+
+async function isInvitationSignupAllowed(request: Request) {
+  if (request.method !== "POST" || normalizedPath(request) !== EMAIL_PASSWORD_SIGN_UP_PATH) {
+    return false
+  }
+
+  const invite = new URL(request.url).searchParams.get("invite")?.trim() ?? ""
+  if (!invite) {
+    return false
+  }
+
+  const email = await getAuthRequestEmail(request)
+  return email ? hasPendingInvitationForEmail(invite, normalizeLoginEmail(email)) : false
+}
+
+async function handleAuthRequest(c: Context) {
+  const request = c.req.raw
+  const observabilityRequest = request.method === "POST"
+    && getBetterAuthProxyPath(new URL(request.url).pathname) === "/oauth2/token"
+    ? request.clone()
+    : null
+  const oauthTokenRateLimit = observabilityRequest
+    ? await checkOAuthTokenRateLimit(request, checkRateLimit)
+    : null
+  if (observabilityRequest && oauthTokenRateLimit?.response) {
+    const rateLimitFields = await getOAuthTokenRateLimitLogFields(observabilityRequest, oauthTokenRateLimit.response)
+    if (rateLimitFields) {
+      logger.warn("oauth token request rate limited", rateLimitFields)
+    }
+    return oauthTokenRateLimit.response
+  }
+  const authRequest = await normalizeMcpOAuthRequest(request)
+  if (authRequest instanceof Response) {
+    if (oauthTokenRateLimit) {
+      // Malformed token requests rejected before auth.handler must still
+      // consume the failure budget, or repeated invalid-resource submissions
+      // would only ever pay the looser attempt buckets.
+      await recordOAuthTokenFailure(oauthTokenRateLimit.failureKey, authRequest, checkRateLimit)
+    }
+    return authRequest
+  }
+  const invitationSignupAllowed = await isInvitationSignupAllowed(authRequest)
+  const initialAdminBootstrapGrant = await getInitialAdminBootstrapGrantFromRequest(authRequest)
+
+  const emailSignInAttempt = await readEmailSignInAttempt(authRequest)
+  if (emailSignInAttempt) {
+    const lockoutResponse = await getEmailPasswordLockoutResponse(emailSignInAttempt)
     if (lockoutResponse) {
       return lockoutResponse
     }
   }
 
-  const shortPasswordResponse = await getShortPasswordResponse(authRequest)
-  if (shortPasswordResponse) {
-    return shortPasswordResponse
+  if (!initialAdminBootstrapGrant) {
+    const singleOrgAuthGuardResponse = await getSingleOrgAuthGuardResponse(authRequest, c, { invitationSignupAllowed })
+    if (singleOrgAuthGuardResponse) {
+      return singleOrgAuthGuardResponse
+    }
+  }
+
+  const passwordPolicyResponse = await getPasswordPolicyResponse(authRequest)
+  if (passwordPolicyResponse) {
+    return passwordPolicyResponse
+  }
+
+  const weakPasswordResponse = await getWeakPasswordResponse(authRequest)
+  if (weakPasswordResponse) {
+    return weakPasswordResponse
   }
 
   const breachedPasswordResponse = await getBreachedPasswordResponse(authRequest)
   if (breachedPasswordResponse) {
     return breachedPasswordResponse
+  }
+
+  const initialAdminBootstrapAuthorization = initialAdminBootstrapGrant
+    ? await authorizeInitialAdminBootstrapSignup({
+        body: await authRequest.clone().json().catch(() => null),
+        email: await getAuthRequestEmail(authRequest),
+      })
+    : null
+  if (initialAdminBootstrapGrant && !initialAdminBootstrapAuthorization) {
+    return initialAdminBootstrapSignupRejectedResponse()
   }
 
   // Desktop sessions use an Authorization bearer and intentionally send no
@@ -573,12 +676,44 @@ async function handleAuthRequest(request: Request) {
   // runs to preserve its normal idempotent response and cookie cleanup for
   // browser callers.
   if (isBetterAuthSignOutRequest(authRequest)) {
+    const cookieToken = await readSignedSessionCookieToken(c)
+    if (cookieToken) {
+      await cache.auth.revokeSession(cookieToken)
+    }
     await revokeBearerSession(authRequest.headers)
   }
 
-  const response = await auth.handler(authRequest)
-  if (emailPasswordAttempt) {
-    await recordEmailPasswordSignInResult(emailPasswordAttempt, response)
+  let response: Response
+  try {
+    response = await auth.handler(authRequest)
+  } catch (error) {
+    const requestId = c.get("requestId")
+    logger.error("better auth handler failed", {
+      auth_session_source: "better_auth_handler",
+      http_method: authRequest.method,
+      http_path: new URL(authRequest.url).pathname,
+      request_id: typeof requestId === "string" ? requestId : undefined,
+      error,
+    })
+    throw error
+  }
+  if (initialAdminBootstrapAuthorization) {
+    response = await completeInitialAdminBootstrapSignup({
+      grant: initialAdminBootstrapAuthorization,
+      response,
+    })
+  }
+  if (emailSignInAttempt) {
+    await recordEmailSignInResult(emailSignInAttempt, response)
+  }
+  if (oauthTokenRateLimit) {
+    await recordOAuthTokenFailure(oauthTokenRateLimit.failureKey, response, checkRateLimit)
+  }
+  if (observabilityRequest) {
+    const rateLimitFields = await getOAuthTokenRateLimitLogFields(observabilityRequest, response)
+    if (rateLimitFields) {
+      logger.warn("oauth token request rate limited", rateLimitFields)
+    }
   }
   return response
 }
@@ -608,6 +743,62 @@ export function registerAuthRoutes<T extends { Variables: AuthContextVariables }
   })
 
   app.get(
+    "/v1/auth/bootstrap/status",
+    describeRoute({
+      tags: ["Authentication"],
+      summary: "Check initial administrator bootstrap availability",
+      description: "Returns whether the private-deployment initial-administrator setup flow is available without exposing configured administrator emails.",
+      responses: {
+        200: jsonResponse("Bootstrap status returned successfully.", z.object({ status: z.enum(["available", "complete", "unavailable"]) })),
+      },
+    }),
+    publicRoute,
+    async (c) => {
+      const availability = await getInitialAdminBootstrapAvailability()
+      return c.json({ status: availability.status })
+    },
+  )
+
+  app.post(
+    "/v1/auth/bootstrap/verify",
+    describeRoute({
+      tags: ["Authentication"],
+      summary: "Verify an initial administrator setup code",
+      description: "Validates a configured administrator email and one-time operator code, then returns a short-lived setup grant for Better Auth account creation.",
+      responses: {
+        200: jsonResponse("Bootstrap grant issued successfully.", z.object({ grant: z.string(), expiresAt: z.string() })),
+        403: jsonResponse("Bootstrap verification failed.", z.object({ error: z.literal("bootstrap_verification_failed"), message: z.string() })),
+        409: jsonResponse("Bootstrap is unavailable.", z.object({ error: z.literal("bootstrap_unavailable"), message: z.string() })),
+      },
+    }),
+    publicRoute,
+    async (c) => {
+      const bodySchema = z.object({ email: z.string().trim().email(), code: z.string().min(1) })
+      const parsed = bodySchema.safeParse(await c.req.json().catch(() => null))
+      if (!parsed.success) {
+        return c.json({ error: "bootstrap_verification_failed", message: "Setup could not be verified. Check the administrator email and one-time setup code." }, 403)
+      }
+      const retryAfter = await checkRateLimit(
+        initialAdminBootstrapVerifyRateLimitKey(normalizeLoginEmail(parsed.data.email)),
+        INITIAL_ADMIN_BOOTSTRAP_VERIFY_RATE_LIMIT_MAX,
+        INITIAL_ADMIN_BOOTSTRAP_VERIFY_RATE_LIMIT_WINDOW_MS,
+        Date.now(),
+      )
+      if (retryAfter !== null) {
+        c.header("Retry-After", String(retryAfter))
+        return c.json({ error: "rate_limited", message: "Too many setup attempts. Try again later." }, 429)
+      }
+      const result = await verifyInitialAdminBootstrap(parsed.data)
+      if (!result.ok) {
+        return result.status === 409
+          ? c.json({ error: "bootstrap_unavailable", message: result.message }, 409)
+          : c.json({ error: "bootstrap_verification_failed", message: result.message }, 403)
+      }
+      return c.json({ grant: result.grant, expiresAt: result.expiresAt.toISOString() })
+    },
+  )
+
+  app.get(
     "/v1/auth/login-options",
     describeRoute({
       tags: ["Authentication"],
@@ -623,7 +814,10 @@ export function registerAuthRoutes<T extends { Variables: AuthContextVariables }
     publicRoute,
     queryValidator(loginOptionsQuerySchema),
     async (c) => {
-      const { email } = c.req.valid("query")
+      const { email, invite } = c.req.valid("query")
+      for (const cookie of buildLoginOptionsSessionCookieClearHeaders(env.betterAuthCookieDomain)) {
+        c.header("Set-Cookie", cookie, { append: true })
+      }
       const botProtection = await verifyBotProtection()
       if (!botProtection.ok) {
         return c.json({
@@ -662,20 +856,22 @@ export function registerAuthRoutes<T extends { Variables: AuthContextVariables }
         }
       }
       const allowPublicSignup = env.orgMode !== "single_org" || env.singleOrg.allowPublicSignup
-      const nextStep = resolveLoginOptionKind({ requireSso: Boolean(requirement), accounts, allowNewAccount: allowPublicSignup })
+      const allowInvitationSignup = !requirement && await hasPendingInvitationForEmail(invite, email)
+      const nextStep = resolveLoginOptionKind({ requireSso: Boolean(requirement), accounts, allowNewAccount: allowPublicSignup || allowInvitationSignup })
 
       if (nextStep === "sso" && requirement) {
         return c.json({
           email,
           nextStep,
           allowPublicSignup,
+          allowInvitationSignup,
           organizationSlug: requirement.organizationSlug,
           signInPath: requirement.signInPath,
           signInUrl: new URL(requirement.signInPath, env.betterAuthTrustedOrigins[0] ?? env.betterAuthUrl).toString(),
         })
       }
 
-      return c.json({ email, nextStep, allowPublicSignup })
+      return c.json({ email, nextStep, allowPublicSignup, allowInvitationSignup })
     },
   )
 
@@ -690,14 +886,14 @@ export function registerAuthRoutes<T extends { Variables: AuthContextVariables }
       responses: {
         200: emptyResponse("Better Auth handled the request successfully."),
         302: emptyResponse("Better Auth redirected the user to continue the auth flow."),
-        400: emptyResponse("Better Auth rejected the request as invalid. Password creation, password change, or reset is also rejected when the proposed password is too short or is known to be compromised."),
+        400: emptyResponse("Better Auth rejected the request as invalid. Password creation, password change, or reset is also rejected when the proposed password fails Den password policy or is known to be compromised."),
         401: emptyResponse("Better Auth rejected the request because authentication failed."),
         429: jsonResponse("Email/password sign-in is temporarily locked after too many failed attempts. The response includes a Retry-After header.", authLoginLockedSchema),
         503: jsonResponse("Password breach screening is temporarily unavailable, so password creation or reset should be retried later.", authPasswordScreeningUnavailableSchema),
       },
     }),
     publicRoute,
-    (c) => handleAuthRequest(c.req.raw),
+    (c) => handleAuthRequest(c),
   )
   registerDesktopAuthRoutes(app)
 }

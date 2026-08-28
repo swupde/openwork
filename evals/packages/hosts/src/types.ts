@@ -4,7 +4,7 @@ export type { SurfaceHandle, SurfaceKind } from "@openwork/cdp";
 
 export interface ElectronSurfaceOptions {
   profile?: "fresh" | "shared";
-  /** Exact caller-owned profile root. Local hosts preserve it on disposal. */
+  /** Exact caller-owned profile root. Hosts preserve it on surface disposal. */
   profileDir?: string;
   bootstrap?: {
     baseUrl: string;
@@ -12,6 +12,10 @@ export interface ElectronSurfaceOptions {
     requireSignin?: boolean;
   };
   env?: Record<string, string>;
+  /** Root package script used for a source Electron launch. Setting this bypasses OPENWORK_EVAL_ELECTRON_BINARY. */
+  devCommand?: "dev" | "dev:electron";
+  /** Skip host-side sidecar/helper preparation when the caller intentionally uses existing resources. */
+  prepareSharedResources?: boolean;
 }
 
 export interface ChromeSurfaceOptions {

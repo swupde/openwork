@@ -10,6 +10,13 @@ import {
   extractGmailMessage,
   truncateText,
 } from "../src/capability-sources/google-workspace-api.js"
+import {
+  buildDocumentReplacementRequests,
+  buildPresentationReplacementRequests,
+  buildSpreadsheetStructureRequests,
+  driveFolderMoveParameters,
+  spreadsheetA1Range,
+} from "../src/google-workspace/native-files.js"
 
 function base64Url(text: string): string {
   return Buffer.from(text, "utf8").toString("base64url")
@@ -57,6 +64,7 @@ describe("extractGmailMessage", () => {
         headers: [
           { name: "From", value: "Ada <ada@example.com>" },
           { name: "To", value: "Ben <ben@example.com>" },
+          { name: "Bcc", value: "Investors <investors@example.com>" },
           { name: "Subject", value: "Nested body" },
           { name: "Date", value: "Tue, 07 Jul 2026 10:00:00 +0000" },
         ],
@@ -82,6 +90,7 @@ describe("extractGmailMessage", () => {
       threadId: "thread_1",
       from: "Ada <ada@example.com>",
       to: "Ben <ben@example.com>",
+      bcc: "Investors <investors@example.com>",
       subject: "Nested body",
       date: "Tue, 07 Jul 2026 10:00:00 +0000",
       snippet: "Snippet fallback",
@@ -240,6 +249,54 @@ describe("Drive helpers", () => {
       type: "domain",
       role: "reader",
     })
+  })
+})
+
+describe("native Google file payloads", () => {
+  test("creates and replaces document text without deleting the terminal newline", () => {
+    expect(buildDocumentReplacementRequests("Hello", null)).toEqual([
+      { insertText: { location: { index: 1 }, text: "Hello" } },
+    ])
+    expect(buildDocumentReplacementRequests("Replacement", 12)).toEqual([
+      { deleteContentRange: { range: { startIndex: 1, endIndex: 11 } } },
+      { insertText: { location: { index: 1 }, text: "Replacement" } },
+    ])
+  })
+
+  test("keeps one spreadsheet sheet, names it, and quotes its A1 range", () => {
+    expect(buildSpreadsheetStructureRequests({
+      sheets: [{ sheetId: 7, title: "Old" }, { sheetId: 8, title: "Extra" }],
+      sheetName: "Q3's plan",
+    })).toEqual([
+      { updateSheetProperties: { properties: { sheetId: 7, title: "Q3's plan" }, fields: "title" } },
+      { deleteSheet: { sheetId: 8 } },
+    ])
+    expect(spreadsheetA1Range("Q3's plan")).toBe("'Q3''s plan'!A1")
+  })
+
+  test("creates title/body slides before deleting the old pages", () => {
+    const requests = buildPresentationReplacementRequests({
+      existingPageIds: ["old_slide"],
+      slides: [{ title: "Launch", body: "September 17" }],
+      idFactory: (label) => `new_${label}`,
+    })
+    expect(requests[0]).toMatchObject({
+      createSlide: {
+        objectId: "new_slide_1",
+        slideLayoutReference: { predefinedLayout: "TITLE_AND_BODY" },
+      },
+    })
+    expect(requests).toContainEqual({ insertText: { objectId: "new_title_1", text: "Launch" } })
+    expect(requests).toContainEqual({ insertText: { objectId: "new_body_1", text: "September 17" } })
+    expect(requests.at(-1)).toEqual({ deleteObject: { objectId: "old_slide" } })
+  })
+
+  test("moves a file into the requested folder and removes prior parents", () => {
+    expect(driveFolderMoveParameters(["root", "old"], "folder_1")).toEqual({
+      addParents: "folder_1",
+      removeParents: "root,old",
+    })
+    expect(driveFolderMoveParameters(["folder_1"], "folder_1")).toEqual({})
   })
 })
 

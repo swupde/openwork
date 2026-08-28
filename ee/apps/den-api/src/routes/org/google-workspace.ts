@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto"
 import { bodyLimit } from "hono/body-limit"
 import { describeRoute } from "hono-openapi"
 import { z } from "zod"
+import { DateTime } from "luxon"
 import type { DenTypeId } from "@openwork-ee/utils/typeid"
 import { env } from "../../env.js"
 import { cloudTransportRoute, jsonValidator, orgMemberRoute, paramValidator, queryValidator } from "../../middleware/index.js"
@@ -30,7 +31,11 @@ import {
 } from "../../capability-sources/google-workspace-api.js"
 import type { ConnectedAccountRow } from "../../capability-sources/oauth-credentials.js"
 import { getNativeOAuthProvider } from "../../capability-sources/provider-registry.js"
-import { buildCalendarAgendaWindow, calendarAgendaPeriods } from "../../capability-sources/calendar-agenda.js"
+import {
+  createNativeGoogleFile,
+  NativeGoogleFileApiError,
+  updateNativeGoogleFile,
+} from "../../google-workspace/native-files.js"
 import { listTeamsForMember } from "../../orgs.js"
 import { readInternalCapabilityConnectorId } from "../../session.js"
 import type { OrgRouteVariables } from "./shared.js"
@@ -112,6 +117,7 @@ const gmailMessageSummarySchema = z.object({
   threadId: z.string(),
   from: z.string(),
   to: z.string(),
+  bcc: z.string(),
   subject: z.string(),
   date: z.string(),
   snippet: z.string(),
@@ -146,13 +152,17 @@ const gmailAttachmentResponseSchema = z.object({
 }).meta({ ref: "GoogleWorkspaceGmailAttachmentResponse" })
 
 const calendarEventsQuerySchema = z.object({
-  timeMin: z.string().datetime().describe("Inclusive lower bound as a UTC RFC3339 timestamp ending in Z, for example 2026-07-29T00:00:00Z. Never pass a timezone-less local date-time."),
-  timeMax: z.string().datetime().describe("Exclusive upper bound as a UTC RFC3339 timestamp ending in Z, for example 2026-07-30T00:00:00Z. Never pass a timezone-less local date-time."),
+  timeMin: z.string().datetime().describe("Inclusive lower bound for event start time."),
+  timeMax: z.string().datetime().describe("Exclusive upper bound for event start time."),
   maxResults: z.coerce.number().int().min(1).max(100).default(25).describe("Maximum events to return, capped at 100."),
 })
 
 const calendarAgendaQuerySchema = z.object({
-  period: z.enum(calendarAgendaPeriods).default("today").describe("Use today for the current local day, tomorrow for the next local day, or next_7_days for upcoming events. The server resolves the range from the calling member's primary-calendar timezone and current time."),
+  day: z.union([
+    z.enum(["today", "tomorrow"]),
+    z.string().date(),
+  ]).default("today"),
+  timeZone: z.string().trim().min(1).max(100).optional().describe("Optional IANA time zone override. Omit it to use the calling member's primary Google Calendar time zone."),
   maxResults: z.coerce.number().int().min(1).max(100).default(25).describe("Maximum events to return, capped at 100."),
 })
 
@@ -178,17 +188,21 @@ const calendarEventsResponseSchema = z.object({
   events: z.array(calendarEventSchema),
 }).meta({ ref: "GoogleWorkspaceCalendarEventsResponse" })
 
-const calendarAgendaResponseSchema = calendarEventsResponseSchema.extend({
-  period: z.enum(calendarAgendaPeriods),
+const calendarAgendaResponseSchema = z.object({
+  ok: z.literal(true),
+  date: z.string().date(),
   timeZone: z.string(),
+  timeMin: z.string().datetime(),
+  timeMax: z.string().datetime(),
+  events: z.array(calendarEventSchema),
 }).meta({ ref: "GoogleWorkspaceCalendarAgendaResponse" })
 
 const createCalendarEventBodySchema = z.object({
   summary: z.string().trim().min(1).max(1_000).describe("Event title."),
   description: z.string().max(20_000).optional().describe("Optional event description."),
   location: z.string().max(1_000).optional().describe("Optional event location."),
-  start: z.string().datetime().describe("Event start as a UTC RFC3339 timestamp ending in Z, for example 2026-07-29T09:00:00Z. Never pass a timezone-less local date-time."),
-  end: z.string().datetime().describe("Event end as a UTC RFC3339 timestamp ending in Z, for example 2026-07-29T09:30:00Z. Never pass a timezone-less local date-time."),
+  start: z.string().datetime().describe("Event start date-time."),
+  end: z.string().datetime().describe("Event end date-time."),
   timeZone: z.string().trim().min(1).max(128).optional().describe("Optional IANA time zone for start and end."),
   attendees: z.array(z.string().email()).max(100).optional().describe("Optional attendee email addresses."),
   createMeetLink: z.boolean().optional().describe("Set true to create a Google Meet conferencing link for this event; the response returns meetLink when Google creates it."),
@@ -269,6 +283,77 @@ const uploadDriveFileResponseSchema = z.object({
   file: driveFileSummarySchema,
 }).meta({ ref: "GoogleWorkspaceUploadDriveFileResponse" })
 
+const nativeFileParamSchema = z.object({
+  fileId: z.string().trim().min(1).max(512).describe("Existing Google Docs, Sheets, or Slides file id."),
+})
+
+const nativeFileCellSchema = z.union([
+  z.string().max(50_000),
+  z.number().finite(),
+  z.boolean(),
+  z.null(),
+])
+
+const nativeSpreadsheetValuesSchema = z.array(z.array(nativeFileCellSchema).max(200)).min(1).max(2_000)
+  .superRefine((rows, context) => {
+    const cellCount = rows.reduce((total, row) => total + row.length, 0)
+    if (cellCount > 20_000) context.addIssue({ code: "custom", message: "Spreadsheet content is limited to 20,000 cells." })
+  })
+
+const nativeSlidesSchema = z.array(z.object({
+  title: z.string().max(5_000),
+  body: z.string().max(50_000),
+}).strict()).min(1).max(100)
+
+const nativeFileCreateBodySchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("document"),
+    name: z.string().trim().min(1).max(250),
+    folderId: z.string().trim().min(1).max(512).optional(),
+    text: z.string().min(1).max(1_000_000),
+  }).strict(),
+  z.object({
+    type: z.literal("spreadsheet"),
+    name: z.string().trim().min(1).max(250),
+    folderId: z.string().trim().min(1).max(512).optional(),
+    sheetName: z.string().trim().min(1).max(100).default("Sheet1"),
+    values: nativeSpreadsheetValuesSchema,
+  }).strict(),
+  z.object({
+    type: z.literal("presentation"),
+    name: z.string().trim().min(1).max(250),
+    folderId: z.string().trim().min(1).max(512).optional(),
+    slides: nativeSlidesSchema,
+  }).strict(),
+]).meta({ ref: "GoogleWorkspaceNativeFileCreateBody" })
+
+const nativeFileUpdateBodySchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("document"),
+    name: z.string().trim().min(1).max(250).optional(),
+    folderId: z.string().trim().min(1).max(512).optional(),
+    text: z.string().min(1).max(1_000_000),
+  }).strict(),
+  z.object({
+    type: z.literal("spreadsheet"),
+    name: z.string().trim().min(1).max(250).optional(),
+    folderId: z.string().trim().min(1).max(512).optional(),
+    sheetName: z.string().trim().min(1).max(100).default("Sheet1"),
+    values: nativeSpreadsheetValuesSchema,
+  }).strict(),
+  z.object({
+    type: z.literal("presentation"),
+    name: z.string().trim().min(1).max(250).optional(),
+    folderId: z.string().trim().min(1).max(512).optional(),
+    slides: nativeSlidesSchema,
+  }).strict(),
+]).meta({ ref: "GoogleWorkspaceNativeFileUpdateBody" })
+
+const nativeFileResponseSchema = z.object({
+  ok: z.literal(true),
+  file: driveFileSummarySchema,
+}).meta({ ref: "GoogleWorkspaceNativeFileResponse" })
+
 const driveFileResponseSchema = z.object({
   ok: z.literal(true),
   file: driveFileSummarySchema.extend({
@@ -322,6 +407,23 @@ function calendarApiBase(): string {
 function driveApiBase(): string {
   // Calendar and Drive normally share www.googleapis.com; one env knob keeps Google API tests simple.
   return (env.googleApiBaseUrl ?? "https://www.googleapis.com").replace(/\/+$/, "")
+}
+
+function nativeFileApiBase(type: "document" | "spreadsheet" | "presentation"): string {
+  if (env.googleApiBaseUrl) return env.googleApiBaseUrl.replace(/\/+$/, "")
+  if (type === "document") return "https://docs.googleapis.com"
+  if (type === "spreadsheet") return "https://sheets.googleapis.com"
+  return "https://slides.googleapis.com"
+}
+
+function nativeFileError(error: unknown): { error: "google_api_error"; message: string } {
+  if (error instanceof NativeGoogleFileApiError) {
+    return { error: "google_api_error", message: error.message }
+  }
+  return {
+    error: "google_api_error",
+    message: error instanceof Error ? error.message : "Google native file operation failed.",
+  }
 }
 
 export function missingScope(account: ConnectedAccountRow, anyOf: string[]): boolean {
@@ -386,7 +488,7 @@ async function googleWorkspaceToken(input: {
 
 async function googleApiError(operation: string, response: Response) {
   const text = await response.text()
-  return { error: "google_api_error", message: `${operation} failed: ${response.status} ${text.slice(0, 300)}` }
+  return { error: "google_api_error" as const, message: `${operation} failed: ${response.status} ${text.slice(0, 300)}` }
 }
 
 async function googleWorkspaceApiFetch(input: Parameters<typeof fetch>[0], init?: RequestInit): Promise<Response> {
@@ -399,14 +501,6 @@ async function googleWorkspaceApiFetch(input: Parameters<typeof fetch>[0], init?
 async function readJson(response: Response): Promise<unknown> {
   const body: unknown = await response.json()
   return body
-}
-
-function extractCalendarTimeZone(value: unknown): string | null {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return null
-  }
-  const timeZone = (value as Record<string, unknown>).timeZone
-  return typeof timeZone === "string" && timeZone.trim().length > 0 ? timeZone : null
 }
 
 function buildCalendarEventPayload(input: z.infer<typeof createCalendarEventBodySchema>): CalendarEventCreatePayload {
@@ -433,6 +527,70 @@ function buildCalendarConferenceData(): CalendarConferenceData {
       conferenceSolutionKey: { type: "hangoutsMeet" },
     },
   }
+}
+
+export function calendarAgendaBounds(input: {
+  day: "today" | "tomorrow" | string
+  timeZone: string
+  now?: Date
+}): { date: string; timeMin: string; timeMax: string } {
+  const now = DateTime.fromJSDate(input.now ?? new Date(), { zone: input.timeZone })
+  if (!now.isValid) throw new Error(`Invalid IANA time zone: ${input.timeZone}`)
+
+  const start = input.day === "today" || input.day === "tomorrow"
+    ? now.startOf("day").plus({ days: input.day === "tomorrow" ? 1 : 0 })
+    : DateTime.fromISO(input.day, { zone: input.timeZone }).startOf("day")
+  if (!start.isValid) throw new Error(`Invalid calendar day: ${input.day}`)
+
+  const date = start.toISODate()
+  const timeMin = start.toUTC().toISO()
+  const timeMax = start.plus({ days: 1 }).toUTC().toISO()
+  if (!date || !timeMin || !timeMax) throw new Error("Could not resolve calendar agenda bounds")
+  return { date, timeMin, timeMax }
+}
+
+async function listPrimaryCalendarEvents(input: {
+  accessToken: string
+  timeMin: string
+  timeMax: string
+  maxResults: number
+}): Promise<
+  | { ok: true; events: z.infer<typeof calendarEventSchema>[] }
+  | { ok: false; error: { error: "google_api_error"; message: string } }
+> {
+  const url = new URL(`${calendarApiBase()}/calendar/v3/calendars/primary/events`)
+  url.searchParams.set("timeMin", input.timeMin)
+  url.searchParams.set("timeMax", input.timeMax)
+  url.searchParams.set("singleEvents", "true")
+  url.searchParams.set("orderBy", "startTime")
+  url.searchParams.set("maxResults", String(input.maxResults))
+
+  const response = await googleWorkspaceApiFetch(url, {
+    headers: { authorization: `Bearer ${input.accessToken}` },
+  })
+  if (!response.ok) {
+    return { ok: false, error: await googleApiError("Google Calendar events list", response) }
+  }
+  return { ok: true, events: extractCalendarEvents(await readJson(response)) }
+}
+
+async function readPrimaryCalendarTimeZone(accessToken: string): Promise<
+  | { ok: true; timeZone: string }
+  | { ok: false; error: { error: "google_api_error"; message: string } }
+> {
+  const url = new URL(`${calendarApiBase()}/calendar/v3/calendars/primary`)
+  url.searchParams.set("fields", "timeZone")
+  const response = await googleWorkspaceApiFetch(url, {
+    headers: { authorization: `Bearer ${accessToken}` },
+  })
+  if (!response.ok) {
+    return { ok: false, error: await googleApiError("Google Calendar metadata", response) }
+  }
+  const parsed = z.object({ timeZone: z.string().trim().min(1) }).safeParse(await readJson(response))
+  if (!parsed.success) {
+    return { ok: false, error: { error: "google_api_error", message: "Google Calendar metadata returned no time zone." } }
+  }
+  return { ok: true, timeZone: parsed.data.timeZone }
 }
 
 function directUploadFiles(form: FormData) {
@@ -753,6 +911,7 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
         messageUrl.searchParams.set("format", "metadata")
         messageUrl.searchParams.append("metadataHeaders", "From")
         messageUrl.searchParams.append("metadataHeaders", "To")
+        messageUrl.searchParams.append("metadataHeaders", "Bcc")
         messageUrl.searchParams.append("metadataHeaders", "Subject")
         messageUrl.searchParams.append("metadataHeaders", "Date")
         const messageResponse = await googleWorkspaceApiFetch(messageUrl, {
@@ -767,6 +926,7 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
           threadId: message.threadId,
           from: message.from,
           to: message.to,
+          bcc: message.bcc,
           subject: message.subject,
           date: message.date,
           snippet: message.snippet,
@@ -873,6 +1033,71 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
   )
 
   app.get(
+    "/v1/capabilities/google-workspace/calendar-agenda",
+    describeRoute({
+      tags: ["Capability Sources"],
+      summary: "Get the primary Google Calendar agenda for today, tomorrow, or one local date",
+      description: "Preferred capability for listing the calling member's primary-calendar agenda for today, tomorrow, or one YYYY-MM-DD date. Omit timeZone to use the primary calendar's configured time zone; override it only when the user explicitly asks for another time zone.",
+      responses: {
+        200: jsonResponse("Google Calendar agenda returned.", calendarAgendaResponseSchema),
+        400: jsonResponse("The local date or time zone was invalid.", invalidRequestSchema),
+        401: jsonResponse("The caller must be signed in.", unauthorizedSchema),
+        409: jsonResponse("The calling member has not connected their Google account or is missing permission.", needsConnectionSchema),
+        502: jsonResponse("Google rejected the request.", upstreamErrorSchema),
+      },
+    }),
+    orgMemberRoute(),
+    queryValidator(calendarAgendaQuerySchema),
+    async (c) => {
+      const payload = c.get("organizationContext")
+      const token = await googleWorkspaceToken({
+        organizationId: payload.organization.id,
+        orgMembershipId: payload.currentMember.id,
+      })
+      if (token.kind === "google_api_error") {
+        return c.json({ error: "google_api_error", message: token.message }, 502)
+      }
+      if (token.kind === "needs_connection") {
+        return c.json({ error: "needs_connection", message: token.message }, 409)
+      }
+      if (missingScope(token.account, [CALENDAR_READ_SCOPE, CALENDAR_EVENTS_SCOPE])) {
+        return c.json({ error: "needs_connection", message: missingPermissionMessage("Google Calendar read") }, 409)
+      }
+
+      const query = c.req.valid("query")
+      let timeZone = query.timeZone
+      if (!timeZone) {
+        const timeZoneResult = await readPrimaryCalendarTimeZone(token.accessToken)
+        if (!timeZoneResult.ok) return c.json(timeZoneResult.error, 502)
+        timeZone = timeZoneResult.timeZone
+      }
+      let bounds: ReturnType<typeof calendarAgendaBounds>
+      try {
+        bounds = calendarAgendaBounds({ day: query.day, timeZone })
+      } catch (error) {
+        return c.json({
+          error: "invalid_request",
+          message: error instanceof Error ? error.message : "Invalid calendar agenda date or time zone.",
+        }, 400)
+      }
+      const result = await listPrimaryCalendarEvents({
+        accessToken: token.accessToken,
+        ...bounds,
+        maxResults: query.maxResults,
+      })
+      if (!result.ok) return c.json(result.error, 502)
+      return c.json({
+        ok: true,
+        date: bounds.date,
+        timeZone,
+        timeMin: bounds.timeMin,
+        timeMax: bounds.timeMax,
+        events: result.events,
+      })
+    },
+  )
+
+  app.get(
     "/v1/capabilities/google-workspace/calendar-events",
     describeRoute({
       tags: ["Capability Sources"],
@@ -904,94 +1129,14 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
       }
 
       const query = c.req.valid("query")
-      const url = new URL(`${calendarApiBase()}/calendar/v3/calendars/primary/events`)
-      url.searchParams.set("timeMin", query.timeMin)
-      url.searchParams.set("timeMax", query.timeMax)
-      url.searchParams.set("singleEvents", "true")
-      url.searchParams.set("orderBy", "startTime")
-      url.searchParams.set("maxResults", String(query.maxResults))
-
-      const response = await googleWorkspaceApiFetch(url, {
-        headers: { authorization: `Bearer ${token.accessToken}` },
+      const result = await listPrimaryCalendarEvents({
+        accessToken: token.accessToken,
+        timeMin: query.timeMin,
+        timeMax: query.timeMax,
+        maxResults: query.maxResults,
       })
-      if (!response.ok) {
-        return c.json(await googleApiError("Google Calendar events list", response), 502)
-      }
-
-      return c.json({ ok: true, events: extractCalendarEvents(await readJson(response)) })
-    },
-  )
-
-  app.get(
-    "/v1/capabilities/google-workspace/calendar-agenda",
-    describeRoute({
-      tags: ["Capability Sources"],
-      summary: "Show the calling member's Google Calendar agenda for today, tomorrow, or the next seven days",
-      description: "Lists events from the calling member's primary Google Calendar without requiring the agent to calculate the current time or timestamps. The server reads the member's primary-calendar timezone and derives a valid UTC RFC3339 range itself. Use this for requests such as today's agenda, tomorrow's calendar, or the next meeting; use calendar-events only when the user has supplied a specific time range.",
-      responses: {
-        200: jsonResponse("Google Calendar agenda returned.", calendarAgendaResponseSchema),
-        401: jsonResponse("The caller must be signed in.", unauthorizedSchema),
-        409: jsonResponse("The calling member has not connected their Google account or is missing permission.", needsConnectionSchema),
-        502: jsonResponse("Google rejected the request.", upstreamErrorSchema),
-      },
-    }),
-    orgMemberRoute(),
-    queryValidator(calendarAgendaQuerySchema),
-    async (c) => {
-      const payload = c.get("organizationContext")
-      const token = await googleWorkspaceToken({
-        organizationId: payload.organization.id,
-        orgMembershipId: payload.currentMember.id,
-      })
-      if (token.kind === "google_api_error") {
-        return c.json({ error: "google_api_error", message: token.message }, 502)
-      }
-      if (token.kind === "needs_connection") {
-        return c.json({ error: "needs_connection", message: token.message }, 409)
-      }
-      if (missingScope(token.account, [CALENDAR_READ_SCOPE, CALENDAR_EVENTS_SCOPE])) {
-        return c.json({ error: "needs_connection", message: missingPermissionMessage("Google Calendar read") }, 409)
-      }
-
-      const query = c.req.valid("query")
-      const calendarUrl = new URL(`${calendarApiBase()}/calendar/v3/users/me/calendarList/primary`)
-      calendarUrl.searchParams.set("fields", "timeZone")
-      const calendarResponse = await googleWorkspaceApiFetch(calendarUrl, {
-        headers: { authorization: `Bearer ${token.accessToken}` },
-      })
-      if (!calendarResponse.ok) {
-        return c.json(await googleApiError("Google Calendar timezone lookup", calendarResponse), 502)
-      }
-      const timeZone = extractCalendarTimeZone(await readJson(calendarResponse))
-      if (!timeZone) {
-        return c.json({ error: "google_api_error", message: "Google Calendar returned no primary-calendar timezone." }, 502)
-      }
-
-      const { timeMin, timeMax } = buildCalendarAgendaWindow({
-        period: query.period,
-        timeZone,
-        now: new Date(),
-      })
-      const eventsUrl = new URL(`${calendarApiBase()}/calendar/v3/calendars/primary/events`)
-      eventsUrl.searchParams.set("timeMin", timeMin)
-      eventsUrl.searchParams.set("timeMax", timeMax)
-      eventsUrl.searchParams.set("singleEvents", "true")
-      eventsUrl.searchParams.set("orderBy", "startTime")
-      eventsUrl.searchParams.set("maxResults", String(query.maxResults))
-
-      const eventsResponse = await googleWorkspaceApiFetch(eventsUrl, {
-        headers: { authorization: `Bearer ${token.accessToken}` },
-      })
-      if (!eventsResponse.ok) {
-        return c.json(await googleApiError("Google Calendar agenda list", eventsResponse), 502)
-      }
-
-      return c.json({
-        ok: true,
-        period: query.period,
-        timeZone,
-        events: extractCalendarEvents(await readJson(eventsResponse)),
-      })
+      if (!result.ok) return c.json(result.error, 502)
+      return c.json({ ok: true, events: result.events })
     },
   )
 
@@ -1124,6 +1269,94 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
         end: event.end,
         meetLink: event.meetLink,
       })
+    },
+  )
+
+  app.post(
+    "/v1/capabilities/google-workspace/native-files",
+    describeRoute({
+      tags: ["Capability Sources"],
+      summary: "Create a native Google document, spreadsheet, or presentation",
+      description: "Creates exactly one Google Docs document, Google Sheets spreadsheet, or Google Slides presentation from structured content, optionally moves it into a Drive folder, and returns the real Drive link. Use this only when the user explicitly asks to create or publish the Google file; drafting local content does not call this capability.",
+      responses: {
+        200: jsonResponse("Native Google file created.", nativeFileResponseSchema),
+        400: jsonResponse("The native file request was invalid.", invalidRequestSchema),
+        401: jsonResponse("The caller must be signed in.", unauthorizedSchema),
+        409: jsonResponse("The calling member has not connected their Google account or is missing permission.", needsConnectionSchema),
+        502: jsonResponse("Google rejected the request.", upstreamErrorSchema),
+      },
+    }),
+    orgMemberRoute(),
+    jsonValidator(nativeFileCreateBodySchema),
+    async (c) => {
+      const payload = c.get("organizationContext")
+      const token = await googleWorkspaceToken({
+        organizationId: payload.organization.id,
+        orgMembershipId: payload.currentMember.id,
+      })
+      if (token.kind === "google_api_error") return c.json({ error: "google_api_error", message: token.message }, 502)
+      if (token.kind === "needs_connection") return c.json({ error: "needs_connection", message: token.message }, 409)
+      if (missingScope(token.account, [DRIVE_FILE_SCOPE, DRIVE_FULL_SCOPE])) {
+        return c.json({ error: "needs_connection", message: missingPermissionMessage("Google Drive write") }, 409)
+      }
+
+      const input = c.req.valid("json")
+      try {
+        const file = await createNativeGoogleFile(input, {
+          accessToken: token.accessToken,
+          apiBase: nativeFileApiBase(input.type),
+          driveApiBase: driveApiBase(),
+          fetch: googleWorkspaceApiFetch,
+        })
+        return c.json({ ok: true, file })
+      } catch (error) {
+        return c.json(nativeFileError(error), 502)
+      }
+    },
+  )
+
+  app.patch(
+    "/v1/capabilities/google-workspace/native-file/:fileId",
+    describeRoute({
+      tags: ["Capability Sources"],
+      summary: "Replace a native Google document, spreadsheet, or presentation",
+      description: "Replaces the complete editable content of one existing Google Docs document, Google Sheets spreadsheet, or Google Slides presentation by file id. It can also rename or move the file and returns the real Drive link. Use this only when the user explicitly asks to update that existing Google file.",
+      responses: {
+        200: jsonResponse("Native Google file updated.", nativeFileResponseSchema),
+        400: jsonResponse("The native file request was invalid.", invalidRequestSchema),
+        401: jsonResponse("The caller must be signed in.", unauthorizedSchema),
+        409: jsonResponse("The calling member has not connected their Google account or is missing permission.", needsConnectionSchema),
+        502: jsonResponse("Google rejected the request.", upstreamErrorSchema),
+      },
+    }),
+    orgMemberRoute(),
+    paramValidator(nativeFileParamSchema),
+    jsonValidator(nativeFileUpdateBodySchema),
+    async (c) => {
+      const payload = c.get("organizationContext")
+      const token = await googleWorkspaceToken({
+        organizationId: payload.organization.id,
+        orgMembershipId: payload.currentMember.id,
+      })
+      if (token.kind === "google_api_error") return c.json({ error: "google_api_error", message: token.message }, 502)
+      if (token.kind === "needs_connection") return c.json({ error: "needs_connection", message: token.message }, 409)
+      if (missingScope(token.account, [DRIVE_FILE_SCOPE, DRIVE_FULL_SCOPE])) {
+        return c.json({ error: "needs_connection", message: missingPermissionMessage("Google Drive write") }, 409)
+      }
+
+      const { fileId } = c.req.valid("param")
+      const input = c.req.valid("json")
+      try {
+        const file = await updateNativeGoogleFile(fileId, input, {
+          accessToken: token.accessToken,
+          apiBase: nativeFileApiBase(input.type),
+          driveApiBase: driveApiBase(),
+          fetch: googleWorkspaceApiFetch,
+        })
+        return c.json({ ok: true, file })
+      } catch (error) {
+        return c.json(nativeFileError(error), 502)
+      }
     },
   )
 

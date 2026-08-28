@@ -38,6 +38,10 @@ import type {
   DesktopCommandInvokers,
   DesktopCommandName,
   DesktopCommandResult,
+  DesktopBinaryDownloadInput,
+  DesktopBinaryDownloadResult,
+  DesktopFetchResult,
+  DesktopMultipartUploadInput,
   EvalRelaunchResult,
   NukeManifestPreview,
   NukeOptions,
@@ -55,17 +59,40 @@ export type BrowserProxyState = {
   proxy: { rules: string; authenticated: boolean } | null;
 };
 
+export type RecoveryRelease = {
+  id: string;
+  version: string;
+  marking: "current" | "previous" | null;
+};
+
+export type RecoveryActionResult = {
+  ok: boolean;
+  action?: "install" | "installer" | "eval";
+  message?: string;
+  reason?: string;
+};
+
 // ---------------------------------------------------------------------------
 // Electron bridge surface
 // ---------------------------------------------------------------------------
 
 declare global {
   interface Window {
+    __openworkRecoveryControl?: {
+      snapshot: () => Promise<unknown>;
+      select: (id: string) => Promise<unknown>;
+    };
     __OPENWORK_ELECTRON__?: {
       invokeDesktop?: <C extends DesktopCommandName>(
         command: C,
         ...args: DesktopCommandArgs<C>
       ) => Promise<DesktopCommandResult<C>>;
+      automationRunner?: {
+        onCredentialRejected?: (callback: () => void) => () => void;
+      };
+      fileSystem?: {
+        getPathForFile?: (file: File) => string;
+      };
       shell?: {
         openExternal?: (url: string) => Promise<{ ok: boolean; error?: string } | void>;
         relaunch?: () => Promise<void>;
@@ -133,6 +160,16 @@ declare global {
         download?: () => Promise<{ ok: boolean; reason?: string }>;
         installAndRestart?: () => Promise<{ ok: boolean; reason?: string }>;
       };
+      recovery?: {
+        recordHealthy?: () => Promise<unknown>;
+        list?: (policy: {
+          versions: string[];
+          minimumVersion: string;
+          allowedVersions?: string[];
+        }) => Promise<{ ok: boolean; releases: RecoveryRelease[]; reason?: string }>;
+        restorePrevious?: () => Promise<RecoveryActionResult>;
+        use?: (id: string) => Promise<RecoveryActionResult>;
+      };
       browser?: {
         show?: (bounds: { x: number; y: number; width: number; height: number }) => Promise<void>;
         hide?: () => Promise<void>;
@@ -177,6 +214,7 @@ declare global {
         initialDeepLinks?: string[];
         platform?: "darwin" | "linux" | "windows";
         version?: string;
+        evalFatalBootstrapFailure?: string | null;
       };
     };
   }
@@ -274,6 +312,72 @@ function isLoopbackUrl(input: RequestInfo | URL): boolean {
   }
 }
 
+function desktopTransferId(): string {
+  return crypto.randomUUID();
+}
+
+async function runCancellableDesktopTransfer<T>(
+  transferId: string,
+  signal: AbortSignal | undefined,
+  operation: () => Promise<T>,
+): Promise<T> {
+  if (signal?.aborted) throw signal.reason;
+  const cancel = () => {
+    void invokeElectronHelper("__cancelTransfer", transferId);
+  };
+  signal?.addEventListener("abort", cancel, { once: true });
+  try {
+    return await operation();
+  } finally {
+    signal?.removeEventListener("abort", cancel);
+  }
+}
+
+export function electronLocalPathForFile(file: File): string | null {
+  const getPathForFile = window.__OPENWORK_ELECTRON__?.fileSystem?.getPathForFile;
+  if (!getPathForFile) return null;
+  try {
+    return getPathForFile(file).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+export async function desktopUploadMultipart(
+  file: File,
+  input: Omit<DesktopMultipartUploadInput, "transferId" | "bytes" | "filename" | "size" | "contentType">,
+  signal?: AbortSignal,
+): Promise<DesktopFetchResult> {
+  const transferId = desktopTransferId();
+  // The renderer hands over the bytes it already holds for this File; the
+  // main process never reads renderer-chosen paths for uploads.
+  const payload: DesktopMultipartUploadInput = {
+    ...input,
+    transferId,
+    bytes: await file.arrayBuffer(),
+    filename: file.name,
+    size: file.size,
+    contentType: file.type || undefined,
+  };
+  return runCancellableDesktopTransfer(
+    transferId,
+    signal,
+    () => invokeElectronHelper("__uploadMultipart", payload),
+  );
+}
+
+export async function desktopDownloadBinary(
+  input: Omit<DesktopBinaryDownloadInput, "transferId">,
+  signal?: AbortSignal,
+): Promise<DesktopBinaryDownloadResult> {
+  const transferId = desktopTransferId();
+  return runCancellableDesktopTransfer(
+    transferId,
+    signal,
+    () => invokeElectronHelper("__downloadBinary", { ...input, transferId }),
+  );
+}
+
 type DesktopFetchMainOptions = {
   timeoutMs?: number;
   agentContextDiagnosticsDeadlineAtMs?: number;
@@ -363,17 +467,31 @@ export async function desktopFetchAgentContextDiagnostics(
 // Convenience wrappers
 // ---------------------------------------------------------------------------
 
+export function assertDesktopWebUrl(url: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error("Only valid web links can be opened externally.");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(`External URL protocol "${parsed.protocol}" is not allowed.`);
+  }
+  return parsed.toString();
+}
+
 export async function openDesktopUrl(url: string): Promise<void> {
+  const safeUrl = assertDesktopWebUrl(url);
   const openExternal = window.__OPENWORK_ELECTRON__?.shell?.openExternal;
   if (openExternal) {
-    const result = await openExternal(url);
+    const result = await openExternal(safeUrl);
     if (result && result.ok === false) {
       throw new Error(result.error ?? "Failed to open browser");
     }
     return;
   }
   if (typeof window !== "undefined") {
-    window.open(url, "_blank", "noopener,noreferrer");
+    window.open(safeUrl, "_blank", "noopener,noreferrer");
   }
 }
 

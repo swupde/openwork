@@ -60,7 +60,7 @@ describe("observability env contract", () => {
         OTEL_TRACES_SAMPLER: "parentbased_traceidratio",
         OTEL_TRACES_SAMPLER_ARG: "0.25",
       },
-      { serviceName: "den-worker-proxy" },
+      { serviceName: "den-api" },
     )
 
     expect(config.backend).toBe("otel")
@@ -216,7 +216,7 @@ describe("observability env contract", () => {
     if (config.backend !== "sentry") {
       throw new Error("expected sentry backend")
     }
-    expect(config.sentry.tracesSampleRate).toBe(1)
+    expect(config.sentry.tracesSampleRate).toBe(0.01)
 
     expect(() => parseObservabilityEnv(
       { DEN_OBSERVABILITY_BACKEND: "sentry" },

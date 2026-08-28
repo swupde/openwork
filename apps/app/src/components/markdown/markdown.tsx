@@ -1,6 +1,5 @@
 /** @jsxImportSource react */
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { motion } from "motion/react";
 
 import {
   Dialog,
@@ -9,6 +8,7 @@ import {
 } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import { useOpenTargets } from "@/lib/target-provider";
+import { useOpenArtifactPath } from "@/lib/artifacts";
 import type { OpenTarget } from "@/react-app/domains/session/artifacts/open-target";
 
 import { applyTextHighlights } from "./text-highlights";
@@ -17,9 +17,12 @@ import {
   renderHighlightedMarkdownHtml,
   renderMarkdownHtml,
   setCodeCopyButtonState,
+  setCodeWrapButtonState,
   syncMarkdownImagePreviews,
 } from "./markdown-primitive";
 import { LinkActionMenu } from "./link-action-menu";
+import { useMermaidEnhancer } from "./mermaid";
+import { useSelectionStableValue } from "./selection-stability";
 
 export { renderHighlightedMarkdownHtml, renderMarkdownHtml } from "./markdown-primitive";
 
@@ -88,7 +91,7 @@ type MarkdownBlockInnerProps = {
   streaming?: boolean;
   highlightQuery?: string;
 } & Omit<
-  React.ComponentProps<typeof motion.div>,
+  React.ComponentProps<"div">,
   "ref" | "className" | "children" | "dangerouslySetInnerHTML"
 >;
 
@@ -101,7 +104,9 @@ function MarkdownBlockInner({
 }: MarkdownBlockInnerProps) {
   const rootRef = useRef<HTMLDivElement>(null);
   const codeCopyResetTimers = useRef(new Map<HTMLButtonElement, number>());
+  const codeWrapStates = useRef(new Map<number, boolean>());
   const { openTargets, onOpenTarget } = useOpenTargets();
+  const openArtifactPath = useOpenArtifactPath();
   const [linkMenu, setLinkMenu] = useState<{ target: OpenTarget; rect: DOMRect } | null>(null);
   const [imagePreview, setImagePreview] = useState<{ src: string; alt: string } | null>(null);
   const syncHtml = useMemo(() => {
@@ -129,6 +134,22 @@ function MarkdownBlockInner({
     }, CODE_COPY_RESET_DELAY_MS);
     codeCopyResetTimers.current.set(button, resetTimer);
   }, []);
+
+  const syncCodeWrapStates = useCallback(() => {
+    const root = rootRef.current;
+    if (!root) return;
+
+    for (const [index, codeBlock] of root.querySelectorAll("[data-openwork-code-block]").entries()) {
+      const button = codeBlock.querySelector("[data-openwork-code-wrap]");
+      if (button instanceof HTMLButtonElement) {
+        setCodeWrapButtonState(button, codeWrapStates.current.get(index) ?? false);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    codeWrapStates.current.clear();
+  }, [text]);
 
   useEffect(() => {
     const timers = codeCopyResetTimers.current;
@@ -162,13 +183,14 @@ function MarkdownBlockInner({
     };
   }, [streaming, text]);
 
-  const html = !streaming && highlightedHtml?.text === text ? highlightedHtml.html : syncHtml;
+  const candidateHtml = !streaming && highlightedHtml?.text === text ? highlightedHtml.html : syncHtml;
+  const html = useSelectionStableValue(rootRef, candidateHtml);
+  const stableInnerHtml = useMemo(() => ({ __html: html }), [html]);
+  useMermaidEnhancer(rootRef, html, !streaming);
 
-  // Re-apply search highlights after EVERY render (no dependency array on
-  // purpose): motion.div re-sets dangerouslySetInnerHTML on unrelated
-  // re-renders (e.g. open-target context updates), silently wiping the
-  // <mark> nodes without `html`/`highlightQuery` changing. With no active
-  // query this is a single querySelector fast path.
+  // Keep the innerHTML prop referentially stable too: a fresh wrapper object
+  // can make an unrelated React render replace selected text nodes even when
+  // the HTML string itself is unchanged.
   useEffect(() => {
     const root = rootRef.current;
 
@@ -182,8 +204,9 @@ function MarkdownBlockInner({
       }
 
       applyTextHighlights(root, highlightQuery ?? "");
+      syncCodeWrapStates();
     });
-  });
+  }, [highlightQuery, html]);
 
   useEffect(() => {
     const root = rootRef.current;
@@ -211,6 +234,30 @@ function MarkdownBlockInner({
         return;
       }
 
+      const inlineCodePath = event.target.closest("[data-openwork-inline-code-path]");
+      if (inlineCodePath instanceof HTMLElement) {
+        event.preventDefault();
+        event.stopPropagation();
+        openArtifactPath(inlineCodePath.dataset.openworkInlineCodePath ?? "");
+        return;
+      }
+
+      const wrapButton = event.target.closest("[data-openwork-code-wrap]");
+      if (wrapButton instanceof HTMLButtonElement) {
+        event.preventDefault();
+        event.stopPropagation();
+
+        const codeBlock = wrapButton.closest("[data-openwork-code-block]");
+        const codeBlocks = Array.from(root.querySelectorAll("[data-openwork-code-block]"));
+        const index = codeBlock ? codeBlocks.indexOf(codeBlock) : -1;
+        if (index >= 0) {
+          const wrapped = !(codeWrapStates.current.get(index) ?? false);
+          codeWrapStates.current.set(index, wrapped);
+          setCodeWrapButtonState(wrapButton, wrapped);
+        }
+        return;
+      }
+
       const chevron = event.target.closest("[data-openwork-link-chevron]");
       if (chevron instanceof HTMLElement) {
         event.preventDefault();
@@ -230,7 +277,7 @@ function MarkdownBlockInner({
 
         if (target && onOpenTarget) {
           event.preventDefault();
-          onOpenTarget(target, { external: true });
+          onOpenTarget(target);
           return;
         }
       }
@@ -245,13 +292,24 @@ function MarkdownBlockInner({
       setImagePreview({ src: image.src, alt: image.alt || "Image" });
     };
 
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      if (!(event.target instanceof HTMLElement) || !event.target.matches("[data-openwork-inline-code-path]")) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      openArtifactPath(event.target.dataset.openworkInlineCodePath ?? "");
+    };
+
     root.addEventListener("load", handleLoad, true);
     root.addEventListener("click", handleClick);
+    root.addEventListener("keydown", handleKeyDown);
 
     if (globalThis.ResizeObserver === undefined) {
       return () => {
         root.removeEventListener("load", handleLoad, true);
         root.removeEventListener("click", handleClick);
+        root.removeEventListener("keydown", handleKeyDown);
       };
     }
 
@@ -262,8 +320,9 @@ function MarkdownBlockInner({
       observer.disconnect();
       root.removeEventListener("load", handleLoad, true);
       root.removeEventListener("click", handleClick);
+      root.removeEventListener("keydown", handleKeyDown);
     };
-  }, [handleCodeBlockCopy, html, onOpenTarget, openTargets]);
+  }, [handleCodeBlockCopy, html, onOpenTarget, openArtifactPath, openTargets]);
 
   if (!html) {
     return null;
@@ -271,10 +330,10 @@ function MarkdownBlockInner({
 
   return (
     <>
-      <motion.div
+      <div
         ref={rootRef}
-        className={cn("markdown-content max-w-none text-foreground", className)}
-        dangerouslySetInnerHTML={{ __html: html }}
+        className={cn("markdown-content max-w-none select-text text-foreground", className)}
+        dangerouslySetInnerHTML={stableInnerHtml}
         {...props}
       />
       {linkMenu && onOpenTarget ? (

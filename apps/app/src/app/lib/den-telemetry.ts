@@ -11,6 +11,8 @@
  */
 
 import { type DenSettings, readDenSettings, resolveDenBaseUrls } from "./den";
+import { desktopFetchViaMain } from "./desktop";
+import { isDesktopRuntime } from "./runtime-env";
 
 const INGEST_PATH = "/v1/telemetry/ingest";
 const INGEST_TIMEOUT_MS = 5_000;
@@ -40,11 +42,12 @@ let flushTimer: ReturnType<typeof setTimeout> | null = null;
 const FLUSH_INTERVAL_MS = 10_000;
 const MAX_BATCH_SIZE = 50;
 
-function getResolvedIngestUrl(settings: DenSettings): string | null {
+export function resolveDenTelemetryIngestUrl(settings: DenSettings): string | null {
   if (!settings.authToken) return null;
 
   const baseUrls = resolveDenBaseUrls({
     baseUrl: settings.baseUrl,
+    apiBaseUrl: settings.apiBaseUrl,
   });
 
   return `${baseUrls.apiBaseUrl}${INGEST_PATH}`;
@@ -59,7 +62,7 @@ async function flushEvents(): Promise<void> {
     return;
   }
 
-  const url = getResolvedIngestUrl(settings);
+  const url = resolveDenTelemetryIngestUrl(settings);
   if (!url) {
     pendingEvents = [];
     return;
@@ -72,7 +75,10 @@ async function flushEvents(): Promise<void> {
     const timeout = setTimeout(() => controller.abort(), INGEST_TIMEOUT_MS);
 
     try {
-      await globalThis.fetch(url, {
+      const fetchImpl = isDesktopRuntime() && new URL(url).origin !== window.location.origin
+        ? desktopFetchViaMain
+        : globalThis.fetch;
+      await fetchImpl(url, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",

@@ -37,13 +37,40 @@
       "override": null
     },
     {
+      "host": "api.openwork.software",
+      "kind": "fetched",
+      "components": ["server"],
+      "purpose": "Legacy hosted OpenWork Connect API origin retained for older Cloud configurations.",
+      "requirement": "optional",
+      "blockedEffect": "Older hosted configurations that still use the legacy API origin cannot reconcile OpenWork Connect or native MCP Apps.",
+      "override": "self-hosted Den API origin"
+    },
+    {
       "host": "api.openworklabs.com",
       "kind": "fetched",
-      "components": ["desktop", "installer", "server"],
-      "purpose": "Hosted OpenWork public API and OpenWork Connect MCP endpoint used by hosted Cloud and install flows.",
-      "requirement": "required-for-cloud",
-      "blockedEffect": "Hosted install checks, OpenWork Connect, or legacy hosted API configurations cannot reach OpenWork Cloud.",
+      "components": ["installer", "server"],
+      "purpose": "Legacy hosted OpenWork public API origin retained for older install and Cloud configurations.",
+      "requirement": "optional",
+      "blockedEffect": "Older hosted install or API configurations that still use this legacy origin cannot reach OpenWork Cloud.",
       "override": "installer apiUrl / self-hosted Den API origin"
+    },
+    {
+      "host": "api.app.openworklabs.com",
+      "kind": "fetched",
+      "components": ["desktop", "renderer", "server"],
+      "purpose": "Hosted OpenWork Den API origin derived from app.openworklabs.com for desktop Den API and OpenWork Connect MCP calls.",
+      "requirement": "required-for-cloud",
+      "blockedEffect": "Hosted Cloud desktop configuration, telemetry, sign-out, and OpenWork Connect MCP calls cannot reach the Den API.",
+      "override": "desktop apiBaseUrl / self-hosted Den API origin"
+    },
+    {
+      "host": "app.openwork.software",
+      "kind": "fetched",
+      "components": ["server"],
+      "purpose": "Legacy hosted OpenWork Cloud web origin retained for older desktop configurations.",
+      "requirement": "optional",
+      "blockedEffect": "Older hosted configurations that still derive Den MCP calls from the legacy web origin cannot reconcile OpenWork Connect or native MCP Apps.",
+      "override": "desktop base URL (self-hosted Den replaces this host)"
     },
     {
       "host": "app.openworklabs.com",

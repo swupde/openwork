@@ -19,14 +19,17 @@ import { authenticatedRoute, jsonValidator, orgMemberRoute, orgRoleRoute, public
 import { denTypeIdSchema, enterprisePlanRequiredSchema, forbiddenSchema, invalidRequestSchema, jsonResponse, notFoundSchema, unauthorizedSchema } from "../../openapi.js"
 import { validateInvitationAcceptVerification } from "../../organization-join-verification.js"
 import { normalizeOrganizationMetadata } from "../../organization-limits.js"
+import { isOpenWorkWebAvailable } from "../../openwork-web-availability.js"
 import {
   acceptInvitationForUser,
   createOrganizationForUser,
+  getOrganizationContextForUser,
   getInvitationPreview,
   getSingletonSsoStatus,
   normalizeAllowedEmailDomains,
   OrganizationEmailDomainRestrictionError,
   serializeMemberFacingOrganizationMetadata,
+  seedDefaultOrganizationRoles,
   setSessionActiveOrganization,
   type AcceptInvitationForUserResult,
   updateOrganizationSettings,
@@ -34,7 +37,7 @@ import {
 import { getRequiredUserEmail } from "../../user.js"
 import { checkRateLimit } from "../../utils/rate-limit.js"
 import type { OrgRouteVariables } from "./shared.js"
-import { ensureOrganizationSuperAdmin, orgAccessFailureStatus } from "./shared.js"
+import { ensureOrganizationAdminRole, ensureOrganizationSuperAdmin, orgAccessFailureStatus } from "./shared.js"
 
 const createOrganizationSchema = z.object({
   name: z.string().trim().min(2).max(120),
@@ -55,6 +58,10 @@ const updateOrganizationSchema = z.object({
 
 const resolveSsoByEmailQuerySchema = z.object({
   email: z.string().trim().email(),
+})
+
+const organizationContextQuerySchema = z.object({
+  refreshRoles: z.enum(["true", "false"]).optional().transform((value) => value === "true"),
 })
 
 const resolveSsoByEmailResponseSchema = z.object({
@@ -103,6 +110,11 @@ const invitationPreviewQuerySchema = z.object({
 const acceptInvitationSchema = z.object({
   id: z.string().trim().min(1).max(255),
 })
+
+const scimDeprovisionedSchema = z.object({
+  error: z.literal("scim_deprovisioned"),
+  message: z.string(),
+}).meta({ ref: "ScimDeprovisionedError" })
 
 const organizationResponseSchema = z.object({
   organization: z.object({}).passthrough().nullable(),
@@ -356,7 +368,7 @@ export function registerOrgCoreRoutes<T extends { Variables: OrgRouteVariables }
         400: jsonResponse("The invitation acceptance request body was invalid.", invalidRequestSchema),
         401: jsonResponse("The caller must be signed in to accept an invitation.", unauthorizedSchema),
         403: jsonResponse("API keys cannot accept invitations, or the deployment requires a verified account email.", forbiddenSchema),
-        409: jsonResponse("The current account email is not allowed to join this organization.", accountEmailDomainNotAllowedSchema),
+        409: jsonResponse("The account cannot join this organization.", z.union([accountEmailDomainNotAllowedSchema, scimDeprovisionedSchema])),
         410: jsonResponse("The user previously accepted this invitation, but their workspace access was removed.", membershipRemovedSchema),
         404: jsonResponse("The invitation could not be found.", notFoundSchema),
       },
@@ -415,6 +427,12 @@ export function registerOrgCoreRoutes<T extends { Variables: OrgRouteVariables }
         error: "membership_removed",
         message: "Your access to this workspace was removed. Ask a workspace admin for a new invite.",
       }, 410)
+    }
+    if (accepted.status === "scim_deprovisioned") {
+      return c.json({
+        error: "scim_deprovisioned",
+        message: "This member is managed by your identity provider. Restore their access in the IdP.",
+      }, 409)
     }
 
     await setRequestActiveOrganization(c, accepted.member.organizationId)
@@ -631,9 +649,31 @@ export function registerOrgCoreRoutes<T extends { Variables: OrgRouteVariables }
       },
     }),
     orgMemberRoute(),
+    queryValidator(organizationContextQuerySchema),
     resolveMemberTeamsMiddleware,
     async (c) => {
-      const payload = c.get("organizationContext")
+      let payload = c.get("organizationContext")
+      const query = c.req.valid("query")
+
+      if (query.refreshRoles) {
+        const permission = ensureOrganizationAdminRole(c, "Only workspace owners and admins can refresh organization roles.")
+        if (!permission.ok) {
+          return c.json(permission.response, orgAccessFailureStatus(permission.response))
+        }
+
+        await seedDefaultOrganizationRoles(payload.organization.id)
+        const refreshedPayload = await getOrganizationContextForUser({
+          organizationId: payload.organization.id,
+          userId: normalizeDenTypeId("user", c.get("user").id),
+        })
+        if (!refreshedPayload) {
+          return c.json({ error: "organization_not_found" }, 404)
+        }
+
+        payload = refreshedPayload
+        c.set("organizationContext", payload)
+      }
+
       const owner = payload.members.find((member: typeof payload.members[number]) => member.isOwner) ?? null
       const cloudEnabled = organizationCloudEnabled(payload.organization.metadata, { orgMode: env.orgMode })
       const [ssoRows, scimRows] = await Promise.all([
@@ -668,14 +708,27 @@ export function registerOrgCoreRoutes<T extends { Variables: OrgRouteVariables }
         plan: parseOrganizationPlan(payload.organization.metadata),
         entitlements: getOrganizationEntitlements(payload.organization.metadata),
         capabilities: {
+          // Protocol capability: clients must see this explicit signal before
+          // calling the dashboard routes. Older Den versions omit the field,
+          // allowing newer Desktop builds to fail closed during a staggered
+          // rollout instead of calling an endpoint that does not exist yet.
+          orgManagedDashboards: true,
           // Expose the effective value, not the raw stored flag: Connect is
           // member-facing default-on unless an explicit org kill switch says no.
           mcpConnections: memberFacingMcpConnectionsEnabled(payload.organization.metadata, {
             gatingEnabled: env.mcpConnectionsGatingEnabled,
           }),
+          // Workflows/Code Mode are enabled for every organization; the field
+          // remains for published clients that still read it.
+          workflows: true,
           installLinks: organizationInstallLinksEnabled(payload.organization.metadata, {
             gatingEnabled: env.installLinksGatingEnabled,
           }),
+          // Deployment capability: OpenWork Web is generally available to all
+          // organizations only when a hosted-style multi-org Den has the
+          // dedicated Stripe Web product configured. This is never read from
+          // mutable organization metadata.
+          openworkWeb: isOpenWorkWebAvailable(),
           ...(cloudEnabled ? { cloud: true } : {}),
         },
         authMethods: {

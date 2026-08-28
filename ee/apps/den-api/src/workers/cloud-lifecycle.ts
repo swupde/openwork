@@ -1,11 +1,12 @@
-import { and, asc, eq, isNull, lt, or } from "@openwork-ee/den-db/drizzle"
-import { WorkerTable, WorkerTokenTable } from "@openwork-ee/den-db/schema"
+import { and, asc, eq, inArray, isNull, lt, notExists, or } from "@openwork-ee/den-db/drizzle"
+import { AutomationRunTable, AutomationTable, MemberTable, WorkerTable, WorkerTokenTable } from "@openwork-ee/den-db/schema"
 import { db } from "../db.js"
 import { env } from "../env.js"
 import { materializeCloudWorkerProviders } from "../llm/cloud-provider-materialization.js"
 import { appLogger } from "../observability/logger.js"
 import { captureException } from "../observability/runtime.js"
 import { CLOUD_INSTANCE_BACKEND } from "./cloud-constants.js"
+import { automationUpdateChangedRows } from "../automations/update-result.js"
 import {
   isDaytonaSandboxMissingError,
   provisionWorkerOnDaytona,
@@ -13,6 +14,8 @@ import {
   wakeWorkerOnDaytona,
   type StopWorkerOnDaytonaResult,
 } from "./daytona.js"
+import { withProvisionDeadline } from "./provision-deadline.js"
+import { touchProvisioningWorker, withProvisioningHeartbeat } from "./provisioning-heartbeat.js"
 
 type WorkerId = typeof WorkerTable.$inferSelect.id
 type WorkerStatus = typeof WorkerTable.$inferSelect.status
@@ -26,7 +29,10 @@ type CloudLifecycleStore = {
   getWorker: (workerId: WorkerId) => Promise<CloudWorker | null>
   getActiveTokens: (workerId: WorkerId) => Promise<WorkerToken[]>
   listIdleWorkers: (input: { idleBefore: Date; limit: number }) => Promise<CloudWorker[]>
+  reserveWake: (workerId: WorkerId) => Promise<boolean>
+  reserveIdleStop: (input: { workerId: WorkerId; idleBefore: Date }) => Promise<boolean>
   updateWorkerStatus: (input: { workerId: WorkerId; status: WorkerStatus; imageVersion?: string | null; onlyWhenStatus?: WorkerStatus }) => Promise<void>
+  touchProvisioningWorker: (workerId: WorkerId) => Promise<void>
 }
 
 type WakeCloudWorkerOptions = {
@@ -34,6 +40,8 @@ type WakeCloudWorkerOptions = {
   wakeWorker?: WakeWorkerOnDaytona
   provisionWorker?: ProvisionWorkerOnDaytona
   materializeProviders?: typeof materializeCloudWorkerProviders
+  deadlineMs?: number
+  heartbeatIntervalMs?: number
 }
 
 type StopIdleCloudWorkersOptions = {
@@ -79,6 +87,13 @@ const databaseCloudLifecycleStore: CloudLifecycleStore = {
       .from(WorkerTokenTable)
       .where(and(eq(WorkerTokenTable.worker_id, workerId), isNull(WorkerTokenTable.revoked_at)))
   },
+  async reserveWake(workerId) {
+    const result: unknown = await db.update(WorkerTable).set({ status: "provisioning" }).where(and(
+      eq(WorkerTable.id, workerId),
+      eq(WorkerTable.status, "stopped"),
+    ))
+    return automationUpdateChangedRows(result)
+  },
   async listIdleWorkers(input) {
     return db
       .select()
@@ -91,9 +106,44 @@ const databaseCloudLifecycleStore: CloudLifecycleStore = {
           lt(WorkerTable.last_active_at, input.idleBefore),
           and(isNull(WorkerTable.last_active_at), lt(WorkerTable.updated_at, input.idleBefore)),
         ),
+        // A scheduled headless run can be admitted before the worker's normal
+        // activity heartbeat lands. Keep idle shutdown from racing that run.
+        notExists(
+          db.select({ id: AutomationRunTable.id }).from(AutomationRunTable)
+            .innerJoin(AutomationTable, eq(AutomationTable.id, AutomationRunTable.automation_id))
+            .innerJoin(MemberTable, eq(MemberTable.id, AutomationTable.owner_member_id))
+            .where(and(
+              eq(AutomationTable.organization_id, WorkerTable.org_id),
+              eq(MemberTable.userId, WorkerTable.created_by_user_id),
+              eq(AutomationRunTable.execution_target, "cloud"),
+              inArray(AutomationRunTable.status, ["claimed", "running"]),
+            )),
+        ),
       ))
       .orderBy(asc(WorkerTable.updated_at))
       .limit(input.limit)
+  },
+  async reserveIdleStop(input) {
+    const result: unknown = await db.update(WorkerTable).set({ status: "provisioning" }).where(and(
+      eq(WorkerTable.id, input.workerId),
+      eq(WorkerTable.status, "healthy"),
+      or(
+        lt(WorkerTable.last_active_at, input.idleBefore),
+        and(isNull(WorkerTable.last_active_at), lt(WorkerTable.updated_at, input.idleBefore)),
+      ),
+      notExists(
+        db.select({ id: AutomationRunTable.id }).from(AutomationRunTable)
+          .innerJoin(AutomationTable, eq(AutomationTable.id, AutomationRunTable.automation_id))
+          .innerJoin(MemberTable, eq(MemberTable.id, AutomationTable.owner_member_id))
+          .where(and(
+            eq(AutomationTable.organization_id, WorkerTable.org_id),
+            eq(MemberTable.userId, WorkerTable.created_by_user_id),
+            eq(AutomationRunTable.execution_target, "cloud"),
+            inArray(AutomationRunTable.status, ["claimed", "running"]),
+          )),
+      ),
+    ))
+    return automationUpdateChangedRows(result)
   },
   async updateWorkerStatus(input) {
     const update = input.imageVersion === undefined
@@ -107,6 +157,7 @@ const databaseCloudLifecycleStore: CloudLifecycleStore = {
         ? and(eq(WorkerTable.id, input.workerId), eq(WorkerTable.status, input.onlyWhenStatus))
         : eq(WorkerTable.id, input.workerId))
   },
+  touchProvisioningWorker,
 }
 
 export function cloudWorkerIdleReferenceTime(worker: Pick<CloudWorker, "last_active_at" | "updated_at">) {
@@ -129,21 +180,25 @@ async function safelyMarkWorkerFailed(store: CloudLifecycleStore, workerId: Work
   }
 }
 
-async function runWakeCloudWorker(workerId: WorkerId, options: WakeCloudWorkerOptions) {
+async function runClaimedCloudWorkerRecovery(workerId: WorkerId, options: WakeCloudWorkerOptions) {
   const store = options.store ?? databaseCloudLifecycleStore
   const wakeWorker = options.wakeWorker ?? wakeWorkerOnDaytona
   const provisionWorker = options.provisionWorker ?? provisionWorkerOnDaytona
   const materializeProviders = options.materializeProviders ?? materializeCloudWorkerProviders
+  const deadlineMs = options.deadlineMs ?? env.cloudProvisionDeadlineMs
 
   try {
     const worker = await store.getWorker(workerId)
 
     if (!worker) {
-      logger.error("worker wake failed", { worker_id: workerId, reason: "worker_not_found" })
+      logger.error("claimed worker recovery failed", { worker_id: workerId, reason: "worker_not_found" })
       return
     }
 
-    await store.updateWorkerStatus({ workerId, status: "provisioning", onlyWhenStatus: "stopped" })
+    // The caller atomically moved the worker to provisioning before entering
+    // this primitive. Only that claimant invokes the provider action; other
+    // replicas observe provisioning and poll instead.
+    if (worker.status !== "provisioning") return
 
     const tokens = await store.getActiveTokens(workerId)
     const hostToken = tokenByScope(tokens, "host")
@@ -163,58 +218,91 @@ async function runWakeCloudWorker(workerId: WorkerId, options: WakeCloudWorkerOp
       clientToken,
       activityToken,
     }
-    let woken: Awaited<ReturnType<WakeWorkerOnDaytona>>
-    try {
-      woken = await wakeWorker(wakeInput)
-    } catch (error) {
-      if (!isDaytonaSandboxMissingError(error)) {
-        throw error
-      }
+    await withProvisioningHeartbeat({
+      workerId,
+      touch: store.touchProvisioningWorker,
+      intervalMs: options.heartbeatIntervalMs,
+      run: async () => {
+        const woken = await withProvisionDeadline({
+          promise: (async () => {
+            try {
+              return await wakeWorker(wakeInput)
+            } catch (error) {
+              if (!isDaytonaSandboxMissingError(error)) {
+                throw error
+              }
 
-      logger.warn("worker wake sandbox missing; reprovisioning", { worker_id: workerId, error })
-      woken = await provisionWorker(wakeInput)
-    }
-
-    if (woken.status === "healthy" && worker.org_id) {
-      try {
-        await materializeProviders({
-          organizationId: worker.org_id,
-          workerId,
-          instanceUrl: woken.url,
-          hostToken,
-          clientToken,
-          force: true,
+              logger.warn("worker wake sandbox missing; reprovisioning", { worker_id: workerId, error })
+              return provisionWorker(wakeInput)
+            }
+          })(),
+          deadlineMs,
+          label: `cloud wake for ${workerId}`,
         })
-      } catch (error) {
-        logger.warn("worker wake provider materialization warning", {
-          worker_id: workerId,
-          message: error instanceof Error ? error.message : "provider_materialization_failed",
-        })
-      }
-    }
 
-    await store.updateWorkerStatus({ workerId, status: woken.status, imageVersion: woken.imageVersion, onlyWhenStatus: "provisioning" })
+        if (woken.status === "healthy" && worker.org_id) {
+          try {
+            await materializeProviders({
+              organizationId: worker.org_id,
+              workerId,
+              instanceUrl: woken.url,
+              hostToken,
+              clientToken,
+              force: true,
+            })
+          } catch (error) {
+            logger.warn("worker wake provider materialization warning", {
+              worker_id: workerId,
+              message: error instanceof Error ? error.message : "provider_materialization_failed",
+            })
+          }
+        }
+
+        await store.updateWorkerStatus({ workerId, status: woken.status, imageVersion: woken.imageVersion, onlyWhenStatus: "provisioning" })
+      },
+    })
   } catch (error) {
     await safelyMarkWorkerFailed(store, workerId)
     logger.error("worker wake failed", { worker_id: workerId, error })
   }
 }
 
-export async function wakeCloudWorker(workerId: WorkerId, options: WakeCloudWorkerOptions = {}) {
-  const existing = wakeInFlight.get(workerId)
-  if (existing) {
-    return existing
+async function runWakeCloudWorker(workerId: WorkerId, options: WakeCloudWorkerOptions) {
+  const store = options.store ?? databaseCloudLifecycleStore
+  try {
+    const worker = await store.getWorker(workerId)
+    if (!worker) {
+      logger.error("worker wake failed", { worker_id: workerId, reason: "worker_not_found" })
+      return
+    }
+
+    // The durable status transition is the cross-replica claim. Only its
+    // winner enters the explicit claimed-recovery primitive below.
+    if (worker.status !== "stopped" || !await store.reserveWake(workerId)) return
+    await runClaimedCloudWorkerRecovery(workerId, { ...options, store })
+  } catch (error) {
+    logger.error("worker wake claim failed", { worker_id: workerId, error })
   }
+}
 
-  const promise = runWakeCloudWorker(workerId, options)
-    .finally(() => {
-      if (wakeInFlight.get(workerId) === promise) {
-        wakeInFlight.delete(workerId)
-      }
-    })
+function runWorkerRecoveryOnce(workerId: WorkerId, operation: () => Promise<void>) {
+  const existing = wakeInFlight.get(workerId)
+  if (existing) return existing
+
+  const promise = operation().finally(() => {
+    if (wakeInFlight.get(workerId) === promise) wakeInFlight.delete(workerId)
+  })
   wakeInFlight.set(workerId, promise)
-
   return promise
+}
+
+export async function wakeCloudWorker(workerId: WorkerId, options: WakeCloudWorkerOptions = {}) {
+  return runWorkerRecoveryOnce(workerId, () => runWakeCloudWorker(workerId, options))
+}
+
+/** Run provider recovery after the caller atomically claimed provisioning. */
+export async function recoverClaimedCloudWorker(workerId: WorkerId, options: WakeCloudWorkerOptions = {}) {
+  return runWorkerRecoveryOnce(workerId, () => runClaimedCloudWorkerRecovery(workerId, options))
 }
 
 function stopResultAllowsStoppedStatus(result: StopWorkerOnDaytonaResult) {
@@ -237,12 +325,16 @@ export async function stopIdleCloudWorkers(options: StopIdleCloudWorkersOptions 
 
   for (const worker of workers) {
     try {
+      if (!await store.reserveIdleStop({ workerId: worker.id, idleBefore })) continue
       const result = await stopWorker(worker.id)
       if (stopResultAllowsStoppedStatus(result)) {
-        await store.updateWorkerStatus({ workerId: worker.id, status: "stopped", onlyWhenStatus: "healthy" })
+        await store.updateWorkerStatus({ workerId: worker.id, status: "stopped", onlyWhenStatus: "provisioning" })
         stopped += 1
+      } else {
+        await store.updateWorkerStatus({ workerId: worker.id, status: "healthy", onlyWhenStatus: "provisioning" })
       }
     } catch (error) {
+      await store.updateWorkerStatus({ workerId: worker.id, status: "healthy", onlyWhenStatus: "provisioning" }).catch(() => undefined)
       logger.error("cloud idle stop failed", { worker_id: worker.id, error })
       captureException(error, { component: "cloud_lifecycle", worker_id: worker.id })
     }

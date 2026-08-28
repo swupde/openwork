@@ -59,17 +59,38 @@ function makeToken(workerId: TestWorker["id"], scope: TestWorkerToken["scope"]):
 function makeStore(input: { workers: TestWorker[]; tokens?: TestWorkerToken[] }) {
   const updates: StatusUpdate[] = []
   const tokens = input.tokens ?? []
+  let touches = 0
   const store: Store = {
+    async touchProvisioningWorker(workerId) {
+      const worker = input.workers.find((entry) => entry.id === workerId)
+      if (!worker || worker.status !== "provisioning") return
+      worker.updated_at = new Date()
+      touches += 1
+    },
     async getWorker(workerId) {
       return input.workers.find((worker) => worker.id === workerId) ?? null
     },
     async getActiveTokens(workerId) {
       return tokens.filter((token) => token.worker_id === workerId && !token.revoked_at)
     },
+    async reserveWake(workerId) {
+      const worker = input.workers.find((entry) => entry.id === workerId)
+      if (!worker || worker.status !== "stopped") return false
+      worker.status = "provisioning"
+      updates.push({ workerId, status: "provisioning", onlyWhenStatus: "stopped" })
+      return true
+    },
     async listIdleWorkers(listInput: ListIdleInput) {
       return input.workers
         .filter((worker) => worker.status === "healthy" && lifecycle.isCloudWorkerIdleForStop(worker, listInput.idleBefore))
         .slice(0, listInput.limit)
+    },
+    async reserveIdleStop({ workerId, idleBefore }) {
+      const worker = input.workers.find((entry) => entry.id === workerId)
+      if (!worker || worker.status !== "healthy" || !lifecycle.isCloudWorkerIdleForStop(worker, idleBefore)) return false
+      worker.status = "provisioning"
+      updates.push({ workerId, status: "provisioning", onlyWhenStatus: "healthy" })
+      return true
     },
     async updateWorkerStatus(update) {
       const worker = input.workers.find((entry) => entry.id === update.workerId)
@@ -85,7 +106,13 @@ function makeStore(input: { workers: TestWorker[]; tokens?: TestWorkerToken[] })
     },
   }
 
-  return { store, updates }
+  return {
+    store,
+    updates,
+    get touches() {
+      return touches
+    },
+  }
 }
 
 function makeDaytonaWakeRuntime(input: {
@@ -262,6 +289,124 @@ describe("cloud lifecycle idle stop", () => {
 })
 
 describe("cloud lifecycle wake", () => {
+  test("marks the worker failed when wake exceeds the provisioning deadline", async () => {
+    const worker = makeWorker({ status: "stopped" })
+    const { store, updates } = makeStore({
+      workers: [worker],
+      tokens: [
+        makeToken(worker.id, "host"),
+        makeToken(worker.id, "client"),
+        makeToken(worker.id, "activity"),
+      ],
+    })
+
+    await lifecycle.wakeCloudWorker(worker.id, {
+      store,
+      wakeWorker: () => new Promise<never>(() => {}),
+      deadlineMs: 20,
+    })
+
+    expect(updates).toContainEqual({
+      workerId: worker.id,
+      status: "failed",
+      onlyWhenStatus: "provisioning",
+    })
+  })
+
+  test("records a fast successful wake without a failed write", async () => {
+    const worker = makeWorker({ status: "stopped" })
+    const { store, updates } = makeStore({
+      workers: [worker],
+      tokens: [
+        makeToken(worker.id, "host"),
+        makeToken(worker.id, "client"),
+        makeToken(worker.id, "activity"),
+      ],
+    })
+
+    await lifecycle.wakeCloudWorker(worker.id, {
+      store,
+      wakeWorker: async () => ({
+        provider: "daytona",
+        url: "https://cloud.example",
+        status: "healthy",
+        imageVersion: "openwork-0.18.8",
+      }),
+      deadlineMs: 5000,
+    })
+
+    expect(updates).toContainEqual({
+      workerId: worker.id,
+      status: "healthy",
+      imageVersion: "openwork-0.18.8",
+      onlyWhenStatus: "provisioning",
+    })
+    expect(updates.some((update) => update.status === "failed")).toBe(false)
+  })
+
+  test("materializes providers against the fresh signed preview returned by wake", async () => {
+    const worker = {
+      ...makeWorker({ status: "stopped" }),
+      org_id: createDenTypeId("organization"),
+    }
+    const { store } = makeStore({
+      workers: [worker],
+      tokens: [
+        makeToken(worker.id, "host"),
+        makeToken(worker.id, "client"),
+        makeToken(worker.id, "activity"),
+      ],
+    })
+    const materializedUrls: string[] = []
+
+    await lifecycle.wakeCloudWorker(worker.id, {
+      store,
+      wakeWorker: async () => ({
+        provider: "daytona",
+        url: "https://wake.preview.example.test",
+        status: "healthy",
+      }),
+      materializeProviders: async (input) => {
+        materializedUrls.push(input.instanceUrl)
+        return { ok: true, status: "noop", fingerprint: "owp:v1:test", providers: 0 }
+      },
+    })
+
+    expect(materializedUrls).toEqual(["https://wake.preview.example.test"])
+  })
+
+  test("runs one provider action for an explicitly claimed recovery", async () => {
+    const worker = makeWorker({ status: "provisioning" })
+    const { store } = makeStore({
+      workers: [worker],
+      tokens: [
+        makeToken(worker.id, "host"),
+        makeToken(worker.id, "client"),
+        makeToken(worker.id, "activity"),
+      ],
+    })
+    const hold = deferred()
+    let providerActions = 0
+    const recover = () => lifecycle.recoverClaimedCloudWorker(worker.id, {
+      store,
+      wakeWorker: async () => {
+        providerActions += 1
+        await hold.promise
+        return { provider: "daytona", url: "https://recovery.preview.example.test", status: "healthy" }
+      },
+    })
+
+    const first = recover()
+    const second = recover()
+    await flushMicrotasks()
+    expect(providerActions).toBe(1)
+    hold.resolve()
+    await Promise.all([first, second])
+
+    expect(worker.status).toBe("healthy")
+    expect(providerActions).toBe(1)
+  })
+
   test("marks the worker failed when a wake token is missing", async () => {
     const worker = makeWorker({ status: "stopped" })
     const { store, updates } = makeStore({

@@ -12,7 +12,12 @@ import {
 } from "./catalog.js"
 import { buildExternalConnectionStatus, type ExternalCapabilityMatch, type McpMemberIdentity } from "./external-capabilities.js"
 import { invokeMcpOperation, normalizeToolBody, normalizeToolRecord } from "./invoke.js"
-import { compareCapabilityMatches, scoreText, tokenize, type CapabilityMatch } from "./search.js"
+import { compareCapabilityMatches, querySchemaFor, scoreText, tokenize, type CapabilityMatch } from "./search.js"
+import {
+  codemodeScriptPath,
+  resolveCodemodeConnectionNamespaceContext,
+  type CodemodeConnectionNamespaceContext,
+} from "./codemode-namespaces.js"
 
 export const NATIVE_CAPABILITY_PREFIX = "native:"
 
@@ -57,7 +62,7 @@ function operationScore(connection: NativeProviderConnectionEntry, operation: Mc
   )
 }
 
-function nativeOperations(catalog: McpToolOperation[], nativeProviderKey: string): McpToolOperation[] {
+export function nativeOperations(catalog: readonly McpToolOperation[], nativeProviderKey: string): McpToolOperation[] {
   const pathPrefix = `/v1/capabilities/${nativeProviderKey}/`
   return catalog.filter((operation) => operation.path.startsWith(pathPrefix))
 }
@@ -66,8 +71,10 @@ function capabilityMatch(
   connection: NativeProviderConnectionEntry,
   operation: McpToolOperation,
   score: number,
+  scriptNamespace?: string,
 ): NativeCapabilityMatch {
   const bodySchema = getJsonRequestBodySchema(operation.operation)
+  const queryParameters = getParameters(operation.operation, "query")
   return {
     name: buildNativeCapabilityName(connection.id, operation.name),
     method: operation.method,
@@ -75,11 +82,13 @@ function capabilityMatch(
     score,
     summary: `[${connection.name}] ${operationSummary(operation)}`,
     pathParams: pathParameterNamesFromTemplate(operation.path),
-    queryParams: getParameters(operation.operation, "query")
+    queryParams: queryParameters
       .flatMap((parameter) => typeof parameter.name === "string" ? [parameter.name] : []),
+    ...(queryParameters.length === 0 ? {} : { querySchema: querySchemaFor(queryParameters) }),
     hasBody: hasJsonRequestBody(operation.operation),
     inputSchema: operation.inputSchema,
     ...(bodySchema === undefined ? {} : { bodySchema }),
+    ...(scriptNamespace ? { scriptPath: codemodeScriptPath(scriptNamespace, operation.name) } : {}),
   }
 }
 
@@ -113,11 +122,16 @@ export async function searchNativeCapabilities(input: {
   organizationId: DenTypeId<"organization">
   member: McpMemberIdentity | null
   query: string
-  catalog: McpToolOperation[]
+  catalog: readonly McpToolOperation[]
   limit: number
+  namespaceContext?: CodemodeConnectionNamespaceContext
 }): Promise<NativeCapabilityMatch[]> {
   if (!input.member) return []
-  const connections = await listNativeProviderUsableEntries({
+  const namespaceContext = input.namespaceContext ?? await resolveCodemodeConnectionNamespaceContext({
+    organizationId: input.organizationId,
+    member: input.member,
+  })
+  const connections = namespaceContext?.nativeProviderEntries ?? await listNativeProviderUsableEntries({
     organizationId: input.organizationId,
     orgMembershipId: input.member.orgMembershipId,
     teamIds: input.member.teamIds,
@@ -133,7 +147,12 @@ export async function searchNativeCapabilities(input: {
     }
     for (const operation of operations) {
       const score = operationScore(connection, operation, queryTokens)
-      if (score > 0) matches.push(capabilityMatch(connection, operation, score))
+      if (score > 0) matches.push(capabilityMatch(
+        connection,
+        operation,
+        score,
+        namespaceContext?.namespaces.native.get(connection.id),
+      ))
     }
   }
   const boundedLimit = Math.max(1, Math.min(20, Math.trunc(input.limit) || 5))
@@ -145,7 +164,7 @@ async function resolveNativeCapability(input: {
   member: McpMemberIdentity | null
   connectionId: string
   toolName: string
-  catalog: McpToolOperation[]
+  catalog: readonly McpToolOperation[]
 }): Promise<{ connection: NativeProviderConnectionEntry; operation: McpToolOperation } | null> {
   if (!input.member) return null
   const connections = await listNativeProviderUsableEntries({
@@ -171,7 +190,7 @@ export async function executeNativeCapability(input: {
   name: string
   organizationId: DenTypeId<"organization">
   member: McpMemberIdentity | null
-  catalog: McpToolOperation[]
+  catalog: readonly McpToolOperation[]
   principal: McpPrincipal
   path?: unknown
   query?: unknown

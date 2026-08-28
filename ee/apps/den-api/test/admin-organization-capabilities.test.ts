@@ -221,6 +221,15 @@ test("admin capability routes show effective defaults while preserving raw overr
   await expect(disableCloud.json()).resolves.toMatchObject({ capabilities: { cloud: false } })
   expect(readCapabilityMetadata(await readOrganizationMetadata())).toMatchObject({ installLinks: true, cloud: false })
 
+  await replaceOrganizationMetadata({ capabilities: { installLinks: true, workflows: false, codemodeScripts: true, remoteMcpApps: true } })
+  const dropRetired = await putCapabilities({ cloud: true })
+  expect(dropRetired.status).toBe(200)
+  const retiredMetadata = readCapabilityMetadata(await readOrganizationMetadata())
+  expect("workflows" in retiredMetadata).toBe(false)
+  expect("codemodeScripts" in retiredMetadata).toBe(false)
+  expect("remoteMcpApps" in retiredMetadata).toBe(false)
+  expect(retiredMetadata).toMatchObject({ installLinks: true, cloud: true })
+
   await replaceOrganizationMetadata({ connectEnabled: true, capabilities: { installLinks: true } })
   const disableFlatEnabledConnect = await putCapabilities({ mcpConnections: false })
   expect(disableFlatEnabledConnect.status).toBe(200)

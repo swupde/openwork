@@ -1,12 +1,9 @@
-import { automationsEnglish } from "./automations";
-
 /**
  * Tiếng Việt translations
  * Thuật ngữ chuyên môn KHÔNG dịch: Skills, Plugins, Commands, Sessions, OpenCode, OpenPackage, OpenWork, MCPs, OAuth, MCP
  */
 
 export default {
-  ...automationsEnglish,
   "app.compact_command_desc": "Tóm tắt phiên này để giảm kích thước ngữ cảnh.",
   "app.error_audit_load": "Tải nhật ký kiểm toán thất bại.",
   "app.error_auth_failed": "Xác thực thất bại",
@@ -629,6 +626,10 @@ export default {
   "session.redo_aria_label": "Làm lại tin nhắn đã hoàn tác",
   "session.redo_label": "Làm lại",
   "session.redo_title": "Làm lại tin nhắn đã hoàn tác",
+  "session.reverted_messages_hidden": "{count} tin nhắn trước đó đang bị ẩn",
+  "session.restore": "Khôi phục",
+  "session.restoring": "Đang khôi phục...",
+  "session.restore_failed": "Không thể khôi phục các tin nhắn bị ẩn. Hãy thử lại.",
   "session.rename_description": "Cập nhật tên cho phiên này.",
   "session.rename_label": "Tên phiên",
   "session.rename_placeholder": "Nhập tên mới",
@@ -938,14 +939,14 @@ export default {
   "settings.tab_advanced": "Nâng cao",
   "settings.tab_appearance": "Giao diện",
   "settings.tab_cloud_account": "Account",
-  "settings.tab_cloud_marketplaces": "Marketplaces & Plugins",
+  "settings.tab_cloud_marketplaces": "Bộ sưu tập",
   "settings.tab_cloud_providers": "Cloud Providers",
   "settings.tab_debug": "Gỡ lỗi",
   "settings.tab_description_advanced": "Kiểm tra trạng thái runtime, kết nối và điều khiển dành cho nhà phát triển.",
   "settings.tab_description_appearance": "Điều chỉnh giao diện OpenWork trên desktop, giao diện hệ thống và khung ứng dụng.",
   "settings.tab_description_debug": "Xem chẩn đoán runtime, nhật ký và tiện ích gỡ lỗi cấp thấp.",
   "settings.tab_description_cloud_account": "Sign in, manage your organization, and configure your cloud connection.",
-  "settings.tab_description_cloud_marketplaces": "Browse and import plugins from your organization's marketplaces.",
+  "settings.tab_description_cloud_marketplaces": "Duyệt các bộ sưu tập plugin của tổ chức và nhập chúng vào không gian làm việc của bạn.",
   "settings.tab_description_cloud_providers": "Xem trạng thái đồng bộ provider LLM của tổ chức.",
   "settings.tab_description_environment": "Save API keys and tokens for local agents, skills, and MCP servers. Secrets stay on this device.",
   "settings.tab_description_extensions": "Kỹ năng, kết nối và công cụ mà agent của bạn có thể sử dụng.",

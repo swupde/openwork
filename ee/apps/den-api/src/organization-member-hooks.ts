@@ -1,8 +1,9 @@
 import { and, eq, isNull, sql } from "@openwork-ee/den-db/drizzle"
 import { MemberTable, OrganizationTable } from "@openwork-ee/den-db/schema"
+import { cache } from "./cache.js"
 import { db } from "./db.js"
 import { syncInferenceAfterMemberChange } from "./inference.js"
-import { syncInferenceSubscriptionQuantityAfterMemberChange, syncSeatSubscriptionQuantityAfterMemberChange } from "./stripe-billing.js"
+import { syncInferenceSubscriptionQuantityAfterMemberChange, syncSeatSubscriptionQuantityAfterMemberChange, syncWebSubscriptionQuantityAfterMemberChange } from "./stripe-billing.js"
 
 type OrgId = typeof OrganizationTable.$inferSelect.id
 type MemberId = typeof MemberTable.$inferSelect.id
@@ -21,6 +22,7 @@ type OrganizationMemberChangeHook = (input: OrganizationMemberChangeHookInput) =
 const organizationMemberChangeHooks: OrganizationMemberChangeHook[] = [
   syncSeatSubscriptionQuantityAfterMemberChange,
   syncInferenceSubscriptionQuantityAfterMemberChange,
+  syncWebSubscriptionQuantityAfterMemberChange,
   syncInferenceAfterMemberChange,
 ]
 
@@ -37,6 +39,8 @@ export async function runPostOrganizationMemberChangeHooks(input: {
   memberId: MemberId
   change: OrganizationMemberChange
 }) {
+  // Member add/remove changes both list rendering and membership auth decisions.
+  await cache.org.deleteMembers(input.organizationId)
   const memberCount = await countOrganizationMembers(input.organizationId)
   for (const hook of organizationMemberChangeHooks) {
     await hook({ ...input, memberCount })

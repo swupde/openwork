@@ -47,7 +47,24 @@ export type LibraryConnectionItem = {
   edges: LibraryAccessEdge[];
 };
 
-export type LibraryItem = LibraryPluginItem | LibraryConnectionItem;
+export type LibraryWorkflowItem = {
+  type: "workflow";
+  id: string;
+  plugin: LibraryNamedEntity | null;
+  name: string;
+  description: string | null;
+  role: PluginAccessRole;
+  edges: LibraryAccessEdge[];
+  state: "ready" | "needs_signin" | "needs_admin_setup";
+  resultState: "never_run" | "fresh" | "stale" | "needs_attention";
+  latestSuccessfulAt: string | null;
+  viewState: "default" | "custom_active" | "build_failed" | "retired";
+  activeViewTitle: string | null;
+  automationCount: number;
+  source: { kind: "created" | "installed_template"; templateName?: string; templateVersion?: string };
+};
+
+export type LibraryItem = LibraryPluginItem | LibraryConnectionItem | LibraryWorkflowItem;
 
 export const libraryQueryKeys = {
   items: ["me", "library"],
@@ -205,10 +222,38 @@ function parseConnection(value: Record<string, unknown>): LibraryConnectionItem 
   };
 }
 
+function parseWorkflow(value: Record<string, unknown>): LibraryWorkflowItem | null {
+  const id = readString(value.id);
+  const plugin = value.plugin === null ? null : parseNamedEntity(value.plugin);
+  const name = readString(value.name);
+  const description = readNullableString(value.description);
+  const role = readRole(value.role);
+  const edges = parseEdges(value.edges);
+  const state = value.state === "ready" || value.state === "needs_signin" || value.state === "needs_admin_setup" ? value.state : null;
+  const resultState = value.resultState === "never_run" || value.resultState === "fresh" || value.resultState === "stale" || value.resultState === "needs_attention" ? value.resultState : null;
+  const latestSuccessfulAt = readNullableString(value.latestSuccessfulAt);
+  const viewState = value.viewState === "default" || value.viewState === "custom_active" || value.viewState === "build_failed" || value.viewState === "retired" ? value.viewState : null;
+  const activeViewTitle = readNullableString(value.activeViewTitle);
+  const sourceKind = isRecord(value.source) && (value.source.kind === "created" || value.source.kind === "installed_template") ? value.source.kind : null;
+  const source: LibraryWorkflowItem["source"] | null = isRecord(value.source) && sourceKind
+    ? {
+        kind: sourceKind,
+        ...(readString(value.source.templateName) ? { templateName: readString(value.source.templateName) ?? undefined } : {}),
+        ...(readString(value.source.templateVersion) ? { templateVersion: readString(value.source.templateVersion) ?? undefined } : {}),
+      }
+    : null;
+  if (!id || (value.plugin !== null && !plugin) || !name || description === undefined || !role || !edges || !state || !resultState
+    || latestSuccessfulAt === undefined || !viewState || activeViewTitle === undefined || !source
+    || typeof value.automationCount !== "number" || !Number.isInteger(value.automationCount) || value.automationCount < 0) return null;
+  return { type: "workflow", id, plugin, name, description, role, edges, state, resultState, latestSuccessfulAt, viewState, activeViewTitle, automationCount: value.automationCount, source };
+}
+
 function parseLibraryItem(value: unknown): LibraryItem | null {
   if (!isRecord(value)) return null;
   if (value.type === "plugin") return parsePlugin(value);
+  if (value.type === "app") return null;
   if (value.type === "connection") return parseConnection(value);
+  if (value.type === "workflow") return parseWorkflow(value);
   return null;
 }
 
@@ -219,7 +264,8 @@ export function parseLibraryPayload(payload: unknown): LibraryItem[] {
   const items = payload.items
     .map(parseLibraryItem)
     .filter((item): item is LibraryItem => item !== null);
-  if (items.length !== payload.items.length) {
+  const supportedItemCount = payload.items.filter((item) => !isRecord(item) || item.type !== "app").length;
+  if (items.length !== supportedItemCount) {
     throw new Error("Library response was incomplete.");
   }
   return items;

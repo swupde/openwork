@@ -1,10 +1,8 @@
-# OpenWork end-to-end specs
+# OpenWork tests and test evidence
 
-All new executable end-to-end coverage lives in
-[`specs/**/*.test.ts`](./specs) and imports `test` from `@openwork/testkit`.
-Specs that drive Electron, Den, or another app surface use `.slow.test.ts`.
-The legacy corpus under `flows/` is frozen compatibility coverage, not an
-authoring path.
+All executable coverage lives in [`specs/**/*.test.ts`](./specs) and imports
+`test` from `@openwork/testkit`. Tests that drive Electron, Den, or another app
+surface use `.e2e.test.ts`.
 
 ## Paved path
 
@@ -13,12 +11,55 @@ Use the skills in this order:
 1. `write-a-spec`
 2. `run-tests`
 3. `diagnose-a-red-run` when the run fails
-4. `publish-evidence` for the existing ambient tape
+4. `publish-evidence` for the existing ambient test evidence
 
-Demo-driven feature work still starts with `/voiceover`. Approve the narration
-before code, create a fresh worktree, then translate its paragraphs directly
-into `evals/specs/<slug>.slow.test.ts`. Do not create a separate narration or
-legacy-flow artifact.
+Demo-driven features start from a preset or world plus a spec in `evals/specs`.
+
+## Glossary
+
+| Term | Meaning |
+| --- | --- |
+| world | A declarative environment and the resources started from it. |
+| topology | The `WorldTopology` shape: Den organizations, environment, web, substrate, ports, and seed, plus apps and witnesses. |
+| preset | Code: a typed, composable, reviewed world definition. |
+| snapshot | A generated receipt of one run. It is data and untrusted input. |
+| place | Where launched resources run: `local` or `daytona`. |
+| substrate | What runs the Den control plane: local processes or `kind`. |
+| witness | A deterministic provider stand-in that records what it saw. |
+| fault | Declared misbehavior used to reproduce a failure condition. |
+| surface | A drivable UI: Electron, or Chrome on Den Web. |
+| origin | Whether a resource is launched or attached. See below. |
+| live | A spec attached to a live shared substrate; red is an incident signal about the service, not a verdict on the diff. |
+
+### Origin: launch vs attach
+
+Every world resource has an origin. *Launched* resources are created by the
+world, owned by it, and disposed with it; plain nouns in a topology mean
+launched. *Attached* resources pre-exist the world; the world binds to them and
+never creates or destroys them. The law: **you own what you launch; you never
+own what you attach.** Dispose, cleanup, and `world rebuild` follow from it:
+rebuild relaunches launched resources and reattaches attached ones.
+
+The term is `attach`, not `connect` (`connections` already names org-to-provider
+bindings in topology), and not `reuse` or `prepared` (legacy names in
+`@openwork/env` internals that will migrate to attach).
+
+## Skills map
+
+Skills own mechanics; this README owns the map and vocabulary.
+
+| Task | Skill to load | When |
+| --- | --- | --- |
+| Author a spec | `write-a-spec` | Add executable coverage under `evals/specs`. |
+| Run tests | `run-tests` | Run a selected testkit spec locally or on Daytona. |
+| Failing or red run | `diagnose-a-red-run` | Classify a failure before changing code. |
+| Publish evidence | `publish-evidence` | Publish an existing ambient evidence run. |
+| Declare a PR verdict | `prove-a-pr` | Decide Passed, Incomplete, or Failed from assertions. |
+| Missing secret or environment variable | `get-env-var` | Load a required team secret into the shell. |
+| Drive local Electron via CDP | `browser-automation` | Explore or debug the local desktop surface. |
+| Daytona E2E | `daytona-electron-test` | Launch and drive Electron in Daytona. |
+| Daytona server or Den setup | `daytona-cloud-server` | Prepare the server-side Daytona sandbox. |
+| Provider keys in Daytona | `daytona-secrets-volume` | Use provider credentials from the Daytona secrets volume. |
 
 ## Install and run
 
@@ -27,25 +68,54 @@ installs or image builds.
 
 ```bash
 pnpm --dir evals install
-pnpm evals:spec                    # app-less PR project
+pnpm evals:pr
+pnpm evals:e2e app-smoke
 ```
 
-Run one app-driving spec through the stack project:
+### E2E CLI
+
+Run the E2E lane with `pnpm evals:e2e [test-names...]`. Naming a test
+auto-satisfies the opt-in flags declared in its source, but value-bearing
+environment variables such as `OPENWORK_EVAL_MODEL` are never auto-set. Vision
+judging is deferred by default; add `--with-llm-vision` to judge inline. Use
+`--local` to force isolated local resources, `--daytona` for Daytona resources,
+`--den <url>` to reuse Den, or `--publish --pr <number>` to judge and publish
+existing evidence. Without a placement flag, the CLI preserves the ambient
+placement environment.
+
+| Exit | Named test | Unfiltered E2E suite | Publish |
+| --- | --- | --- | --- |
+| `0` | Passed | Passed, or incomplete with expected skips | Published |
+| `1` | Failed | Failed | Failed claims published, or publish failed |
+| `2` | Incomplete because it skipped | Not used | Claims pending judgment |
+
+See `run-tests` for environment requirements and the cold-boot verdict check.
+
+### Live lane
+
+Surface and substrate are independent axes:
+
+| Surface | Launched substrate (world-owned, hermetic) | Attached live substrate |
+| --- | --- | --- |
+| App-less | `<slug>.test.ts` | `<slug>.live.test.ts` |
+| App-driving | `<slug>.e2e.test.ts` | Not yet paved |
+
+Run a live spec only by exact name and with explicit consent and endpoint values:
 
 ```bash
-OPENWORK_EVAL_APP_SPECS=1 \
-  pnpm --dir evals exec vitest run --config vitest.config.ts \
-  --project stack specs/<slug>.slow.test.ts
+OPENWORK_EVAL_LIVE=1 OPENWORK_EVAL_LIVE_DEN_API_URL=https://api.openworklabs.com OPENWORK_EVAL_SECRET_LIVE_MAILBOX_EMAIL=<mailbox> pnpm evals:pr specs/prod-den-signup-invites.live.test.ts
 ```
 
-Set `OPENWORK_EVAL_DAYTONA=1` to place supported resources in Daytona
-sandboxes. Leave it unset for isolated local resources. See `run-tests` for
-environment requirements and the cold-boot verdict check.
+The live Den is attached and never deleted. Timestamped plus-addressed identities,
+organizations, and invitations launched onto it are owned by the spec; cleanup is
+asserted even on failure, and any residue (including an account without a
+self-service deletion endpoint) must be documented with exact identities.
 
 ## Authoring contract
 
 - Import `test` from `@openwork/testkit`.
-- Name app-driving files `<slug>.slow.test.ts`; other specs use `<slug>.test.ts`.
+- Name app-driving files `<slug>.e2e.test.ts`; app-less tests use `<slug>.test.ts`.
+- Live specs use `<slug>.live.test.ts`, never run in PR/E2E suites, and require a consent environment variable.
 - Acquire resources in dependency order with `needs()` → `server()` → `app()`.
 - Drive user-visible behavior and assert observable outcomes. Backend, file,
   and process checks may witness side effects but do not replace the journey.
@@ -53,55 +123,224 @@ environment requirements and the cold-boot verdict check.
   dependencies skip with a named reason.
 - Assert both positive and negative sides of identity or permission boundaries.
 
+## Layers
+
+Imports only point down: a layer may use lower layers, never a higher layer.
+This is enforced by `pnpm --dir evals run lint:layers`.
+
+| Layer | Contents | Rule |
+| --- | --- | --- |
+| L0 | `@openwork/matchers` | Turn supplied facts into pure findings; no I/O. |
+| L1 | `@openwork/cdp`, `@openwork/labs` | Provide protocol and lab primitives; do not own journeys or test lifecycle. |
+| L2 | `@openwork/behaviors` | Provide framework-free actions and observations over narrow handles. |
+| L3 | root `@openwork/world` + `@openwork/env` | The shared package owns definitions/CLI/state/surfaces; env injects the eval-only Den/desktop runtime adapter. Neither depends on Vitest. |
+| L4 | `@openwork/testkit` and `evals/bin/evals.mjs` | Adapt environments to specs, Vitest, and evidence. |
+
 ## Composable packages and diagnostics
 
 The packages under [`packages/`](./packages) are independently consumable, but
-new executable coverage is always assembled as a spec under `specs/`.
+executable coverage is always assembled as a test under `specs/`.
 
 | Package | Owns |
 | --- | --- |
-| `@openwork/testkit` | spec fixture plus `needs()`, `server()`, `app()`, mock, and placement resources |
+| root `@openwork/world` | generic definitions, path discovery, CLI lifecycle, local state store, and headless-web surface |
+| `@openwork/env` | eval runtime adapter: places, Den server, desktop apps, mocks, eval snapshots, and kind stack |
+| `@openwork/testkit` | thin Vitest adapter: fixture, needs/skip mapping, evidence bridging, and spec-facing re-exports |
 | `@openwork/cdp` | raw CDP client, targets, `Surface`, and `attachSurface` |
 | `@openwork/labs` | egress, identity-provider, release-feed, and mock-MCP labs |
 | `@openwork/hosts` | local and Daytona hosts and `resolveHost()` |
 | `@openwork/behaviors` | framework-free actions and observations over narrow handles |
 | `@openwork/matchers` | pure findings over facts, with no I/O |
-| `@openwork/fraimz` | current internal screenshot-capture and ambient-tape implementation used by testkit; not a flow-authoring path |
-| `@openwork/timeline` | timing spans for long spec journeys |
-| `@openwork/evidence` | scan, render, and PR publication for completed tapes |
+| `@openwork/test-evidence` | screenshot capture, visual validation, and ambient test-evidence recording used by testkit |
+| `@openwork/timeline` | timing spans for long test journeys |
+| `@openwork/test-artifacts` | index, render, and PR publication for completed test runs |
 
 Because behaviors and matchers do not depend on a test context, they also power
-the standalone diagnostic script:
+the standalone diagnostic script at `evals/scripts/diagnose.mts`. It imports
+only `@openwork/behaviors` and `@openwork/matchers` and can inspect a real
+endpoint without creating test evidence.
+
+## Worlds
+
+A world is a declarative topology managed by root `@openwork/world`.
+`@openwork/env` keeps the eval-only topology schema and injects its Den/desktop
+runtime adapter into the shared shell.
+`defineWorld()` validates a `WorldTopology` and returns a definition that can be
+deep-patched with `.with()`. The topology has:
+
+- `den.orgs`: named organizations, each with an optional admin and named members.
+- `den.env`: optional environment variables for the Den server. `den.web` and
+  `den.substrate` also configure that server; `den.ports` fixes API and Web
+  ports, and `den.seed` selects the supported demo seed.
+- `apps`: optional named desktop apps with their target org/member, workspace,
+  model, sessions, and optional local server delay.
+- `witnesses`: optional named witnesses; v1 accepts MCP mocks only.
+
+The shipped definitions are `soloWorkspace`, `supportOrg`, `acmeDemo`,
+`acmeDocs`, and `desktopProductionLive`; their CLI names are `solo`,
+`support-org`, `acme-demo`, `acme-docs`, and `desktop-prod-live`. `startWorld()` boots the Den, organizations, witnesses, and apps in
+dependency order and disposes them together. `fromSnapshot()` validates
+generated snapshot JSON and returns the name and topology needed to start an
+equivalent fresh world.
+
+Each started world writes a snapshot to
+`evals/results/.worlds/<name>.json`. Snapshots contain the validated topology
+plus resolved Den and app endpoints. They are generated, never hand-written.
+Snapshots are untrusted input: `rebuild` and `resume` allowlist Den environment
+keys, database names, ports, paths, models and faults, and require loopback-only
+resolved CDP URLs before starting, attaching to, or tearing down resources.
+
+### World CLI
+
+The root `pnpm world` command requires Node 24+. Its interactive lifecycle is:
 
 ```bash
-node evals/scripts/diagnose.mts https://den.customer.example
+pnpm world up support-org          # boot a world; stays up until Ctrl-C
+pnpm world up acme-demo --name acme-demo --keep
+                                    # keep resources after exit
+pnpm world resume acme-demo        # attach to that running world
+pnpm world resume acme-demo --teardown
+                                    # attach and stop it
+pnpm world rebuild <snapshot>      # rebuild the world a failed run was in
+pnpm world list
+pnpm world forget <name>
+
+# Path definitions use the filename as their name and can default to detached.
+pnpm world up ./worlds/dev-headless.ts
+pnpm world up ./worlds/headless-prod-live.ts --allow-shared-state
+
+# Explicit macOS-only live sharing with the installed production stores.
+pnpm world up ./worlds/desktop-prod-live.ts --allow-shared-state
 ```
 
-It imports only `@openwork/behaviors` and `@openwork/matchers` and can point at
-a real endpoint without creating test evidence.
+`up` also accepts `--name <name>`. Without `--keep`, Ctrl-C tears down the
+resources; with `--keep`, Ctrl-C leaves them detached. `resume` accepts a world
+name or snapshot path and detaches on Ctrl-C unless `--teardown` is present.
+`forget` removes snapshot metadata without stopping detached services. `help`
+and `list` auto-discover `worlds/*.ts`. Path definitions may select detached mode,
+so the checked-in headless and production-live definitions return after health
+without requiring `--name`, `--keep`, or `--detach`.
+
+`desktop-prod-live` is a deliberately dangerous local-only mode. It launches
+source Electron through `pnpm dev` with isolated Electron userData, app
+identifier, Vite/CDP ports, and protocol registration, while resolving the
+installed production `OPENWORK_DATA_DIR` and channel-aware `OPENCODE_DB` only at
+launch time. It never copies or symlinks those stores, does not boot or modify a
+Den, and does not seed a workspace, session, or sign-in. Production may remain
+running, but concurrent writes from production and dev are unsupported and may
+corrupt state. `up` and every `rebuild` require `--allow-shared-state`; `resume`
+only attaches to the already-running isolated dev process. Snapshots retain the
+symbolic `desktopState` source/mode plus CDP/workspace metadata, never resolved
+production paths or tokens. Teardown stops only the dev process and does not
+delete shared stores.
+
+`headless-prod-live` applies the same symbolic state selection to source Vite +
+`openwork-server` without Electron. Its production tokens, server state, config,
+OpenWork data, and OpenCode database are resolved in place and never copied into
+the owner-only world snapshot. It refuses remote access, public hosts, and
+non-loopback host bindings. Named headless worlds use separate runtime/config/log
+directories and a launch identity, and their detached supervisor tears down the
+remaining sibling if Vite or the backend exits.
+
+World v1 has deliberate limits:
+
+- Apps may sign in only to the first (primary) organization; an app without
+  `signedInTo` remains fresh and signed out.
+- Witnesses are MCP mocks only.
+- `onKind()` runs a real Helm Den on the shared `openwork-kube-lab` kind cluster.
+  Kind worlds can boot local Electron apps signed in as the seeded Acme admin;
+  they do not yet accept witnesses, extra organizations, seed overrides, custom
+  port-forwards, or non-local placement.
+
+Run the opt-in proof on a machine with local Docker, kind, kubectl, and Helm:
+
+```bash
+OPENWORK_EVAL_E2E_TESTS=1 OPENWORK_EVAL_KIND_E2E=1 pnpm --dir evals exec vitest run --config vitest.config.ts --project e2e specs/world-kind-den.e2e.test.ts
+```
+
+Daytona cannot host this substrate: its sandbox has no Docker binary or daemon,
+reports `CapEff: 0000000000000000`, and blocks `unshare -Urm`, so no container
+runtime can start kind there.
+
+### Reproducing a failure
+
+A failed local run's world snapshot can be rebuilt with:
+
+```bash
+pnpm world rebuild evals/results/.worlds/<name>.json
+```
+
+## Recipes
+
+### Drive the app
+
+Use `startWorld()` and select named surfaces with `world.app("name")`. Compose
+journeys from `@openwork/behaviors`; executable coverage belongs in `evals/specs`.
+
+```ts
+import { startWorld, supportOrg } from "@openwork/testkit";
+
+await using world = await startWorld(supportOrg, { place });
+const alice = world.app("alice"); // signed in
+const bob = world.app("bob"); // fresh, not signed in
+```
+
+### Provision a fresh setup
+
+Create a topology with `defineWorld()` or patch a preset with `.with()`. Use
+`pnpm world up <preset>` interactively and `startWorld()` in specs.
+
+```ts
+const slowSupport = supportOrg.with({ apps: { bob: { localServerDelayMs: 500 } } });
+```
+
+### Reproduce network conditions
+
+Declare provider faults at `witnesses.<name>.fault` in the topology; fault proxy
+controls live in `faults.ts`. Use `localServerDelayMs` on apps for delayed local
+server startup.
+
+```ts
+const faulted = acmeDocs.with({
+  witnesses: { slack: { profileId: "slack-user-mcp", fault: "provider-throttled" } },
+});
+```
+
+### Reproduce a failure
+
+Take the snapshot from the failed run and rebuild its topology in a fresh world:
+
+```bash
+pnpm world rebuild evals/results/.worlds/<name>.json
+```
+
+### Docs screenshots and demos
+
+The same `startWorld()` lifecycle powers docs shots and demos, so docs, CI, and
+reproduction cannot diverge. Use the `acmeDocs` and `acmeDemo` presets.
 
 ## Ambient evidence and verdicts
 
-The testkit fixture opens and closes an evidence tape around each test.
-Screenshots record takes, validation claims them, and tape facts carry witness
-assertions. Do not create, pass, or manage a roll handle.
+The testkit fixture opens and closes a test-evidence recorder around each test.
+Screenshots become test artifacts, visual validation records their expectations,
+and assertion evidence carries witness assertions. Do not create or pass
+recorder handles.
 
-Report `Passed` only when every claim has an observable assertion in the tape.
+Report `Passed` only when every claim has observable evidence in the test run.
 A failed assertion is `Failed`; missing requirements, tooling failure, or
-missing tape evidence is `Incomplete` or a named skip. A green suite containing
+missing test evidence is `Incomplete` or a named skip. A green suite containing
 skips is not proof.
 
-Publish an already completed tape with the `publish-evidence` skill:
+Publish an already completed test run with the `publish-evidence` skill:
 
 ```bash
-pnpm fraimz:publish -- --pr <number> [--roll <dir|name>]
+pnpm evals:e2e --publish --pr <number> [--test-run <path|directory-id|latest|name>]
 ```
 
-`fraimz:publish` is retained as an implementation-compatibility command name;
-it publishes a testkit tape and never reruns tests. Its optional `--roll`
-argument selects a specific existing tape at publish time; it is not a test
-author roll handle. Custom screenshots and recordings are supplementary and
-never determine the pass/fail verdict.
+`evals:e2e --publish` judges and publishes test evidence without rerunning tests.
+Its optional `--test-run` argument selects an existing test run by path,
+directory ID, record name, or `latest` at publish time. Custom screenshots and
+recordings are supplementary and never determine the pass/fail verdict.
 
 ## Standalone isolated Den
 
@@ -118,20 +357,17 @@ It also adds the printed `OPENWORK_EVAL_DEN_WEB_URL` to the trusted origins;
 without that origin, Better Auth rejects eval sign-in with
 `403 INVALID_ORIGIN`.
 
-## Daytona app specs
+## Daytona E2E tests
 
-Start the maintained Electron sandbox path:
+Use the maintained Daytona setup from `run-tests`, then run a selected test
+through the E2E CLI:
 
 ```bash
-daytona organization use "<org-name>"
-bash .devcontainer/test-on-daytona.sh [branch-or-commit] --artifacts-volume
+pnpm evals:e2e app-smoke --daytona
 ```
 
-Then run the selected `.slow.test.ts` with both
-`OPENWORK_EVAL_APP_SPECS=1` and `OPENWORK_EVAL_DAYTONA=1`. Use direct CDP tools
-only to explore or debug. Convert repeatable new coverage into a testkit spec;
-do not add a legacy flow. [`daytona-flows.md`](./daytona-flows.md) retains the
-manual sandbox notes.
+Use direct CDP tools only to explore or debug. Convert repeatable coverage into
+a testkit test.
 
 ## CDP manual-debugging tools
 
@@ -149,34 +385,23 @@ takes `browser_url`; target-specific calls also use the selected target ID.
 | `browser_screenshot` | capture a PNG checkpoint |
 
 Use these calls for exploration and debugging, not as replacement verdict
-evidence. Repeatable executable coverage belongs in a testkit spec, where
-observable assertions and validated takes are recorded in the ambient tape.
+evidence. Repeatable executable coverage belongs in a testkit test, where
+observable assertions and validated screenshots are recorded as test evidence.
 
-## Frozen legacy flow compatibility
+## Reserved names (not implemented)
 
-The existing `evals/flows/**` corpus and `evals/runner/**` remain available only
-for compatibility. The corpus is frozen:
+These names are designed but not built. Do not attempt to use them:
 
-- Deleting an obsolete flow is allowed.
-- Adding, modifying, copying, renaming, or scaffolding a flow is forbidden.
-- A user request for new coverage always goes to `evals/specs` and
-  `@openwork/testkit`.
+- `attach.den({ url, tier })`
+- `attach.user({ secretRef })`
+- `attach.sandbox(...)`
+- `tier: "prod" | "staging" | "demo"`; the production tier will structurally
+  refuse organization provisioning, seeding, and database access.
+- `secretRef`; secrets will be named and resolved at start. Snapshots may carry
+  secret references, never secret values.
 
-Only when a user explicitly requests an existing legacy flow, load the
-`run-evals` or `fraimz` compatibility skill and run that unchanged flow:
-
-```bash
-pnpm evals --list
-pnpm evals --flow <existing-id> --cdp-url <electron-cdp-url>
-pnpm fraimz --flow <existing-id> --cdp-url <electron-cdp-url>
-```
-
-If the existing flow is broken or obsolete, report that limitation rather than
-changing it. Legacy results continue to land under `evals/results/`; they do
-not define the evidence contract for new work.
-
-## Historical scenario notes
-
-The remaining Markdown scenario documents describe existing product journeys
-and manual debugging procedures. They are not templates for new executable
-coverage. New automation derived from them belongs in `specs/`.
+The low-level escape hatch available today is
+`OPENWORK_EVAL_DEN_API_URL` with `OPENWORK_EVAL_DEN_WEB_URL`. It attaches an
+existing Den at the `server()` level and is called `reuse` in current code.
+Attached mode has no `apiLog()` and does not support `seedProfile`. Locally
+launched mocks are loopback-only and therefore unreachable from a remote Den.

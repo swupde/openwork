@@ -43,8 +43,10 @@ describe("message-list loading feedback", () => {
   test("acknowledges a submitted message before streaming starts", () => {
     const markup = renderList([userMessage], "submitted");
 
-    expect(markup).toContain("Thinking…");
-    expect(markup).not.toContain("Loading…");
+    expect(markup).toContain("Working 0s");
+    expect(markup).toContain("ow-text-shimmer");
+    expect(markup).not.toContain("animate-spin");
+    expect(markup).not.toContain("PaperGrainGradient");
   });
 
   test("does not duplicate the empty-conversation waiting treatment", () => {
@@ -54,7 +56,13 @@ describe("message-list loading feedback", () => {
   test("keeps the same loading treatment when streaming begins", () => {
     const markup = renderList([userMessage], "streaming");
 
-    expect(markup).toContain("Thinking…");
-    expect(markup).not.toContain("Loading…");
+    expect(markup).toContain("Working 0s");
+    expect(markup).toContain("ow-text-shimmer");
+    expect(markup).not.toContain("animate-spin");
+    expect(markup).not.toContain("PaperGrainGradient");
+  });
+
+  test("does not duplicate working feedback when a tool row is visible", () => {
+    expect(shouldShowMessageListLoading("streaming", 2, true)).toBe(false);
   });
 });

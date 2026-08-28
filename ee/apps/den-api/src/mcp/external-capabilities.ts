@@ -6,7 +6,6 @@ import {
   OPENWORK_CLOUD_MCP_CONNECTION_ACTION_SOURCE,
   OPENWORK_CLOUD_MCP_CONNECTION_ACTION_VERSION,
 } from "@openwork/types/den/mcp-connection-action"
-import { MemberTable } from "@openwork-ee/den-db/schema"
 import { normalizeDenTypeId, type DenTypeId } from "@openwork-ee/utils/typeid"
 import {
   getExternalMcpConnection,
@@ -31,6 +30,7 @@ import {
   evaluateToolPolicy,
   isToolDisabled,
 } from "../capability-sources/external-mcp-tool-policy.js"
+import { cache } from "../cache.js"
 import { db } from "../db.js"
 import { listTeamsForMember } from "../orgs.js"
 import { openworkOrganizationConnectionsUrl, openworkYourConnectionsUrl } from "./connection-navigation.js"
@@ -41,6 +41,17 @@ import {
 } from "./external-mcp-tool-arguments.js"
 import { compareCapabilityMatches, tokenize } from "./search.js"
 import type { CapabilityMatch } from "./search.js"
+import {
+  CODEMODE_EXTERNAL_MCP_CONNECTION_LIMIT,
+  codemodeScriptPath,
+  resolveCodemodeConnectionNamespaceContext,
+  type CodemodeConnectionNamespaceContext,
+} from "./codemode-namespaces.js"
+import {
+  getExternalToolsSearchCache,
+  setExternalToolsSearchCache,
+  type ExternalToolsSearchCacheKey,
+} from "./external-tools-search-cache.js"
 
 /**
  * Merges org-level External MCP Connections (capability-sources/) into the
@@ -61,9 +72,11 @@ import type { CapabilityMatch } from "./search.js"
  */
 
 const EXTERNAL_CAPABILITY_PREFIX = "mcp:"
-export const EXTERNAL_MCP_SEARCH_CONNECTION_LIMIT = 16
-export const EXTERNAL_MCP_SEARCH_CONCURRENCY = 4
+export const EXTERNAL_MCP_SEARCH_CONNECTION_LIMIT = CODEMODE_EXTERNAL_MCP_CONNECTION_LIMIT
+export const EXTERNAL_MCP_SEARCH_CONCURRENCY = 8
 export const EXTERNAL_MCP_SEARCH_MATCH_LIMIT = 20
+const EXTERNAL_MCP_SEARCH_REQUEST_TIMEOUT_MS = 5_000
+const EXTERNAL_MCP_SEARCH_LIFECYCLE_TIMEOUT_MS = 8_000
 
 export function buildExternalCapabilityName(connectionId: string, toolName: string): string {
   return `${EXTERNAL_CAPABILITY_PREFIX}${connectionId}:${toolName}`
@@ -96,16 +109,10 @@ export async function resolveMcpMemberIdentity(input: {
   organizationId: string
 }): Promise<McpMemberIdentity | null> {
   const organizationId = normalizeDenTypeId("organization", input.organizationId)
-  const rows = await db
-    .select({ id: MemberTable.id })
-    .from(MemberTable)
-    .where(and(
-      eq(MemberTable.userId, normalizeDenTypeId("user", input.userId)),
-      eq(MemberTable.organizationId, organizationId),
-      isNull(MemberTable.removedAt),
-    ))
-    .limit(1)
-  const member = rows[0]
+  const member = await cache.org.membership({
+    organizationId,
+    userId: normalizeDenTypeId("user", input.userId),
+  })
   if (!member) return null
   const teams = await listTeamsForMember({ organizationId, memberId: member.id })
   return { orgMembershipId: member.id, teamIds: teams.map((team) => team.id) }
@@ -167,11 +174,18 @@ export type ExternalCapabilityMatch = CapabilityMatch & {
   /** Tells the generic execute facade where MCP arguments must be supplied. */
   invocation?: { argumentsField: "body" }
   /** Distinguishes a connection-health result from a callable capability. */
-  kind?: "connection_status"
+  kind?: "connection_status" | "mcp_app"
   /** Set for connection-level status rows: the tool exists but needs a human/admin fix before real tools can be listed. */
   status?: "needs_connection" | "error"
   hint?: string
   connectionStatus?: ExternalConnectionStatus
+}
+
+export type ExternalMcpAppLaunch = {
+  connectionId: string
+  toolName: string
+  resourceUri: string
+  arguments: Record<string, unknown>
 }
 
 export type ExternalConnectionStatus = {
@@ -212,6 +226,17 @@ const PROVIDER_ADMIN_ACTION_PATTERN = /\b(?:app (?:is )?not installed|admin(?:is
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+export function externalMcpAppResourceUri(tool: { _meta?: unknown }): string | null {
+  const meta = isRecord(tool._meta) ? tool._meta : {}
+  const ui = isRecord(meta.ui) ? meta.ui : {}
+  const resourceUri = typeof ui.resourceUri === "string"
+    ? ui.resourceUri
+    : typeof meta["ui/resourceUri"] === "string"
+      ? meta["ui/resourceUri"]
+      : null
+  return resourceUri?.startsWith("ui://") ? resourceUri : null
 }
 
 function cappedErrorMessage(message: string): string {
@@ -622,6 +647,8 @@ export function externalMcpSearchCoverageHint(coverage: ExternalMcpSearchCoverag
   return `External MCP search inspected ${coverage.probedConnections} of ${coverage.eligibleConnections} eligible connections. Results may be incomplete; narrow the query using a connection name and search again.`
 }
 
+const CONNECTION_CARD_HINT = "Execute this exact capability name once: it returns the live status, renders an actionable connection card for the member in compatible hosts, and includes the action to relay in text."
+
 async function probeExternalMcpConnection(input: {
   connection: ExternalMcpConnectionRow
   member: McpMemberIdentity
@@ -629,6 +656,7 @@ async function probeExternalMcpConnection(input: {
   redirectUriBase: string
   limit: number
   deadline: ExternalMcpLifecycleDeadline
+  scriptNamespace?: string
 }): Promise<ExternalCapabilityMatch[]> {
   const matches: ExternalCapabilityMatch[] = []
   const add = (match: ExternalCapabilityMatch) => {
@@ -646,7 +674,7 @@ async function probeExternalMcpConnection(input: {
         score,
         summary: `[${connection.name}] OAuth provider settings changed and require administrator review.`,
         status: "error",
-        hint: `Ask an org admin to open OpenWork Cloud -> Connectors, review the live OAuth issuer for "${connection.name}", and reconnect if requested.`,
+        hint: `Ask an org admin to open OpenWork Cloud -> Connectors, review the live OAuth issuer for "${connection.name}", and reconnect if requested. ${CONNECTION_CARD_HINT}`,
         connectionStatus: buildExternalConnectionStatus({
           connection,
           state: "reauth_required",
@@ -677,7 +705,7 @@ async function probeExternalMcpConnection(input: {
           score,
           summary: `[${connection.name}] Available to you, but you haven't connected your ${connection.name} account yet.`,
           status: "needs_connection",
-          hint: `Ask the user to open OpenWork Cloud -> Your Connections and click Connect on "${connection.name}", then search again.`,
+          hint: `Ask the user to open OpenWork Cloud -> Your Connections and click Connect on "${connection.name}", then search again. ${CONNECTION_CARD_HINT}`,
           connectionStatus: buildExternalConnectionStatus({ connection, state: "needs_connection", errorCode: "not_connected", message }),
         }))
       }
@@ -693,7 +721,7 @@ async function probeExternalMcpConnection(input: {
         score,
         summary: `[${connection.name}] Available to your organization, but an admin hasn't connected it yet.`,
         status: "needs_connection",
-        hint: `Ask an org admin to open the OpenWork Cloud dashboard -> Connections and connect "${connection.name}", then search again.`,
+        hint: `Ask an org admin to open the OpenWork Cloud dashboard -> Connections and connect "${connection.name}", then search again. ${CONNECTION_CARD_HINT}`,
         connectionStatus: buildExternalConnectionStatus({ connection, state: "needs_connection", errorCode: "not_connected", message }),
       }))
     }
@@ -704,15 +732,31 @@ async function probeExternalMcpConnection(input: {
     ? { orgMembershipId: input.member.orgMembershipId }
     : undefined
   let tools: Awaited<ReturnType<typeof listExternalMcpTools>>
+  const cacheKey: ExternalToolsSearchCacheKey = {
+    organizationId: connection.organizationId,
+    connectionId: connection.id,
+    updatedAt: connection.updatedAt,
+    credentialMode: connection.credentialMode,
+    ...(connection.credentialMode === "per_member" ? { orgMembershipId: input.member.orgMembershipId } : {}),
+  }
+  const cachedProbe = getExternalToolsSearchCache(cacheKey)
   try {
-    tools = await listExternalMcpTools(
-      connection,
-      redirectUriFor(input.redirectUriBase, connection.id),
-      member,
-      undefined,
-      input.deadline,
-    )
+    if (cachedProbe?.outcome === "failure") throw cachedProbe.error
+    if (cachedProbe?.outcome === "success") {
+      tools = cachedProbe.tools
+    } else {
+      tools = await listExternalMcpTools(
+        connection,
+        redirectUriFor(input.redirectUriBase, connection.id),
+        member,
+        undefined,
+        input.deadline,
+        EXTERNAL_MCP_SEARCH_REQUEST_TIMEOUT_MS,
+      )
+      setExternalToolsSearchCache(cacheKey, { outcome: "success", tools })
+    }
   } catch (error) {
+    if (!cachedProbe) setExternalToolsSearchCache(cacheKey, { outcome: "failure", error })
     const message = upstreamErrorMessage(error)
     const diagnostic = error instanceof ExternalMcpDiagnosticError ? error.diagnostic : undefined
     const nameTokens = tokenize(connection.name)
@@ -733,7 +777,7 @@ async function probeExternalMcpConnection(input: {
         score,
         summary: `[${connection.name}] This connection is set up but returned an error (${message}).`,
         status: "error",
-        hint: externalConnectionErrorHint(connection.name, error, message, connection.credentialMode),
+        hint: `${externalConnectionErrorHint(connection.name, error, message, connection.credentialMode)} ${CONNECTION_CARD_HINT}`,
         connectionStatus: buildExternalConnectionStatus({
           connection,
           state,
@@ -753,6 +797,7 @@ async function probeExternalMcpConnection(input: {
     const summaryTokens = tokenize(summary)
     const score = scoreText(nameTokens, summaryTokens, input.queryTokens)
     if (score <= 0) continue
+    const resourceUri = externalMcpAppResourceUri(tool)
     add({
       name: buildExternalCapabilityName(connection.id, tool.name),
       method: "MCP",
@@ -765,6 +810,8 @@ async function probeExternalMcpConnection(input: {
       argumentsSchema: tool.inputSchema,
       schemaDigest: externalMcpToolSchemaDigest(tool.inputSchema),
       invocation: { argumentsField: "body" },
+      ...(resourceUri ? { kind: "mcp_app" as const, mcpApp: { resourceUri } } : {}),
+      ...(input.scriptNamespace ? { scriptPath: codemodeScriptPath(input.scriptNamespace, tool.name) } : {}),
     })
   }
   return matches
@@ -782,6 +829,7 @@ export async function searchExternalCapabilities(input: {
   query: string
   redirectUriBase: string
   limit?: number
+  namespaceContext?: CodemodeConnectionNamespaceContext
   reportCoverage?: (coverage: ExternalMcpSearchCoverage) => void
 }): Promise<ExternalCapabilityMatch[]> {
   if (!input.member) return []
@@ -790,12 +838,17 @@ export async function searchExternalCapabilities(input: {
   const requestedLimit = input.limit ?? 5
   if (!Number.isFinite(requestedLimit) || requestedLimit <= 0) return []
   const limit = Math.min(Math.max(1, Math.trunc(requestedLimit)), EXTERNAL_MCP_SEARCH_MATCH_LIMIT)
-  const deadline = createExternalMcpLifecycleDeadline()
-  const connections = await listUsableExternalMcpConnections({
+  const deadline = createExternalMcpLifecycleDeadline(EXTERNAL_MCP_SEARCH_LIFECYCLE_TIMEOUT_MS)
+  const namespaceContext = input.namespaceContext ?? await resolveCodemodeConnectionNamespaceContext({
+    organizationId: input.organizationId,
+    member: input.member,
+  })
+  const connections = namespaceContext?.externalMcpConnections ?? await listUsableExternalMcpConnections({
     organizationId: normalizeDenTypeId("organization", input.organizationId),
     orgMembershipId: input.member.orgMembershipId,
     teamIds: input.member.teamIds,
   })
+  const scriptNamespaces = namespaceContext?.namespaces.externalMcp
   const selectedConnections = selectExternalMcpSearchConnections(connections, queryTokens)
   input.reportCoverage?.({
     eligibleConnections: connections.length,
@@ -813,6 +866,7 @@ export async function searchExternalCapabilities(input: {
       redirectUriBase: input.redirectUriBase,
       limit,
       deadline: sharedDeadline,
+      scriptNamespace: scriptNamespaces?.get(connection.id),
     }),
   })
 }
@@ -849,6 +903,7 @@ export type ExternalCapabilityExecuteResult =
       ok: true
       result: Awaited<ReturnType<typeof callExternalMcpTool>>
       schemaGuidance?: ExternalMcpSchemaGuidance
+      mcpApp?: ExternalMcpAppLaunch
     }
   | {
       ok: false
@@ -948,6 +1003,87 @@ function advisorySchemaGuidance(
   }
 }
 
+export type ExternalConnectionProbe =
+  | { ok: true; connected: true; connection: { id: string; name: string } }
+  | { ok: true; connected: false; status: ExternalConnectionStatus }
+  | { ok: false; error: "forbidden" | "unknown_capability"; message: string }
+
+/**
+ * Probes one connection's live credential state without calling provider
+ * tools. Backs the connection_status capability execution and the app-only
+ * connection_action tool, so the same check renders the connection card and
+ * refreshes it after the member fixes the connection.
+ */
+export async function probeExternalConnectionStatus(input: {
+  organizationId: string
+  member: McpMemberIdentity | null
+  connectionId: string
+}): Promise<ExternalConnectionProbe> {
+  if (!input.member) {
+    return { ok: false, error: "forbidden", message: "No active org membership for this token." }
+  }
+  let connection: Awaited<ReturnType<typeof getExternalMcpConnection>>
+  let connectionId: DenTypeId<"externalMcpConnection">
+  try {
+    connectionId = normalizeDenTypeId("externalMcpConnection", input.connectionId)
+    connection = await getExternalMcpConnection({
+      organizationId: normalizeDenTypeId("organization", input.organizationId),
+      connectionId,
+    })
+  } catch {
+    connection = null
+    connectionId = input.connectionId as DenTypeId<"externalMcpConnection">
+  }
+  if (!connection || connection.kind !== "external_mcp") {
+    return { ok: false, error: "unknown_capability", message: `No external MCP connection "${input.connectionId}" in this organization.` }
+  }
+  const canUse = await memberCanUseExternalMcpConnection({
+    connectionId,
+    orgMembershipId: input.member.orgMembershipId,
+    teamIds: input.member.teamIds,
+  })
+  if (!canUse) {
+    return { ok: false, error: "forbidden", message: `You have not been granted access to "${connection.name}".` }
+  }
+  if (connection.oauthIssuerReviewRequiredAt) {
+    const message = `"${connection.name}" is blocked until an organization admin reviews its changed OAuth issuer.`
+    return {
+      ok: true,
+      connected: false,
+      status: buildExternalConnectionStatus({
+        connection,
+        state: "reauth_required",
+        errorCode: "unauthorized",
+        message,
+        actionOwner: "organization_admin",
+      }),
+    }
+  }
+  if (connection.credentialMode === "per_member") {
+    const account = await getConnectedAccount({
+      organizationId: connection.organizationId,
+      orgMembershipId: input.member.orgMembershipId,
+      providerId: connection.id,
+    })
+    if (!account?.accessToken) {
+      const message = `You haven't connected your ${connection.name} account yet.`
+      return {
+        ok: true,
+        connected: false,
+        status: buildExternalConnectionStatus({ connection, state: "needs_connection", errorCode: "not_connected", message }),
+      }
+    }
+  } else if (!hasSharedCredential(connection)) {
+    const message = `"${connection.name}" is not connected yet.`
+    return {
+      ok: true,
+      connected: false,
+      status: buildExternalConnectionStatus({ connection, state: "needs_connection", errorCode: "not_connected", message }),
+    }
+  }
+  return { ok: true, connected: true, connection: { id: connection.id, name: connection.name } }
+}
+
 /**
  * Executes a namespaced external capability, scoped to the calling
  * principal's org AND member: the member must hold a grant (org-wide,
@@ -962,6 +1098,10 @@ export async function executeExternalCapability(input: {
   args: unknown
   schemaDigest?: string
   redirectUriBase: string
+  /** Fail closed unless the live provider catalog still marks this exact tool read-only. */
+  requireReadOnly?: boolean
+  /** Fail closed when the live input schema no longer matches schemaDigest. */
+  requireSchemaMatch?: boolean
 }): Promise<ExternalCapabilityExecuteResult> {
   if (!input.member) {
     return { ok: false, error: "forbidden", message: "No active org membership for this token." }
@@ -1085,8 +1225,29 @@ export async function executeExternalCapability(input: {
       }
     }
 
+    if (input.requireReadOnly && (tool.annotations?.readOnlyHint !== true || tool.annotations?.destructiveHint === true)) {
+      return {
+        ok: false,
+        error: "policy_blocked",
+        capability: buildExternalCapabilityName(connection.id, input.toolName),
+        message: `${input.toolName} is no longer advertised as strictly read-only, so OpenWork blocked the Remote MCP App call.`,
+        sameArgumentsRetryable: false,
+        retry: { action: "search_capabilities", searchRequired: true },
+      }
+    }
+
     const schemaDigest = externalMcpToolSchemaDigest(tool.inputSchema)
     currentSchemaDigest = schemaDigest
+    if (input.requireSchemaMatch && input.schemaDigest && input.schemaDigest !== schemaDigest) {
+      return {
+        ok: false,
+        error: "policy_blocked",
+        capability: buildExternalCapabilityName(connection.id, input.toolName),
+        message: `${input.toolName} now advertises a different input schema, so OpenWork blocked the Remote MCP App call until its cached revision is refreshed.`,
+        sameArgumentsRetryable: false,
+        retry: { action: "search_capabilities", searchRequired: true },
+      }
+    }
     const schemaWarnings: ExternalMcpSchemaWarning[] = []
     if (input.schemaDigest && input.schemaDigest !== schemaDigest) {
       schemaWarnings.push({
@@ -1129,10 +1290,21 @@ export async function executeExternalCapability(input: {
 
     schemaGuidance = advisorySchemaGuidance(schemaWarnings)
     const result = await providerCall
+    const resourceUri = externalMcpAppResourceUri(tool)
     return {
       ok: true,
       result,
       ...(schemaGuidance ? { schemaGuidance } : {}),
+      ...(resourceUri
+        ? {
+            mcpApp: {
+              connectionId: connection.id,
+              toolName: tool.name,
+              resourceUri,
+              arguments: forwardedArguments,
+            },
+          }
+        : {}),
     }
   } catch (error) {
     const message = upstreamErrorMessage(error)

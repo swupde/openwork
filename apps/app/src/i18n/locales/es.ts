@@ -1,12 +1,9 @@
-import { automationsEnglish } from "./automations";
-
 /**
  * Spanish translations (Español)
  * Professional terms (Skills, Plugins, Commands, Sessions, OpenCode, OpenPackage, OpenWork) are NOT translated
  */
 
 export default {
-  ...automationsEnglish,
   "app.compact_command_desc": "Resume esta sesión para reducir el contexto.",
   "app.error_audit_load": "No se pudo cargar el audit log.",
   "app.error_auth_failed": "Error de autenticación",
@@ -636,6 +633,10 @@ export default {
   "session.redo_aria_label": "Rehacer el último mensaje revertido",
   "session.redo_label": "Rehacer",
   "session.redo_title": "Rehacer el último mensaje revertido",
+  "session.reverted_messages_hidden": "{count} mensajes anteriores están ocultos",
+  "session.restore": "Restaurar",
+  "session.restoring": "Restaurando...",
+  "session.restore_failed": "No se pudieron restaurar los mensajes ocultos. Inténtalo de nuevo.",
   "session.rename_description": "Actualiza el nombre de esta sesión.",
   "session.rename_label": "Nombre de la sesión",
   "session.rename_placeholder": "Escribe un nombre nuevo",
@@ -945,14 +946,14 @@ export default {
   "settings.tab_advanced": "Avanzado",
   "settings.tab_appearance": "Apariencia",
   "settings.tab_cloud_account": "Account",
-  "settings.tab_cloud_marketplaces": "Marketplaces & Plugins",
+  "settings.tab_cloud_marketplaces": "Colecciones",
   "settings.tab_cloud_providers": "Cloud Providers",
   "settings.tab_debug": "Depurar",
   "settings.tab_description_advanced": "Inspecciona el estado del runtime, el estado de la conexión y los controles orientados a desarrolladores.",
   "settings.tab_description_appearance": "Ajusta la apariencia de OpenWork en el escritorio, el tema del sistema y la app.",
   "settings.tab_description_debug": "Revisa diagnósticos, registros y utilidades avanzadas de depuración del runtime.",
   "settings.tab_description_cloud_account": "Sign in, manage your organization, and configure your cloud connection.",
-  "settings.tab_description_cloud_marketplaces": "Browse and import plugins from your organization's marketplaces.",
+  "settings.tab_description_cloud_marketplaces": "Explora las colecciones de plugins de tu organización e impórtalas a tu espacio de trabajo.",
   "settings.tab_description_cloud_providers": "Consulta el estado de sincronización de los proveedores LLM de la organización.",
   "settings.tab_description_environment": "Save API keys and tokens for local agents, skills, and MCP servers. Secrets stay on this device.",
   "settings.tab_description_extensions": "Skills, conexiones y herramientas que tu agente puede usar.",
@@ -1081,7 +1082,7 @@ export default {
   "skills.share_team_uploading": "Subiendo…",
   "skills.share_team_sign_in": "Inicia sesión para compartir con el equipo",
   "skills.share_team_sign_in_hint": "OpenWork Cloud se abre en tu navegador. Vuelve aquí después de iniciar sesión.",
-  "skills.share_team_uploaded_success": "Subido a {org}. Aparecerá en Marketplace.",
+  "skills.share_team_uploaded_success": "Subido a {org}. Aparecerá en Colecciones.",
   "skills.share_title": "Compartir Skill",
   "skills.shown_count": "Se muestra {count}",
   "skills.skill_creator_already_installed": "La Skill para crear Skills ya está instalada.",

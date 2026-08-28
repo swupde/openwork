@@ -1,12 +1,9 @@
-import { automationsEnglish } from "./automations";
-
 /**
  * Thai translations
  * Professional terms (Skills, Plugins, Commands, Sessions, OpenCode, OpenPackage, OpenWork) are NOT translated
  */
 
 export default {
-  ...automationsEnglish,
   "app.compact_command_desc": "สรุปเซสชันนี้เพื่อลดขนาดบริบท",
   "app.error_audit_load": "โหลดบันทึกการตรวจสอบไม่สำเร็จ",
   "app.error_auth_failed": "การยืนยันตัวตนล้มเหลว",
@@ -629,6 +626,10 @@ export default {
   "session.redo_aria_label": "ทำซ้ำข้อความที่ย้อนกลับ",
   "session.redo_label": "ทำซ้ำ",
   "session.redo_title": "ทำซ้ำข้อความที่ย้อนกลับ",
+  "session.reverted_messages_hidden": "ซ่อนข้อความก่อนหน้าอยู่ {count} ข้อความ",
+  "session.restore": "กู้คืน",
+  "session.restoring": "กำลังกู้คืน...",
+  "session.restore_failed": "ไม่สามารถกู้คืนข้อความที่ซ่อนได้ โปรดลองอีกครั้ง",
   "session.rename_description": "อัปเดตชื่อสำหรับเซสชันนี้",
   "session.rename_label": "ชื่อเซสชัน",
   "session.rename_placeholder": "ใส่ชื่อใหม่",
@@ -938,14 +939,14 @@ export default {
   "settings.tab_advanced": "ขั้นสูง",
   "settings.tab_appearance": "ธีม",
   "settings.tab_cloud_account": "Account",
-  "settings.tab_cloud_marketplaces": "Marketplaces & Plugins",
+  "settings.tab_cloud_marketplaces": "คอลเลกชัน",
   "settings.tab_cloud_providers": "Cloud Providers",
   "settings.tab_debug": "ดีบัก",
   "settings.tab_description_advanced": "ตรวจสอบสถานะรันไทม์ การเชื่อมต่อ และตัวควบคุมสำหรับนักพัฒนา",
   "settings.tab_description_appearance": "ปรับรูปลักษณ์ OpenWork ทั้งเดสก์ท็อป ธีมระบบ และกรอบแอป",
   "settings.tab_description_debug": "ตรวจสอบข้อมูลวินิจฉัยรันไทม์ logs และเครื่องมือดีบักระดับต่ำ",
   "settings.tab_description_cloud_account": "Sign in, manage your organization, and configure your cloud connection.",
-  "settings.tab_description_cloud_marketplaces": "Browse and import plugins from your organization's marketplaces.",
+  "settings.tab_description_cloud_marketplaces": "เรียกดูคอลเลกชันปลั๊กอินขององค์กรและนำเข้าสู่พื้นที่ทำงานของคุณ",
   "settings.tab_description_cloud_providers": "ตรวจสอบสถานะการซิงค์ LLM provider ขององค์กร",
   "settings.tab_description_environment": "Save API keys and tokens for local agents, skills, and MCP servers. Secrets stay on this device.",
   "settings.tab_description_extensions": "ทักษะ การเชื่อมต่อ และเครื่องมือที่เอเจนต์ของคุณใช้ได้",

@@ -1,5 +1,4 @@
-import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js"
-
+import { SdkError, SdkErrorCode } from "@modelcontextprotocol/client"
 import type { EnterpriseMcpOperationPhase, EnterpriseMcpRequestPhase } from "./contracts.js"
 
 export type EnterpriseMcpErrorCode =
@@ -10,6 +9,8 @@ export type EnterpriseMcpErrorCode =
   | "MCP_PROTOCOL_INITIALIZE_FAILED"
   | "MCP_TOOL_DISCOVERY_FAILED"
   | "MCP_TOOL_EXECUTION_FAILED"
+  | "MCP_RESOURCE_DISCOVERY_FAILED"
+  | "MCP_RESOURCE_READ_FAILED"
   | "MCP_SHUTDOWN_FAILED"
 
 const errorCodeByPhase: Record<EnterpriseMcpOperationPhase, EnterpriseMcpErrorCode> = {
@@ -20,6 +21,8 @@ const errorCodeByPhase: Record<EnterpriseMcpOperationPhase, EnterpriseMcpErrorCo
   "protocol-initialize": "MCP_PROTOCOL_INITIALIZE_FAILED",
   "tool-discovery": "MCP_TOOL_DISCOVERY_FAILED",
   "tool-execution": "MCP_TOOL_EXECUTION_FAILED",
+  "resource-discovery": "MCP_RESOURCE_DISCOVERY_FAILED",
+  "resource-read": "MCP_RESOURCE_READ_FAILED",
   shutdown: "MCP_SHUTDOWN_FAILED",
 }
 
@@ -28,9 +31,11 @@ const phaseLabel: Record<EnterpriseMcpOperationPhase, string> = {
   "requirements-discovery": "MCP connection requirements discovery",
   "connection-handshake": "MCP connection handshake",
   "authorization-callback": "OAuth authorization callback",
-  "protocol-initialize": "MCP protocol initialization",
+  "protocol-initialize": "MCP protocol negotiation",
   "tool-discovery": "MCP tool discovery",
   "tool-execution": "MCP tool execution",
+  "resource-discovery": "MCP resource discovery",
+  "resource-read": "MCP resource read",
   shutdown: "MCP client shutdown",
 }
 
@@ -41,9 +46,12 @@ const requestPhaseLabel: Record<EnterpriseMcpRequestPhase, string> = {
   "oauth-client-registration": "OAuth client registration",
   "oauth-token-exchange": "OAuth token exchange",
   "oauth-token-refresh": "OAuth token refresh",
+  "mcp-discovery": "the MCP server/discover request",
   "mcp-initialize": "the MCP initialize request",
   "mcp-tool-discovery": "the MCP tools/list request",
   "mcp-tool-execution": "the MCP tools/call request",
+  "mcp-resource-discovery": "the MCP resource catalog request",
+  "mcp-resource-read": "the MCP resources/read request",
   "unknown-request": "an MCP provider request",
 }
 
@@ -68,17 +76,17 @@ export class EnterpriseMcpClientError extends Error {
 
 /**
  * Marks a lifecycle abort as ours on the `data` of an MCP error. The SDK
- * rethrows an `McpError` untouched but collapses any other abort reason into
+ * rethrows an `SdkError` untouched but collapses any other abort reason into
  * `String(reason)` on a RequestTimeout, leaving downstream diagnostics unable
  * to tell an OpenWork deadline apart from a provider-declared failure.
  */
 export const ENTERPRISE_MCP_LIFECYCLE_DEADLINE_DATA_KEY = "enterpriseMcpLifecycleDeadline"
 
-export class EnterpriseMcpLifecycleDeadlineError extends McpError {
+export class EnterpriseMcpLifecycleDeadlineError extends SdkError {
   readonly operationPhase: EnterpriseMcpOperationPhase
 
   constructor(operationPhase: EnterpriseMcpOperationPhase) {
-    super(ErrorCode.RequestTimeout, `Enterprise MCP ${operationPhase} exceeded its lifecycle deadline.`, {
+    super(SdkErrorCode.RequestTimeout, `Enterprise MCP ${operationPhase} exceeded its lifecycle deadline.`, {
       [ENTERPRISE_MCP_LIFECYCLE_DEADLINE_DATA_KEY]: true,
       operationPhase,
     })
@@ -115,6 +123,7 @@ export type EnterpriseMcpOAuthContractErrorCode =
   | "MCP_OAUTH_CLIENT_EXPIRED"
   | "MCP_OAUTH_CREDENTIAL_EXPIRED"
   | "MCP_OAUTH_CREDENTIAL_CHANGED"
+  | "MCP_OAUTH_CONFIGURATION_CHANGED"
   | "MCP_OAUTH_CONFIGURATION_REQUIRED"
   | "MCP_OAUTH_ISSUER_MISMATCH"
   | "MCP_OAUTH_PERSISTENCE_INVALID"
@@ -193,6 +202,7 @@ export type EnterpriseMcpCatalogErrorCode =
   | "MCP_CATALOG_PAGE_LIMIT"
   | "MCP_CATALOG_ITEM_LIMIT"
   | "MCP_CATALOG_DUPLICATE_TOOL"
+  | "MCP_CATALOG_DUPLICATE_RESOURCE"
   | "MCP_CATALOG_TOOL_NAME_LIMIT"
   | "MCP_CATALOG_TOOL_DESCRIPTION_LIMIT"
   | "MCP_CATALOG_TOOL_TITLE_LIMIT"
@@ -201,12 +211,15 @@ export type EnterpriseMcpCatalogErrorCode =
   | "MCP_CATALOG_SCHEMA_CYCLE"
   | "MCP_CATALOG_CURSOR_SIZE_LIMIT"
   | "MCP_CATALOG_BYTE_LIMIT"
+  | "MCP_RESOURCE_URI_LIMIT"
+  | "MCP_RESOURCE_DESCRIPTOR_LIMIT"
+  | "MCP_RESOURCE_RESULT_LIMIT"
 
 export class EnterpriseMcpCatalogError extends Error {
   readonly code: EnterpriseMcpCatalogErrorCode
 
   constructor(code: EnterpriseMcpCatalogErrorCode) {
-    super("The MCP tool catalog exceeded an enterprise client contract limit.")
+    super("The MCP catalog or resource exceeded an enterprise client contract limit.")
     this.name = "EnterpriseMcpCatalogError"
     this.code = code
   }

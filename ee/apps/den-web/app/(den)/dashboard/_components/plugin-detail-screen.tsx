@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
-import { Archive, ArrowLeft, FileText, MoreHorizontal, Pencil, Plus, Server, Store, Terminal, Users, Webhook } from "lucide-react";
+import { Archive, ArrowLeft, Code2, FileText, MoreHorizontal, Pencil, Plus, Server, Store, Terminal, Users, Webhook } from "lucide-react";
 
 import { getNewPluginSkillRoute, getOrgAccessFlags, getPluginSkillRoute, getPluginsRoute } from "../../_lib/den-org";
 import { buttonVariants, DenButton } from "../../_components/ui/button";
@@ -14,27 +14,41 @@ import {
   type DenPlugin,
   type PluginHook,
   type PluginMcp,
+  type PluginWorkflow,
   type PluginSkill,
   type PluginAgent,
   type PluginCommand,
   formatPluginTimestamp,
   useArchivePlugin,
+  useAttachWorkflowToPlugin,
   usePlugin,
   useUpdatePlugin,
 } from "./plugin-data";
 import { CatalogIdentityTile } from "./catalog-identity-tile";
 import { type PluginAccessGrant, usePluginAccess } from "./plugin-access-data";
 import { PluginAccessSection } from "./plugin-access-section";
+import { WorkflowDetailPanel } from "./workflow-detail-panel";
+import { useLibrary, type LibraryWorkflowItem } from "./library-data";
 
-export function PluginDetailScreen({ pluginId }: { pluginId: string }) {
+export function PluginDetailScreen({
+  pluginId,
+  backHref,
+}: {
+  pluginId: string;
+  backHref?: string;
+}) {
   const router = useRouter();
   const { orgContext, orgSlug } = useOrgDashboard();
   const { data: plugin, isLoading, error, refetch } = usePlugin(pluginId);
   const pluginAccessQuery = usePluginAccess(pluginId);
   const archivePlugin = useArchivePlugin();
+  const attachWorkflow = useAttachWorkflowToPlugin(pluginId);
+  const libraryQuery = useLibrary();
   const [actionsOpen, setActionsOpen] = useState(false);
   const [editPlugin, setEditPlugin] = useState<{ name: string; description: string } | null>(null);
   const [archiveOpen, setArchiveOpen] = useState(false);
+  const [addWorkflowOpen, setAddWorkflowOpen] = useState(false);
+  const [selectedWorkflowId, setSelectedWorkflowId] = useState<string | null>(null);
   const actionsRef = useRef<HTMLDivElement | null>(null);
   const access = getOrgAccessFlags(
     orgContext?.currentMember.role ?? "member",
@@ -73,6 +87,14 @@ export function PluginDetailScreen({ pluginId }: { pluginId: string }) {
     );
   }
 
+  if (selectedWorkflowId) {
+    return (
+      <div className="mx-auto max-w-[1180px] px-6 py-8 md:px-8">
+        <WorkflowDetailPanel configObjectId={selectedWorkflowId} onClose={() => setSelectedWorkflowId(null)} />
+      </div>
+    );
+  }
+
   const marketplaces = plugin.marketplaces ?? [];
   const creator = orgContext?.members.find((member) => member.id === plugin.createdByOrgMembershipId) ?? null;
   const accessBlastRadius = getPluginAccessBlastRadius(
@@ -85,6 +107,7 @@ export function PluginDetailScreen({ pluginId }: { pluginId: string }) {
   if (plugin.commands.length === 0) missingLabels.push("commands");
   if (plugin.hooks.length === 0) missingLabels.push("hooks");
   if (plugin.mcps.length === 0) missingLabels.push("MCP servers");
+  if (plugin.workflows.length === 0) missingLabels.push("Workflows");
 
   async function handleArchivePlugin() {
     try {
@@ -101,7 +124,7 @@ export function PluginDetailScreen({ pluginId }: { pluginId: string }) {
     <div className="mx-auto max-w-[860px] px-6 py-8 md:px-8">
       <div className="mb-6 flex items-center justify-between gap-4">
         <Link
-          href={getPluginsRoute(orgSlug)}
+          href={backHref ?? getPluginsRoute(orgSlug)}
           className="inline-flex items-center gap-1.5 text-[13px] text-gray-400 transition hover:text-gray-700"
         >
           <ArrowLeft className="h-4 w-4" />
@@ -201,7 +224,16 @@ export function PluginDetailScreen({ pluginId }: { pluginId: string }) {
           isLoading={pluginAccessQuery.isLoading}
           error={pluginAccessQuery.error}
         />
-        <SkillsSection orgSlug={orgSlug} plugin={plugin} />
+        <SkillsSection orgSlug={orgSlug} plugin={plugin} canEdit={access.isAdmin} />
+        <WorkflowsSection
+          plugin={plugin}
+          canEdit={access.isAdmin}
+          onAdd={() => {
+            attachWorkflow.reset();
+            setAddWorkflowOpen(true);
+          }}
+          onOpen={(workflowId) => setSelectedWorkflowId(workflowId)}
+        />
         <PrimitiveSection icon={Users} label="Agents" items={plugin.agents} render={renderAgentRow} />
         <PrimitiveSection icon={Terminal} label="Commands" items={plugin.commands} render={renderCommandRow} />
         <PrimitiveSection icon={Webhook} label="Hooks" items={plugin.hooks} render={renderHookRow} />
@@ -237,6 +269,19 @@ export function PluginDetailScreen({ pluginId }: { pluginId: string }) {
           if (!archivePlugin.isPending) setArchiveOpen(false);
         }}
         onConfirm={() => void handleArchivePlugin()}
+      />
+      <AddWorkflowDialog
+        open={addWorkflowOpen}
+        plugin={plugin}
+        workflows={(libraryQuery.data ?? []).filter((item): item is LibraryWorkflowItem => item.type === "workflow")}
+        busy={attachWorkflow.isPending}
+        error={attachWorkflow.error}
+        onClose={() => {
+          if (!attachWorkflow.isPending) setAddWorkflowOpen(false);
+        }}
+        onAttach={(workflowId) => {
+          void attachWorkflow.mutateAsync(workflowId).then(() => setAddWorkflowOpen(false)).catch(() => undefined);
+        }}
       />
     </div>
   );
@@ -455,7 +500,7 @@ function PrimitiveSection<T>({
   );
 }
 
-function SkillsSection({ orgSlug, plugin }: { orgSlug: string | null; plugin: DenPlugin }) {
+function SkillsSection({ orgSlug, plugin, canEdit }: { orgSlug: string | null; plugin: DenPlugin; canEdit: boolean }) {
   return (
     <section>
       <div className="mb-3 flex items-center justify-between gap-3">
@@ -466,10 +511,12 @@ function SkillsSection({ orgSlug, plugin }: { orgSlug: string | null; plugin: De
           </h2>
           <p className="mt-1 text-[12px] text-gray-400">Reusable instructions included in this plugin.</p>
         </div>
-        <Link href={getNewPluginSkillRoute(orgSlug, plugin.id)} className={buttonVariants({ size: "sm" })}>
-          <Plus className="h-3.5 w-3.5" aria-hidden="true" />
-          Add skill
-        </Link>
+        {canEdit ? (
+          <Link href={getNewPluginSkillRoute(orgSlug, plugin.id)} className={buttonVariants({ size: "sm" })}>
+            <Plus className="h-3.5 w-3.5" aria-hidden="true" />
+            Add skill
+          </Link>
+        ) : null}
       </div>
       {plugin.skills.length === 0 ? (
         <div className="rounded-xl border border-dashed border-gray-200 bg-white px-5 py-8 text-center">
@@ -479,7 +526,7 @@ function SkillsSection({ orgSlug, plugin }: { orgSlug: string | null; plugin: De
       ) : (
         <div className="grid gap-2">
           {plugin.skills.map((skill) => (
-            <SkillRow key={skill.id} orgSlug={orgSlug} pluginId={plugin.id} skill={skill} />
+            <SkillRow key={skill.id} orgSlug={orgSlug} pluginId={plugin.id} skill={skill} href={canEdit} />
           ))}
         </div>
       )}
@@ -487,18 +534,34 @@ function SkillsSection({ orgSlug, plugin }: { orgSlug: string | null; plugin: De
   );
 }
 
-function SkillRow({ orgSlug, pluginId, skill }: { orgSlug: string | null; pluginId: string; skill: PluginSkill }) {
-  return (
-    <Link
-      href={getPluginSkillRoute(orgSlug, pluginId, skill.id)}
-      className="block rounded-xl border border-gray-100 bg-white px-4 py-3 transition hover:border-gray-200"
-    >
+function SkillRow({
+  orgSlug,
+  pluginId,
+  skill,
+  href,
+}: {
+  orgSlug: string | null;
+  pluginId: string;
+  skill: PluginSkill;
+  href: boolean;
+}) {
+  const className = "block rounded-xl border border-gray-100 bg-white px-4 py-3 transition hover:border-gray-200";
+  const body = (
+    <>
       <p className="truncate text-[14px] font-semibold tracking-[-0.01em] text-gray-900">{skill.name}</p>
       {skill.description ? (
         <p className="mt-0.5 line-clamp-2 text-[12.5px] leading-[1.55] text-gray-500">{skill.description}</p>
       ) : null}
-    </Link>
+    </>
   );
+  if (href) {
+    return (
+      <Link href={getPluginSkillRoute(orgSlug, pluginId, skill.id)} className={className}>
+        {body}
+      </Link>
+    );
+  }
+  return <div className={className}>{body}</div>;
 }
 
 function renderHookRow(hook: PluginHook) {
@@ -566,6 +629,111 @@ function renderCommandRow(command: PluginCommand) {
         <p className="mt-0.5 line-clamp-2 text-[12.5px] leading-[1.55] text-gray-500">{command.description}</p>
       ) : null}
     </div>
+  );
+}
+
+function WorkflowsSection({
+  plugin,
+  canEdit,
+  onAdd,
+  onOpen,
+}: {
+  plugin: DenPlugin;
+  canEdit: boolean;
+  onAdd: () => void;
+  onOpen: (workflowId: string) => void;
+}) {
+  return (
+    <section>
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <div>
+          <h2 className="inline-flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-[0.16em] text-gray-400">
+            <Code2 className="h-3.5 w-3.5" />
+            Workflows
+          </h2>
+          <p className="mt-1 text-[12px] text-gray-400">Reusable Workflows shared with this Plugin and its collection audiences.</p>
+        </div>
+        {canEdit ? (
+          <DenButton size="sm" onClick={onAdd}><Plus className="h-3.5 w-3.5" aria-hidden />Add Workflow</DenButton>
+        ) : null}
+      </div>
+      {plugin.workflows.length === 0 ? (
+        <div className="rounded-xl border border-dashed border-gray-200 bg-white px-5 py-8 text-center">
+          <p className="text-[14px] font-medium text-gray-900">No Workflows in this Plugin yet.</p>
+          <p className="mt-1 text-[12.5px] text-gray-500">Create a Workflow from a successful Code Mode run and choose this Plugin, or attach an existing Workflow.</p>
+        </div>
+      ) : (
+        <div className="grid gap-2">{plugin.workflows.map((workflow) => renderWorkflowRow(workflow, () => onOpen(workflow.id)))}</div>
+      )}
+    </section>
+  );
+}
+
+function AddWorkflowDialog({
+  open,
+  plugin,
+  workflows,
+  busy,
+  error,
+  onClose,
+  onAttach,
+}: {
+  open: boolean;
+  plugin: DenPlugin;
+  workflows: LibraryWorkflowItem[];
+  busy: boolean;
+  error: unknown;
+  onClose: () => void;
+  onAttach: (workflowId: string) => void;
+}) {
+  const existing = new Set(plugin.workflows.map((workflow) => workflow.id));
+  const available = workflows.filter((workflow) => !existing.has(workflow.id) && workflow.role === "manager");
+  if (!open) return null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/45 px-4 py-6" onClick={busy ? undefined : onClose}>
+      <div role="dialog" aria-modal="true" aria-labelledby="add-workflow-title" className="w-full max-w-[520px] rounded-2xl border border-gray-100 bg-white p-6 shadow-[0_24px_60px_-24px_rgba(15,23,42,0.4)]" onClick={(event) => event.stopPropagation()}>
+        <h2 id="add-workflow-title" className="text-[16px] font-semibold tracking-[-0.01em] text-gray-950">Add a Workflow to {plugin.name}</h2>
+        <p className="mt-1 text-[13px] leading-6 text-gray-500">Workflows in this Plugin are visible to the same people and teams as the Plugin, including collection audiences.</p>
+        <div className="mt-4 max-h-72 space-y-2 overflow-y-auto">
+          {available.length === 0 ? (
+            <div className="rounded-xl border border-dashed border-gray-200 px-4 py-6 text-center text-[13px] text-gray-500">No unattached Workflows you manage are available. Create one from a successful Code Mode run and choose this Plugin when saving.</div>
+          ) : available.map((workflow) => (
+            <button key={workflow.id} type="button" disabled={busy} onClick={() => onAttach(workflow.id)} className="w-full rounded-xl border border-gray-100 px-4 py-3 text-left transition hover:border-gray-200 hover:bg-gray-50 disabled:opacity-60">
+              <p className="text-[14px] font-semibold text-gray-900">{workflow.name}</p>
+              <p className="mt-0.5 text-[12.5px] text-gray-500">{workflow.plugin ? `Currently in ${workflow.plugin.name}` : "Shared directly"}{workflow.description ? ` · ${workflow.description}` : ""}</p>
+            </button>
+          ))}
+        </div>
+        {error ? <p className="mt-3 text-[12.5px] text-red-600">{error instanceof Error ? error.message : "Failed to add Workflow."}</p> : null}
+        <div className="mt-5 flex justify-end"><DenButton variant="secondary" onClick={onClose} disabled={busy}>Close</DenButton></div>
+      </div>
+    </div>
+  );
+}
+
+function renderWorkflowRow(workflow: PluginWorkflow, onOpen: () => void) {
+  return (
+    <button
+      key={workflow.id}
+      type="button"
+      onClick={onOpen}
+      className="w-full rounded-xl border border-gray-100 bg-white px-4 py-3 text-left transition hover:border-gray-200 hover:bg-gray-50"
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="truncate text-[14px] font-semibold tracking-[-0.01em] text-gray-900">{workflow.name}</p>
+        <span className="rounded-full bg-gray-50 px-2 py-0.5 text-[11px] text-gray-500">
+          {workflow.requiredCapabilityCount} read-only capabilit{workflow.requiredCapabilityCount === 1 ? "y" : "ies"}
+        </span>
+      </div>
+      {workflow.description ? (
+        <p className="mt-0.5 line-clamp-2 text-[12.5px] leading-[1.55] text-gray-500">{workflow.description}</p>
+      ) : null}
+      <p className="mt-2 text-[11px] text-gray-400">
+        {workflow.versionId ? `Current version ${workflow.versionId.slice(0, 8)}` : "No published version"}
+        {workflow.outputSchema ? " · Validated output" : ""}
+      </p>
+    </button>
   );
 }
 

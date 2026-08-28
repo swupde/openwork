@@ -1,12 +1,9 @@
-import { automationsEnglish } from "./automations";
-
 /**
  * Catalan translations (Català)
  * Professional terms (Skills, Plugins, Commands, Sessions, OpenCode, OpenPackage, OpenWork) are NOT translated
  */
 
 export default {
-  ...automationsEnglish,
   "app.compact_command_desc": "Resumeix aquesta sessió per reduir la mida del context.",
   "app.error_audit_load": "No s'ha pogut carregar el registre d'auditoria.",
   "app.error_auth_failed": "L'autenticació ha fallat",
@@ -636,6 +633,10 @@ export default {
   "session.redo_aria_label": "Refeix l'últim missatge revertit",
   "session.redo_label": "Refer",
   "session.redo_title": "Refeix l'últim missatge revertit",
+  "session.reverted_messages_hidden": "Hi ha {count} missatges anteriors ocults",
+  "session.restore": "Restaura",
+  "session.restoring": "Restaurant...",
+  "session.restore_failed": "No s'han pogut restaurar els missatges ocults. Torna-ho a provar.",
   "session.rename_description": "Actualitza el nom d'aquesta sessió.",
   "session.rename_label": "Nom de la sessió",
   "session.rename_placeholder": "Introdueix un nom nou",
@@ -945,14 +946,14 @@ export default {
   "settings.tab_advanced": "Avançat",
   "settings.tab_appearance": "Aparença",
   "settings.tab_cloud_account": "Account",
-  "settings.tab_cloud_marketplaces": "Marketplaces & Plugins",
+  "settings.tab_cloud_marketplaces": "Col·leccions",
   "settings.tab_cloud_providers": "Cloud Providers",
   "settings.tab_debug": "Depuració",
   "settings.tab_description_advanced": "Inspecciona l'estat del runtime, l'estat de la connexió i els controls orientats a desenvolupador.",
   "settings.tab_description_appearance": "Ajusta l'aspecte d'OpenWork al desktop, al tema del sistema i al marc de l'app.",
   "settings.tab_description_debug": "Revisa els diagnòstics, els registres i les utilitats avançades de depuració del runtime.",
   "settings.tab_description_cloud_account": "Sign in, manage your organization, and configure your cloud connection.",
-  "settings.tab_description_cloud_marketplaces": "Browse and import plugins from your organization's marketplaces.",
+  "settings.tab_description_cloud_marketplaces": "Explora les col·leccions de plugins de la teva organització i importa-les al teu espai de treball.",
   "settings.tab_description_cloud_providers": "Revisa l'estat de sincronització dels proveïdors LLM de l'organització.",
   "settings.tab_description_environment": "Save API keys and tokens for local agents, skills, and MCP servers. Secrets stay on this device.",
   "settings.tab_description_extensions": "Skills, connexions i eines que el teu agent pot utilitzar.",
@@ -1081,7 +1082,7 @@ export default {
   "skills.share_team_uploading": "S'està carregant…",
   "skills.share_team_sign_in": "Inicia la sessió per compartir amb l'equip",
   "skills.share_team_sign_in_hint": "OpenWork Cloud s'obre al vostre navegador. Torna aquí després d'iniciar la sessió.",
-  "skills.share_team_uploaded_success": "S'ha pujat a {org}. Apareixerà al Marketplace.",
+  "skills.share_team_uploaded_success": "S'ha pujat a {org}. Apareixerà a Col·leccions.",
   "skills.share_title": "Comparteix Skill",
   "skills.shown_count": "Es mostra {count}",
   "skills.skill_creator_already_installed": "El creador d'Skills ja està instal·lat.",

@@ -1,14 +1,17 @@
 import type { AutomationExecutionThread } from "@openwork/types/automations"
+import { workspaceSessionRoute } from "@/react-app/shell/workspace-routes"
 
 export type AutomationExecutionIdentity = {
-  icon: "desktop"
-  label: "Desktop"
+  icon: "desktop" | "cloud"
+  label: "Desktop" | "OpenWork Cloud"
 }
 
 export function automationExecutionIdentity(
   thread: Pick<AutomationExecutionThread, "executionLocation">,
 ): AutomationExecutionIdentity {
-  return { icon: "desktop", label: "Desktop" }
+  return thread.executionLocation === "cloud"
+    ? { icon: "cloud", label: "OpenWork Cloud" }
+    : { icon: "desktop", label: "Desktop" }
 }
 
 export function automationExecutionThreadRoute(
@@ -20,4 +23,13 @@ export function automationExecutionThreadRoute(
     thread: thread.id,
   })
   return `/automations?${query.toString()}`
+}
+
+export function automationLocalSessionRoute(
+  thread: Pick<AutomationExecutionThread, "executionLocation" | "nativeThreadId" | "workspaceId">,
+) {
+  if (thread.executionLocation !== "desktop") return null
+  const sessionId = thread.nativeThreadId?.trim()
+  const workspaceId = thread.workspaceId?.trim()
+  return sessionId && workspaceId ? workspaceSessionRoute(workspaceId, sessionId) : null
 }

@@ -1,5 +1,3 @@
-import { automationsEnglish } from "./automations";
-
 /**
  * 中文（简体）翻译
  * 产品名称保留英文：OpenCode、OpenPackage、OpenWork
@@ -9,7 +7,6 @@ import { automationsEnglish } from "./automations";
  */
 
 export default {
-  ...automationsEnglish,
   "app.compact_command_desc": "压缩此会话以减少上下文大小。",
   "app.error_audit_load": "加载审计日志失败。",
   "app.error_auth_failed": "认证失败",
@@ -632,6 +629,10 @@ export default {
   "session.redo_aria_label": "重做上一条撤销的消息",
   "session.redo_label": "重做",
   "session.redo_title": "重做上一条撤销的消息",
+  "session.reverted_messages_hidden": "{count} 条较早的消息已隐藏",
+  "session.restore": "恢复",
+  "session.restoring": "正在恢复...",
+  "session.restore_failed": "无法恢复隐藏的消息，请重试。",
   "session.rename_description": "更新此会话名称。",
   "session.rename_label": "会话名称",
   "session.rename_placeholder": "输入新的名称",
@@ -941,14 +942,14 @@ export default {
   "settings.tab_advanced": "高级",
   "settings.tab_appearance": "外观",
   "settings.tab_cloud_account": "Account",
-  "settings.tab_cloud_marketplaces": "Marketplaces & Plugins",
+  "settings.tab_cloud_marketplaces": "合集",
   "settings.tab_cloud_providers": "Cloud Providers",
   "settings.tab_debug": "调试",
   "settings.tab_description_advanced": "检查运行时健康状态、连接状态和面向开发者的控制项。",
   "settings.tab_description_appearance": "调整OpenWork在桌面、系统主题和应用外观方面的显示效果。",
   "settings.tab_description_debug": "查看运行时诊断信息、日志和底层调试工具。",
   "settings.tab_description_cloud_account": "Sign in, manage your organization, and configure your cloud connection.",
-  "settings.tab_description_cloud_marketplaces": "Browse and import plugins from your organization's marketplaces.",
+  "settings.tab_description_cloud_marketplaces": "浏览组织的插件合集并将其导入工作区。",
   "settings.tab_description_cloud_providers": "查看组织LLM提供商的同步状态。",
   "settings.tab_description_extensions": "智能体可使用的技能、连接和工具。",
   "settings.tab_description_general": "连接提供商、选择默认模型、授权文件夹，以及控制所选OpenWork工作区和运行时连接。",

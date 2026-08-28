@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type Ref } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { AlertTriangle, Check, Loader2, Plug, Wrench } from "lucide-react";
@@ -81,7 +81,6 @@ export function YourConnectionsScreen() {
     <DashboardPageTemplate
       icon={Plug}
       title="Your Connections"
-      badgeLabel="Beta"
       description="Tools your organization has made available to you. Connect your own account where needed; workspace admins can test tools directly, and your AI coworker uses them with your permissions."
       colors={["#DBEAFE", "#1E3A8A", "#2563EB", "#93C5FD"]}
     >
@@ -167,7 +166,7 @@ function YourConnectionRow({
   presets: ReturnType<typeof useMcpConnectionPresets>["data"];
   onSetup: (target: PluginMcpSetupTarget) => void;
   highlighted: boolean;
-  rowRef?: React.Ref<HTMLDivElement>;
+  rowRef?: Ref<HTMLDivElement>;
   polling: boolean;
   connecting: boolean;
   disconnecting: boolean;

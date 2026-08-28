@@ -1,3 +1,4 @@
+import { processBlankSlateProfile, resolveBlankSlateLaunch } from "./blank-slate-profile.mjs";
 import { execFileSync, spawn } from "node:child_process";
 import { createServer } from "node:http";
 import net from "node:net";
@@ -20,8 +21,8 @@ import { globalOpencodeConfigDir, workspaceOpencodeConfigCandidates } from "@ope
 
 import { configureFakeMediaForTests, installMediaPermissionHandlers } from "./media-permissions.mjs";
 import { registerMigrationIpc } from "./migration.mjs";
-import { createRuntimeManager } from "./runtime.mjs";
-import { registerUpdaterIpc } from "./updater.mjs";
+import { createRuntimeManager, createSystemCaCertificateVerifyProc } from "./runtime.mjs";
+import { normalizeReleaseRepository, registerUpdaterIpc } from "./updater.mjs";
 import {
   checkComputerUsePermissions,
   getComputerUseMcpCommand,
@@ -52,10 +53,11 @@ import { resolveConnectLinkPublicKeys } from "./connect-link-keys.mjs";
 import { openExternalUrl } from "./open-external.mjs";
 import { resolveAppIdentifier, resolveUserDataPath } from "./dev-profile.mjs";
 import { fetchAgentContextDiagnosticsResponse } from "./agent-context-diagnostics-fetch.mjs";
+import { downloadBinaryToPath, uploadMultipartFromBytes } from "./binary-transfer.mjs";
 import {
   createLinuxDesktopIntegration,
 } from "./linux-desktop-integration.mjs";
-import { createDesktopAutomationRunner } from "./automation-runner.mjs";
+import { createDesktopAutomationRunner, normalizeRunnerBaseUrl } from "./automation-runner.mjs";
 import {
   desktopActivationRequired,
   enterprisePreactivationCommandAllowed,
@@ -72,6 +74,13 @@ import {
   windowsIconFromNativeImage,
 } from "./brand-icon-windows.mjs";
 import { resetMacDockIcon } from "./brand-icon-darwin.mjs";
+import { createDesktopVaultKeyProvider } from "./secure-vault-key.mjs";
+import {
+  clearOpenworkSentrySession,
+  initOpenworkSentry,
+  setOpenworkSentrySession,
+} from "./sentry.mjs";
+import { installStdioErrorHandlers } from "./stdio-errors.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const APP_ROOT = path.resolve(__dirname, "../../..");
@@ -88,6 +97,7 @@ const {
   nativeImage,
   nativeTheme,
   net: electronNet,
+  powerMonitor,
   Notification: ElectronNotification,
   session,
   shell,
@@ -95,19 +105,34 @@ const {
 } = require("electron");
 const pty = require(["node", "pty"].join("-"));
 const NATIVE_DEEP_LINK_EVENT = "openwork:deep-link-native";
+const AUTOMATION_RUNNER_CREDENTIAL_REJECTED_EVENT = "openwork:automation-runner:credential-rejected";
 const isDevMode = process.env.OPENWORK_DEV_MODE === "1";
 const DESKTOP_DISTRIBUTION = resolveDesktopDistribution({
   isPackaged: app.isPackaged,
   packageFlavor: Reflect.get(desktopPackageMetadata, "openworkDistribution"),
   environmentFlavor: process.env.OPENWORK_DESKTOP_DISTRIBUTION,
 });
+const RELEASE_REPOSITORY = normalizeReleaseRepository(
+  Reflect.get(desktopPackageMetadata, "openworkReleaseRepository"),
+);
 const TAURI_APP_IDENTIFIER = DESKTOP_DISTRIBUTION.appIdentifier;
 const DEV_APP_IDENTIFIER = `${DESKTOP_DISTRIBUTION.appIdentifier}.dev`;
 const DESKTOP_PROTOCOL_SCHEME = DESKTOP_DISTRIBUTION.protocolScheme;
-const APP_NAME =
+const DEFAULT_APP_NAME =
   (!app.isPackaged ? process.env.OPENWORK_ELECTRON_APP_NAME?.trim() : "") ||
   (isDevMode ? `${DESKTOP_DISTRIBUTION.appName} - Dev` : DESKTOP_DISTRIBUTION.appName);
+const BLANK_SLATE_LAUNCH = resolveBlankSlateLaunch({
+  appName: DEFAULT_APP_NAME,
+  profile: processBlankSlateProfile,
+});
+const APP_NAME = BLANK_SLATE_LAUNCH.appName;
 let currentDisplayAppName = APP_NAME;
+installStdioErrorHandlers();
+await initOpenworkSentry({
+  app,
+  distribution: DESKTOP_DISTRIBUTION,
+  packageMetadata: desktopPackageMetadata,
+});
 const BASE_APP_IDENTIFIER = isDevMode ? DEV_APP_IDENTIFIER : TAURI_APP_IDENTIFIER;
 const APP_IDENTIFIER = resolveAppIdentifier({
   appIdentifierOverride: process.env.OPENWORK_ELECTRON_APP_IDENTIFIER,
@@ -118,7 +143,7 @@ const APP_IDENTIFIER = resolveAppIdentifier({
   isDevMode,
   isPackaged: app.isPackaged,
 });
-if (process.env.OPENWORK_ELECTRON_USE_MOCK_KEYCHAIN === "1") {
+if (BLANK_SLATE_LAUNCH.enabled || process.env.OPENWORK_ELECTRON_USE_MOCK_KEYCHAIN === "1") {
   // Fresh, isolated development profiles otherwise trigger macOS's native
   // "Login" keychain prompt as soon as Chromium persists an authenticated
   // cookie. That modal blocks the entire Electron main loop and makes the demo
@@ -126,8 +151,8 @@ if (process.env.OPENWORK_ELECTRON_USE_MOCK_KEYCHAIN === "1") {
   // system keychain normally.
   app.commandLine.appendSwitch("use-mock-keychain");
 }
-const RELEASE_DOWNLOAD_BASE_URL = "https://github.com/different-ai/openwork/releases/latest/download";
-const RELEASE_PAGE_URL = "https://github.com/different-ai/openwork/releases/latest";
+const RELEASE_DOWNLOAD_BASE_URL = `https://github.com/${RELEASE_REPOSITORY}/releases/latest/download`;
+const RELEASE_PAGE_URL = `https://github.com/${RELEASE_REPOSITORY}/releases/latest`;
 const DOCS_PAGE_URL = "https://openworklabs.com/docs";
 const applicationMenu = createApplicationMenu({
   appName: APP_NAME,
@@ -185,14 +210,16 @@ function killTerminalsForWebContents(webContentsId) {
 // OPENWORK_DEV_PROFILE in unpackaged dev; then the legacy identifier default.
 app.setName(APP_NAME);
 app.setAppUserModelId(APP_IDENTIFIER);
+if (BLANK_SLATE_LAUNCH.homePath) app.setPath("home", BLANK_SLATE_LAUNCH.homePath);
 if (
   app.isPackaged
+  && !BLANK_SLATE_LAUNCH.enabled
   && process.env.OPENWORK_ELECTRON_DISABLE_PROTOCOL_REGISTRATION !== "1"
   && !(process.platform === "linux" && process.env.APPIMAGE)
 ) {
   app.setAsDefaultProtocolClient(DESKTOP_PROTOCOL_SCHEME);
 }
-const userDataPath = resolveUserDataPath({
+const userDataPath = BLANK_SLATE_LAUNCH.userDataPath ?? resolveUserDataPath({
   appDataPath: app.getPath("appData"),
   appIdentifier: APP_IDENTIFIER,
   userDataOverride: process.env.OPENWORK_ELECTRON_USERDATA,
@@ -371,6 +398,28 @@ const BRAND_ICON_FETCH_TIMEOUT_MS = 10_000;
 // Keep in sync with ee/apps/den-api/src/brand-icon-validation.ts so logo CDNs
 // that expect a browser request behave the same at save time and apply time.
 const BRAND_ICON_FETCH_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+function scheduleBlankSlateProfileCleanup() {
+  if (!BLANK_SLATE_LAUNCH.rootPath) return;
+  try {
+    const child = spawn(process.execPath, [
+      path.join(__dirname, "blank-slate-cleanup.mjs"),
+      String(process.pid),
+      BLANK_SLATE_LAUNCH.rootPath,
+    ], {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+    });
+    child.once("error", (error) => {
+      console.warn("[blank-slate] failed to schedule temporary profile cleanup", error);
+    });
+    child.unref();
+  } catch (error) {
+    console.warn("[blank-slate] failed to schedule temporary profile cleanup", error);
+  }
+}
 let brandIconApplySequence = 0;
 let brandIconRuntimeState = { applied: false, sourceUrl: null, reason: null };
 
@@ -1017,6 +1066,45 @@ const workspaceStore = createWorkspaceStore({
   forceRequireSignin: FORCE_DESKTOP_REQUIRE_SIGNIN,
 });
 
+const activeDesktopTransfers = new Map();
+
+function desktopTransferKey(event, transferId) {
+  const normalizedId = typeof transferId === "string" ? transferId.trim() : "";
+  if (!normalizedId || normalizedId.length > 128 || !/^[a-zA-Z0-9._-]+$/.test(normalizedId)) {
+    throw new Error("A valid transferId is required.");
+  }
+  return `${event.sender.id}:${normalizedId}`;
+}
+
+async function runDesktopTransfer(event, input, operation) {
+  const key = desktopTransferKey(event, input?.transferId);
+  if (activeDesktopTransfers.has(key)) throw new Error("transferId is already active.");
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  activeDesktopTransfers.set(key, controller);
+  event.sender.once("destroyed", abort);
+  try {
+    // Both authorities come from app-owned state in userData; workspace-
+    // writable configuration must never widen where a transfer may write.
+    const [authorizedRoots, allowedUrlPrefixes] = await Promise.all([
+      workspaceStore.listLocalWorkspacePaths(),
+      workspaceStore.listRemoteWorkspaceUrlPrefixes(),
+    ]);
+    return await operation(input, {
+      authorizedRoots,
+      allowedUrlPrefixes,
+      // App-owned staging keeps in-flight downloads outside every authorized
+      // workspace root until they complete.
+      stagingDir: path.join(app.getPath("userData"), "binary-transfers"),
+      fetcher: electronNet.fetch,
+      signal: controller.signal,
+    });
+  } finally {
+    event.sender.removeListener("destroyed", abort);
+    activeDesktopTransfers.delete(key);
+  }
+}
+
 const connectLinkReplayGuard = createConnectLinkReplayGuard({
   filePath: path.join(app.getPath("userData"), "connect-link-seen.json"),
 });
@@ -1187,14 +1275,49 @@ const runtimeManager = createRuntimeManager({
   app,
   desktopRoot: path.resolve(__dirname, ".."),
   listLocalWorkspacePaths: () => workspaceStore.listLocalWorkspacePaths(),
+  // When OPENWORK_ENCRYPTION_KEY is set, skip the safeStorage provider so it does not shadow the documented env override used by CI/headless/enterprise.
+  localManagedMcpVaultKey: process.env.OPENWORK_ENCRYPTION_KEY?.trim()
+    ? undefined
+    : createDesktopVaultKeyProvider({
+        filePath: path.join(app.getPath("userData"), "local-managed-mcp-vault-key.bin"),
+        loadSafeStorage: () => require("electron").safeStorage,
+      }),
 });
+const initialRunnerBootstrap = workspaceStore.readDesktopBootstrapConfigSync();
+const legacyRunnerBaseUrls = [
+  initialRunnerBootstrap.apiBaseUrl,
+  initialRunnerBootstrap.baseUrl,
+  initialRunnerBootstrap.baseUrl
+    ? `${String(initialRunnerBootstrap.baseUrl).replace(/\/+$/, "")}/api/den`
+    : null,
+  `${DEFAULT_DEN_BASE_URL}/api/den`,
+].map((value) => normalizeRunnerBaseUrl(value)).filter(Boolean);
 const desktopAutomationRunner = createDesktopAutomationRunner({
+  // v1 credentials predate token audiences. Keep them usable during the Den
+  // rollout only for endpoints trusted before the renderer starts issuing IPC.
+  legacyBaseUrls: legacyRunnerBaseUrls,
   getLocalRuntime: async () => {
     const server = await runtimeManager.openworkServerInfo();
     return { baseUrl: server.baseUrl, token: server.clientToken ?? server.ownerToken };
   },
   log: (state) => console.info(`[automation-runner] ${state}`),
+  onCredentialRejected: () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.webContents.send(AUTOMATION_RUNNER_CREDENTIAL_REJECTED_EVENT);
+  },
 });
+
+// Scheduled Automations are due at wall-clock times a laptop routinely sleeps
+// through. Waking the machine has to poll for work now, not up to a full poll
+// interval later, or a recovered occurrence sits queued while the desktop is
+// already back.
+const wakeAutomationRunner = (wakeEvent) => {
+  if (desktopAutomationRunner.wake().polled) {
+    console.info(`[automation-runner] polling for work after ${wakeEvent}`);
+  }
+};
+powerMonitor.on("resume", () => wakeAutomationRunner("resume"));
+powerMonitor.on("unlock-screen", () => wakeAutomationRunner("unlock-screen"));
 
 let runtimeDisposedForQuit = false;
 let runtimeDisposeInProgress = false;
@@ -1257,6 +1380,9 @@ function assertOpenworkServerReady(info) {
 }
 
 async function bootRuntimeForSelectedWorkspace() {
+  if (typeof process.env.OPENWORK_EVAL_FATAL_DESKTOP_BOOTSTRAP_FAILURE === "string") {
+    throw new Error(process.env.OPENWORK_EVAL_FATAL_DESKTOP_BOOTSTRAP_FAILURE);
+  }
   const list = await workspaceStore.readWorkspaceState();
   const selectedId = list.selectedId || list.activeId || list.workspaces[0]?.id || "";
   const workspace = selectedId
@@ -1713,13 +1839,27 @@ const desktopCommandHandlers = {
   "desktopNotificationShow": async (event, ...args) => {
       return showDesktopNotification(args[0] ?? {});
   },
+  "desktopSentrySetSession": async (event, ...args) => {
+      const input = args[0] ?? {};
+      return {
+        enabled: setOpenworkSentrySession({
+          userId: input.userId,
+          orgId: input.orgId,
+        }),
+      };
+  },
+  "desktopSentryClearSession": async (event, ...args) => {
+      return { enabled: clearOpenworkSentrySession() };
+  },
   "desktopIntegrationStatus": async (event, ...args) => {
       return linuxDesktopIntegration.getStatus();
   },
   "desktopIntegrationInstall": async (event, ...args) => {
+      if (BLANK_SLATE_LAUNCH.enabled) throw new Error("Desktop integration is disabled for test profiles.");
       return linuxDesktopIntegration.install(args[0] ?? {});
   },
   "desktopIntegrationRemove": async (event, ...args) => {
+      if (BLANK_SLATE_LAUNCH.enabled) throw new Error("Desktop integration is disabled for test profiles.");
       return linuxDesktopIntegration.remove();
   },
   "getUiControlBridgeInfo": async (event, ...args) => {
@@ -2042,7 +2182,7 @@ const desktopCommandHandlers = {
   },
   "__applyBrandAppName": async (event, ...args) => {
     currentDisplayAppName = applyBrandAppName(
-      DESKTOP_DISTRIBUTION.flavor === "enterprise" ? null : args[0],
+      BLANK_SLATE_LAUNCH.enabled || DESKTOP_DISTRIBUTION.flavor === "enterprise" ? null : args[0],
       {
       fallbackName: APP_NAME,
       platform: process.platform,
@@ -2053,12 +2193,13 @@ const desktopCommandHandlers = {
       window: mainWindow,
       },
     );
-    if (process.platform === "win32") {
+    if (process.platform === "win32" && !BLANK_SLATE_LAUNCH.enabled) {
       await registerWindowsDisplayShortcut();
     }
     return { ok: true, appName: currentDisplayAppName };
   },
   "__applyBrandIcon": async (event, ...args) => {
+      if (BLANK_SLATE_LAUNCH.enabled) return { ok: true };
       const value = args[0] === null ? null : String(args[0] ?? "");
       return applyBrandIconUrl(value);
   },
@@ -2176,6 +2317,18 @@ const desktopCommandHandlers = {
         headers: Array.from(response.headers.entries()),
         body: await response.text(),
       };
+  },
+  "__uploadMultipart": async (event, ...args) => {
+      return runDesktopTransfer(event, args[0] ?? {}, uploadMultipartFromBytes);
+  },
+  "__downloadBinary": async (event, ...args) => {
+      return runDesktopTransfer(event, args[0] ?? {}, downloadBinaryToPath);
+  },
+  "__cancelTransfer": async (event, ...args) => {
+      const controller = activeDesktopTransfers.get(desktopTransferKey(event, args[0]));
+      if (!controller) return false;
+      controller.abort();
+      return true;
   },
   "__homeDir": async (event, ...args) => {
       return os.homedir();
@@ -2523,6 +2676,12 @@ const { ensureAutoUpdater } = registerUpdaterIpc({
   manifestChannel: DESKTOP_DISTRIBUTION.flavor === "public"
     ? "latest"
     : DESKTOP_DISTRIBUTION.flavor,
+  electronNet,
+  shell,
+  distribution: DESKTOP_DISTRIBUTION.flavor,
+  platform: process.platform,
+  arch: process.arch,
+  releaseRepository: RELEASE_REPOSITORY,
 });
 
 if (!app.requestSingleInstanceLock()) {
@@ -2544,7 +2703,13 @@ or use: pnpm dev:worktree`);
     if (runtimeDisposeInProgress) return;
     showShutdownScreen();
     desktopAutomationRunner.stop();
-    void Promise.all([disposeRuntimeBeforeQuit(), uiControlServer.stop()]).finally(() => app.quit());
+    void Promise.all([
+      disposeRuntimeBeforeQuit(),
+      uiControlServer.stop(),
+    ]).finally(() => {
+      scheduleBlankSlateProfileCleanup();
+      app.quit();
+    });
   });
 
   app.on("second-instance", async (_event, argv) => {
@@ -2569,6 +2734,8 @@ or use: pnpm dev:worktree`);
   });
 
   app.whenReady().then(async () => {
+    const systemCaCertificates = await runtimeManager.systemCaCertificates();
+    session.defaultSession.setCertificateVerifyProc(createSystemCaCertificateVerifyProc(systemCaCertificates));
     installMediaPermissionHandlers(session, () => mainWindow);
     await runPendingNukeCleanup({
       env: process.env,
@@ -2578,10 +2745,9 @@ or use: pnpm dev:worktree`);
     }).catch((error) => {
       console.warn("[nuke] pending cleanup failed", error);
     });
-    await workspaceStore.importBundledDesktopBootstrapConfigIfPreferred();
     const bootstrapConfig = await workspaceStore.getDesktopBootstrapConfig();
     currentDisplayAppName = applyBrandAppName(
-      DESKTOP_DISTRIBUTION.flavor === "enterprise"
+      BLANK_SLATE_LAUNCH.enabled || DESKTOP_DISTRIBUTION.flavor === "enterprise"
         ? null
         : bootstrapConfig.brandAppName,
       {
@@ -2593,10 +2759,10 @@ or use: pnpm dev:worktree`);
       applicationMenu,
       },
     );
-    if (process.platform === "win32") {
+    if (process.platform === "win32" && !BLANK_SLATE_LAUNCH.enabled) {
       await registerWindowsDisplayShortcut();
     }
-    if (process.platform !== "linux") {
+    if (process.platform !== "linux" && !BLANK_SLATE_LAUNCH.enabled) {
       await applyDesktopBootstrapBrandIcon(bootstrapConfig, applyBrandIconUrl);
     }
     applicationMenu.install();
@@ -2625,17 +2791,19 @@ or use: pnpm dev:worktree`);
 
     queueDeepLinks(forwardedDeepLinks(process.argv));
     const win = await createMainWindow();
-    if (process.platform === "linux") {
+    if (process.platform === "linux" && !BLANK_SLATE_LAUNCH.enabled) {
       await applyDesktopBootstrapBrandIcon(bootstrapConfig, applyBrandIconUrl);
     }
     win.webContents.on("did-finish-load", () => {
       flushPendingDeepLinks();
     });
-    setTimeout(() => {
-      void linuxDesktopIntegration.maybePrompt(win).catch((error) => {
-        console.warn("[desktop-integration] prompt failed", error);
-      });
-    }, 500);
+    if (!BLANK_SLATE_LAUNCH.enabled) {
+      setTimeout(() => {
+        void linuxDesktopIntegration.maybePrompt(win).catch((error) => {
+          console.warn("[desktop-integration] prompt failed", error);
+        });
+      }, 500);
+    }
 
     // Initialize the packaged updater after the window is up so the user sees
     // a working app first. Renderer-owned checks pass the selected release

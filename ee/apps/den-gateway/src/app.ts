@@ -5,6 +5,7 @@ import { extname, resolve, sep } from "node:path"
 import { createJsonStdoutLogger, type JsonObject, type JsonStdoutLogger } from "@openwork-ee/utils/observability"
 import { Hono } from "hono"
 import { env } from "./env.js"
+import { createInstanceFetch, fetchWithConnectRetry, type FetchLike } from "./instance-fetch.js"
 
 type InstanceStatus = "provisioning" | "waking" | "ready" | "failed"
 type NonReadyStatus = "provisioning" | "waking" | "failed"
@@ -14,10 +15,11 @@ type ResolvePayload = {
   url: string | null
   clientToken: string | null
   hostToken: string | null
+  expiresAt: string | null
 }
 
 type InstanceResolution =
-  | { kind: "ready"; url: string; clientToken: string; hostToken: string }
+  | { kind: "ready"; url: string; clientToken: string; hostToken: string; expiresAtMs: number }
   | { kind: "not_ready"; status: NonReadyStatus }
   | { kind: "error"; statusCode: number; error: string }
 
@@ -34,6 +36,7 @@ export type GatewayAppOptions = {
   resolveTtlMs?: number
   now?: () => number
   fetchImpl?: typeof fetch
+  instanceFetch?: FetchLike
   logger?: JsonStdoutLogger
   logRequests?: boolean
 }
@@ -46,6 +49,7 @@ type GatewayConfig = {
   resolveTtlMs: number
   now: () => number
   fetchImpl: typeof fetch
+  instanceFetch: FetchLike
   logger: JsonStdoutLogger
   logRequests: boolean
 }
@@ -87,6 +91,14 @@ const alwaysProxyPathPrefixes = [
 const workspacePathPrefix = "/workspace/"
 const defaultLogger = createJsonStdoutLogger({ serviceName: "den-gateway" })
 
+function createLazyInstanceFetch(connectTimeoutMs: number): FetchLike {
+  let instanceFetch: FetchLike | undefined
+  return (url, init) => {
+    instanceFetch ??= createInstanceFetch({ connectTimeoutMs })
+    return instanceFetch(url, init)
+  }
+}
+
 class GatewayHttpError extends Error {
   status: number
   code: string
@@ -112,6 +124,7 @@ function createConfig(options: GatewayAppOptions): GatewayConfig {
     resolveTtlMs: options.resolveTtlMs ?? env.resolveTtlMs,
     now: options.now ?? Date.now,
     fetchImpl: options.fetchImpl ?? fetch,
+    instanceFetch: options.instanceFetch ?? options.fetchImpl ?? createLazyInstanceFetch(env.upstreamConnectTimeoutMs),
     logger: options.logger ?? defaultLogger,
     logRequests: options.logRequests ?? env.logRequests,
   }
@@ -137,11 +150,12 @@ function readResolvePayload(value: unknown): ResolvePayload | null {
   const url = typeof value.url === "string" ? value.url : value.url === null ? null : undefined
   const clientToken = typeof value.clientToken === "string" ? value.clientToken : value.clientToken === null ? null : undefined
   const hostToken = typeof value.hostToken === "string" ? value.hostToken : value.hostToken === null ? null : undefined
-  if (!status || url === undefined || clientToken === undefined || hostToken === undefined) {
+  const expiresAt = typeof value.expiresAt === "string" ? value.expiresAt : value.expiresAt === null ? null : undefined
+  if (!status || url === undefined || clientToken === undefined || hostToken === undefined || expiresAt === undefined) {
     return null
   }
 
-  return { status, url, clientToken, hostToken }
+  return { status, url, clientToken, hostToken, expiresAt }
 }
 
 function isUsableUpstreamUrl(value: string) {
@@ -153,16 +167,18 @@ function isUsableUpstreamUrl(value: string) {
   }
 }
 
-function parseResolvedInstance(payload: ResolvePayload): InstanceResolution {
+function parseResolvedInstance(payload: ResolvePayload, now: number): InstanceResolution {
   if (payload.status !== "ready") {
     return { kind: "not_ready", status: payload.status }
   }
 
-  if (!payload.url || !payload.clientToken || !payload.hostToken || !isUsableUpstreamUrl(payload.url)) {
+  const expiresAtMs = payload.expiresAt ? Date.parse(payload.expiresAt) : Number.NaN
+  if (!payload.url || !payload.clientToken || !payload.hostToken || !isUsableUpstreamUrl(payload.url) || !Number.isFinite(expiresAtMs)) {
     return { kind: "error", statusCode: 502, error: "gateway_resolve_invalid_ready_instance" }
   }
+  if (expiresAtMs <= now) return { kind: "error", statusCode: 503, error: "gateway_resolve_expired_ready_instance" }
 
-  return { kind: "ready", url: payload.url, clientToken: payload.clientToken, hostToken: payload.hostToken }
+  return { kind: "ready", url: payload.url, clientToken: payload.clientToken, hostToken: payload.hostToken, expiresAtMs }
 }
 
 function readBearerAuthorization(headers: Headers) {
@@ -422,7 +438,7 @@ async function resolveFromDenApi(config: GatewayConfig, bearer: string): Promise
     return { kind: "error", statusCode: 502, error: "gateway_resolve_invalid_response" }
   }
 
-  return parseResolvedInstance(payload)
+  return parseResolvedInstance(payload, config.now())
 }
 
 async function resolveInstance(input: {
@@ -444,7 +460,7 @@ async function resolveInstance(input: {
   if (resolution.kind === "ready") {
     input.cache.set(input.bearer, {
       resolution,
-      expiresAtMs: now + input.config.resolveTtlMs,
+      expiresAtMs: Math.min(now + input.config.resolveTtlMs, resolution.expiresAtMs),
     })
   }
   return resolution
@@ -578,11 +594,15 @@ async function proxyToInstance(input: {
 }) {
   let response: Response
   try {
-    response = await input.config.fetchImpl(buildProxyUrl(input.resolution.url, input.request.url), {
-      method: input.request.method,
-      headers: upstreamRequestHeaders(input.request.headers, input.resolution.clientToken, input.resolution.hostToken),
-      body: await requestBody(input.request),
-      redirect: "manual",
+    response = await fetchWithConnectRetry({
+      fetchImpl: input.config.instanceFetch,
+      url: buildProxyUrl(input.resolution.url, input.request.url),
+      init: {
+        method: input.request.method,
+        headers: upstreamRequestHeaders(input.request.headers, input.resolution.clientToken, input.resolution.hostToken),
+        body: await requestBody(input.request),
+        redirect: "manual",
+      },
     })
   } catch {
     return jsonResponse({ error: "gateway_upstream_failed" }, 502)

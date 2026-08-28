@@ -3,6 +3,7 @@ import { useMemo, useState } from "react"
 import { useQuery, useQueryClient } from "@tanstack/react-query"
 import {
   AlertCircle,
+  AlertTriangle,
   Archive,
   ArrowLeft,
   CalendarClock,
@@ -16,7 +17,7 @@ import {
   Search,
   Square,
 } from "lucide-react"
-import { useNavigate, useSearchParams } from "react-router-dom"
+import { useNavigate, useSearchParams } from "react-router"
 import type {
   AutomationDetail,
   AutomationRun,
@@ -25,6 +26,7 @@ import type {
   AutomationState,
   CreateAutomation,
 } from "@openwork/types/automations"
+import { AUTOMATION_FREE_MODEL } from "@openwork/types/automations"
 
 import { createDenClient, DenApiError, readDenSettings } from "@/app/lib/den"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -43,14 +45,18 @@ import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
 import { toast } from "@/components/ui/sonner"
 import { useDenAuth } from "@/react-app/domains/cloud/den-auth-provider"
+import { useDesktopRestriction } from "@/react-app/domains/cloud/desktop-config-provider"
 import { ConfirmModal } from "@/react-app/design-system/modals/confirm-modal"
 import { AutomationEditor } from "./automation-editor"
-import { automationExecutionThreadRoute, automationExecutionIdentity } from "./automation-cloud-thread"
+import { dispatchAutomationsStateChanged } from "./automation-events"
+import { automationExecutionThreadRoute, automationExecutionIdentity, automationLocalSessionRoute } from "./automation-cloud-thread"
 import { formatAutomationSchedule, formatAutomationTime } from "./automation-format"
 import type { AutomationProviderCatalog } from "./automation-model-options"
 import { automationModelOptions, describeAutomationModel } from "./automation-model-options"
 
 const ACTIVE_RUN_STATUSES = new Set<AutomationRun["status"]>(["queued", "claimed", "running"])
+const AUTOMATIONS_PAGE_FAST_POLL_MS = 10_000
+const AUTOMATIONS_PAGE_SLOW_POLL_MS = 60_000
 
 function stateLabel(state: AutomationState) {
   if (state === "needs_attention") return "Needs attention"
@@ -72,7 +78,13 @@ function runVariant(status: AutomationRun["status"]): "default" | "secondary" | 
 
 function runLabel(run: AutomationRun) {
   if (run.status === "skipped" && run.error?.code === "runner_unavailable") {
-    return "Missed — desktop runner unavailable"
+    // Den names the cause it observed — no desktop, a busy desktop, or one
+    // that stayed silent. Older receipts predate that and carry the single
+    // generic wording, so fall back rather than restate it for every cause.
+    return run.error.message.trim() || "Missed — desktop runner unavailable"
+  }
+  if (run.status === "skipped" && (run.error?.code === "model_access_lost" || run.error?.code === "provider_unavailable")) {
+    return "Skipped — model unavailable"
   }
   return run.status
 }
@@ -135,6 +147,7 @@ export function AutomationsPage(props: { providerCatalog?: AutomationProviderCat
   const [searchParams, setSearchParams] = useSearchParams()
   const [query, setQuery] = useState("")
   const [editing, setEditing] = useState(false)
+  const [repairingModel, setRepairingModel] = useState(false)
   const [busyAction, setBusyAction] = useState<string | null>(null)
   const [archiveOpen, setArchiveOpen] = useState(false)
 
@@ -151,18 +164,35 @@ export function AutomationsPage(props: { providerCatalog?: AutomationProviderCat
   const creating = searchParams.get("create") === "1"
   const ready = denAuth.isSignedIn && Boolean(client && organizationId)
   const queryRoot = ["den", "automations", organizationId]
+  const zenModelRestricted = useDesktopRestriction("allowZenModel")
+  const freeStarterInRuntime = props.providerCatalog === undefined || Boolean(
+    props.providerCatalog[AUTOMATION_FREE_MODEL.providerId]?.[AUTOMATION_FREE_MODEL.modelId],
+  )
 
   const listQuery = useQuery({
     queryKey: [...queryRoot, "list"],
     queryFn: () => client!.listAutomations(organizationId!, { limit: 100 }),
     enabled: ready,
-    refetchInterval: 15_000,
+    refetchInterval: AUTOMATIONS_PAGE_SLOW_POLL_MS,
   })
   const providersQuery = useQuery({
     queryKey: [...queryRoot, "models"],
     queryFn: () => client!.listOrgLlmProviders(organizationId!),
     enabled: ready,
   })
+  const runnerPresenceQuery = useQuery({
+    queryKey: [...queryRoot, "runner-presence"],
+    queryFn: () => client!.getAutomationDesktopRunnerPresence(organizationId!),
+    enabled: ready,
+    // A failed probe waits for the next interval instead of retrying, and a
+    // Den without the route answers null once — there is nothing to poll.
+    retry: false,
+    refetchInterval: (queryState) => (queryState.state.data === null ? false : 60_000),
+  })
+  // Only a Den that positively reports no desktop earns the warning. A Den too
+  // old to answer, or one that has not answered yet, leaves presence unknown,
+  // and claiming there is no desktop on that basis would be worse than silence.
+  const noDesktopConnected = runnerPresenceQuery.data?.connected === false
   const detailQuery = useQuery({
     queryKey: [...queryRoot, "detail", selectedId],
     queryFn: () => client!.getAutomation(organizationId!, selectedId!),
@@ -172,7 +202,9 @@ export function AutomationsPage(props: { providerCatalog?: AutomationProviderCat
     queryKey: [...queryRoot, "runs", selectedId],
     queryFn: () => client!.listAutomationRuns(organizationId!, selectedId!, { limit: 100 }),
     enabled: ready && Boolean(selectedId),
-    refetchInterval: 5_000,
+    refetchInterval: (queryState) => queryState.state.data?.items.some((run) => ACTIVE_RUN_STATUSES.has(run.status))
+      ? AUTOMATIONS_PAGE_FAST_POLL_MS
+      : AUTOMATIONS_PAGE_SLOW_POLL_MS,
   })
   const receiptQuery = useQuery({
     queryKey: [...queryRoot, "receipt", selectedRunId],
@@ -180,11 +212,16 @@ export function AutomationsPage(props: { providerCatalog?: AutomationProviderCat
     enabled: ready && Boolean(selectedRunId),
     refetchInterval: (queryState) => {
       const run = queryState.state.data?.run
-      return run && ACTIVE_RUN_STATUSES.has(run.status) ? 3_000 : false
+      return run && ACTIVE_RUN_STATUSES.has(run.status) ? AUTOMATIONS_PAGE_FAST_POLL_MS : false
     },
   })
 
-  const models = useMemo(() => automationModelOptions(providersQuery.data ?? []), [providersQuery.data])
+  const models = useMemo(
+    () => automationModelOptions(providersQuery.data ?? [], {
+      includeFreeStarter: !zenModelRestricted && freeStarterInRuntime,
+    }),
+    [freeStarterInRuntime, providersQuery.data, zenModelRestricted],
+  )
   const filteredItems = useMemo(() => {
     const normalized = query.trim().toLowerCase()
     const items = listQuery.data?.items.filter((item) => item.automation.state !== "archived") ?? []
@@ -200,9 +237,11 @@ export function AutomationsPage(props: { providerCatalog?: AutomationProviderCat
     if (automationId) next.set("automation", automationId)
     setSearchParams(next)
     setEditing(false)
+    setRepairingModel(false)
   }
   const refresh = async () => {
     await queryClient.invalidateQueries({ queryKey: queryRoot })
+    dispatchAutomationsStateChanged()
   }
   const act = async (key: string, action: () => Promise<void>, success: string) => {
     setBusyAction(key)
@@ -225,7 +264,7 @@ export function AutomationsPage(props: { providerCatalog?: AutomationProviderCat
           <Cloud aria-hidden="true" />
           <AlertTitle>Sign in to Den to use Automations</AlertTitle>
           <AlertDescription>
-            Automations run remotely in Den and remain available when this app or your computer is offline.
+            Den keeps Automation schedules and history. Cloud Automations can run while Desktop is offline; Desktop Automations run when this signed-in app is connected.
           </AlertDescription>
         </Alert>
       </div>
@@ -305,11 +344,17 @@ export function AutomationsPage(props: { providerCatalog?: AutomationProviderCat
     }
     const detail = detailQuery.data
     const task = detail.automation
+    const modelNeedsAttention = task.needsAttentionReason?.code === "model_access_lost"
+      || task.needsAttentionReason?.code === "provider_unavailable"
     const runs = runsQuery.data?.items ?? []
-    const selectedReceipt = receiptQuery.data
+    const selectedReceipt = receiptQuery.data?.run.id === selectedRunId ? receiptQuery.data : undefined
+    const receiptIsLoading = receiptQuery.isLoading || (receiptQuery.isFetching && !selectedReceipt)
     const threadMatches = !selectedThreadId || selectedReceipt?.run.executionThread?.id === selectedThreadId
+    const localSessionRoute = selectedReceipt?.run.executionThread
+      ? automationLocalSessionRoute(selectedReceipt.run.executionThread)
+      : null
 
-    if (editing) {
+    if (editing && (detail.revision.executionTarget ?? "desktop") === "desktop") {
       return (
         <div className="mx-auto max-w-3xl space-y-5 p-6">
           <div>
@@ -320,16 +365,21 @@ export function AutomationsPage(props: { providerCatalog?: AutomationProviderCat
             initial={inputFromDetail(detail)}
             initialKey={detail.revision.id}
             busy={busyAction === "update"}
+            openModelPickerOnMount={repairingModel}
             modelOptions={models}
             providerCatalog={props.providerCatalog}
             submitLabel="Save changes"
-            onCancel={() => setEditing(false)}
+            onCancel={() => {
+              setEditing(false)
+              setRepairingModel(false)
+            }}
             onSave={async (input) => {
               setBusyAction("update")
               try {
                 await client.updateAutomation(organizationId, task.id, input)
                 await refresh()
                 setEditing(false)
+                setRepairingModel(false)
                 toast.success("Automation updated")
               } catch (error) {
                 toast.error(describeError(error))
@@ -358,7 +408,10 @@ export function AutomationsPage(props: { providerCatalog?: AutomationProviderCat
             </div>
           </div>
           <div className="flex flex-wrap gap-2">
-            <Button variant="outline" onClick={() => setEditing(true)}><Pencil />Edit</Button>
+            {(detail.revision.executionTarget ?? "desktop") === "desktop" ? <Button variant="outline" onClick={() => {
+              setRepairingModel(false)
+              setEditing(true)
+            }}><Pencil />Edit</Button> : null}
             {task.state === "active" ? (
               <Button
                 variant="outline"
@@ -369,7 +422,7 @@ export function AutomationsPage(props: { providerCatalog?: AutomationProviderCat
               >
                 <Square />Deactivate
               </Button>
-            ) : task.state !== "archived" ? (
+            ) : task.state === "inactive" ? (
               <Button
                 variant="outline"
                 disabled={busyAction !== null}
@@ -381,7 +434,7 @@ export function AutomationsPage(props: { providerCatalog?: AutomationProviderCat
               </Button>
             ) : null}
             <Button
-              disabled={busyAction !== null || task.state === "archived"}
+              disabled={busyAction !== null || task.state === "archived" || task.state === "needs_attention"}
               onClick={() => void act("run", async () => {
                 const run = await client.runAutomationNow(organizationId, task.id)
                 const next = new URLSearchParams({ automation: task.id, run: run.id })
@@ -396,11 +449,44 @@ export function AutomationsPage(props: { providerCatalog?: AutomationProviderCat
           </div>
         </div>
 
-        {task.needsAttentionReason ? (
-          <Alert variant="warning">
+        {(detail.revision.executionTarget ?? "desktop") === "desktop"
+          && task.state === "active"
+          && noDesktopConnected ? (
+          <Alert variant="warning" data-automation-runner-offline>
             <AlertCircle />
-            <AlertTitle>Action required</AlertTitle>
-            <AlertDescription>{task.needsAttentionReason.message}</AlertDescription>
+            <AlertTitle>No desktop connected</AlertTitle>
+            <AlertDescription>
+              <p>
+                This Automation runs on your desktop, and Den cannot see one right now. Occurrences that
+                come due are recorded as missed unless a signed-in desktop is running by then.
+              </p>
+            </AlertDescription>
+          </Alert>
+        ) : null}
+
+        {task.needsAttentionReason ? (
+          <Alert variant="warning" data-automation-model-attention={modelNeedsAttention || undefined}>
+            {modelNeedsAttention ? <AlertTriangle /> : <AlertCircle />}
+            <AlertTitle>{modelNeedsAttention ? "Model needs attention" : "Action required"}</AlertTitle>
+            <AlertDescription className="space-y-3">
+              <p>{task.needsAttentionReason.message}</p>
+              {modelNeedsAttention && (detail.revision.executionTarget ?? "desktop") === "desktop" ? (
+                <>
+                  <p>This Automation is paused. Its instructions, schedule, and run history are unchanged.</p>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={() => {
+                      setRepairingModel(true)
+                      setEditing(true)
+                    }}
+                  >
+                    Select a supported model
+                  </Button>
+                </>
+              ) : null}
+            </AlertDescription>
           </Alert>
         ) : null}
 
@@ -418,12 +504,12 @@ export function AutomationsPage(props: { providerCatalog?: AutomationProviderCat
 
             <Card variant="outline">
               <CardHeader>
-                <CardTitle>Desktop execution</CardTitle>
-                <CardDescription>Den keeps the schedule and durable history; your connected desktop runs the task locally.</CardDescription>
+                <CardTitle>{detail.revision.executionTarget === "cloud" ? "OpenWork Cloud execution" : "Desktop execution"}</CardTitle>
+                <CardDescription>{detail.revision.executionTarget === "cloud" ? "Den wakes the Cloud runtime and runs this task headlessly without a desktop." : "Den keeps the schedule and durable history; your connected desktop runs the task locally."}</CardDescription>
               </CardHeader>
               <CardContent className="grid gap-3 text-sm sm:grid-cols-2">
                 <div className="min-w-0"><span className="text-muted-foreground">Model</span><p className="break-words">{describeAutomationModel(detail.revision.model, models)}</p></div>
-                <div className="min-w-0"><span className="text-muted-foreground">Next run</span><p className="break-words">{formatAutomationTime(task.nextDueAt)}</p></div>
+                <div className="min-w-0"><span className="text-muted-foreground">Next run</span><p className="break-words">{task.state === "needs_attention" ? "No future run scheduled" : formatAutomationTime(task.nextDueAt)}</p></div>
                 <div className="min-w-0"><span className="text-muted-foreground">Runtime limit</span><p className="break-words">{Math.round(detail.revision.maximumRuntimeMs / 60_000)} minutes</p></div>
                 <div className="min-w-0"><span className="text-muted-foreground">Integrations</span><p className="break-words">Your available OpenWork Connect tools</p></div>
               </CardContent>
@@ -491,7 +577,7 @@ export function AutomationsPage(props: { providerCatalog?: AutomationProviderCat
             <CardContent>
               {!selectedRunId ? (
                 <div className="py-10 text-center text-sm text-muted-foreground">No run selected.</div>
-              ) : receiptQuery.isLoading ? (
+              ) : receiptIsLoading ? (
                 <Skeleton className="h-48 rounded-xl" />
               ) : receiptQuery.error || !selectedReceipt ? (
                 <Alert variant="warning"><AlertCircle /><AlertDescription>{describeError(receiptQuery.error)}</AlertDescription></Alert>
@@ -504,10 +590,21 @@ export function AutomationsPage(props: { providerCatalog?: AutomationProviderCat
                     {selectedReceipt.run.executionThread ? (
                       <Badge variant="outline"><ExecutionIcon run={selectedReceipt.run} />{automationExecutionIdentity(selectedReceipt.run.executionThread).label}</Badge>
                     ) : selectedReceipt.run.status === "queued" ? (
-                      <Badge variant="outline">Waiting for desktop runner</Badge>
+                      <Badge variant="outline">{selectedReceipt.run.executionTarget === "cloud" ? "Waiting for OpenWork Cloud" : "Waiting for desktop runner"}</Badge>
                     ) : (
-                      <Badge variant="outline"><Monitor className="mr-1 h-3 w-3" />Desktop</Badge>
+                      <Badge variant="outline">{selectedReceipt.run.executionTarget === "cloud" ? <Cloud className="mr-1 h-3 w-3" /> : <Monitor className="mr-1 h-3 w-3" />}{selectedReceipt.run.executionTarget === "cloud" ? "OpenWork Cloud" : "Desktop"}</Badge>
                     )}
+                    {localSessionRoute ? (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        data-automation-run-id={selectedReceipt.run.id}
+                        onClick={() => navigate(localSessionRoute)}
+                      >
+                        Open local thread
+                      </Button>
+                    ) : null}
                   </div>
                   {selectedReceipt.run.error ? (
                     <Alert variant="destructive"><AlertCircle /><AlertTitle>{selectedReceipt.run.error.code}</AlertTitle><AlertDescription>{selectedReceipt.run.error.message}</AlertDescription></Alert>
@@ -559,7 +656,7 @@ export function AutomationsPage(props: { providerCatalog?: AutomationProviderCat
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <h2 className="text-xl font-semibold">Automations</h2>
-          <p className="mt-1 text-sm text-muted-foreground">Scheduled durably in Den and executed by your connected desktop.</p>
+          <p className="mt-1 text-sm text-muted-foreground">Scheduled durably in Den, with each Automation executed in its fixed Desktop or OpenWork Cloud location.</p>
         </div>
         <Button onClick={() => setSearchParams(new URLSearchParams({ create: "1" }))}><Plus />New Automation</Button>
       </div>
@@ -572,7 +669,7 @@ export function AutomationsPage(props: { providerCatalog?: AutomationProviderCat
           <EmptyHeader>
             <EmptyMedia variant="icon"><CalendarClock /></EmptyMedia>
             <EmptyTitle>{query ? "No matching Automations" : "No Automations yet"}</EmptyTitle>
-            <EmptyDescription>{query ? "Try a different search." : "Create one to run useful work on a schedule, even while your computer is offline."}</EmptyDescription>
+            <EmptyDescription>{query ? "Try a different search." : "Create a Desktop Automation here; it runs while this signed-in desktop is connected. Create headless Cloud Automations from Web or Cloud Chat."}</EmptyDescription>
           </EmptyHeader>
           {!query ? <EmptyContent><Button onClick={() => setSearchParams(new URLSearchParams({ create: "1" }))}><Plus />New Automation</Button></EmptyContent> : null}
         </Empty>
@@ -582,12 +679,19 @@ export function AutomationsPage(props: { providerCatalog?: AutomationProviderCat
             <button
               key={item.automation.id}
               type="button"
+              data-automation-id={item.automation.id}
+              {...(item.automation.state === "needs_attention" ? { "data-automation-needs-attention": true } : {})}
               className="rounded-2xl border border-border bg-card p-4 text-left transition-colors hover:bg-muted/40"
               onClick={() => openAutomation(item.automation.id)}
             >
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
-                  <h3 className="truncate font-medium">{item.automation.name}</h3>
+                  <h3 className="flex items-center gap-2 truncate font-medium">
+                    {item.automation.state === "needs_attention" ? (
+                      <AlertTriangle className="size-4 shrink-0 text-warning" aria-label="Automation needs attention" />
+                    ) : null}
+                    <span className="truncate">{item.automation.name}</span>
+                  </h3>
                   <p className="mt-1 line-clamp-2 text-sm text-muted-foreground">{item.revision.instructions}</p>
                 </div>
                 <Badge variant={stateVariant(item.automation.state)}>{stateLabel(item.automation.state)}</Badge>

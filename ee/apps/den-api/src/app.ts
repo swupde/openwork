@@ -1,7 +1,8 @@
 import "./load-env.js"
-import { createDenTypeId } from "@openwork-ee/utils/typeid"
+import { createDenTypeId, normalizeDenTypeId } from "@openwork-ee/utils/typeid"
 import { swaggerUI } from "@hono/swagger-ui"
-import { sql } from "@openwork-ee/den-db/drizzle"
+import { and, eq, isNull, sql } from "@openwork-ee/den-db/drizzle"
+import { MemberTable, OrganizationTable } from "@openwork-ee/den-db/schema"
 import { cors } from "hono/cors"
 import { Hono } from "hono"
 import type { RequestIdVariables } from "hono/request-id"
@@ -13,6 +14,7 @@ import { env } from "./env.js"
 import { publicRoute } from "./middleware/index.js"
 import { registerAdminMcpRoutes } from "./mcp/admin.js"
 import { registerAgentMcpRoutes } from "./mcp/agent.js"
+import { registerExternalConnectionProxyRoutes } from "./mcp/external-connection-proxy.js"
 import { registerMcpRoutes } from "./mcp/index.js"
 import type { MemberTeamsContext, OrganizationContextVariables, UserOrganizationsContext } from "./middleware/index.js"
 import { buildOperationId, emptyResponse, htmlResponse, jsonResponse } from "./openapi.js"
@@ -22,20 +24,29 @@ import { registerAdminRoutes } from "./routes/admin/index.js"
 import { registerAuthRoutes } from "./routes/auth/index.js"
 import { registerBootstrapRoutes } from "./routes/bootstrap/index.js"
 import { registerCloudRoutes } from "./routes/cloud/index.js"
+import { registerDeprecatedMemoryRoutes } from "./routes/deprecated-memory.js"
 import { registerDeprecatedSkillHubRoutes } from "./routes/deprecated-skill-hubs.js"
 import { registerDevRoutes } from "./routes/dev/index.js"
 import { registerMcpTokenRoutes } from "./routes/mcp/index.js"
-import { registerMemoryRoutes } from "./routes/memory/index.js"
 import { registerAutomationRoutes } from "./routes/automations/index.js"
+import { configureCloudAgentExecutor, configureCloudWorkflowExecutor } from "./automations/service.js"
+import { cloudAgentRuntimeAvailable, executeCloudAgent } from "./automations/cloud-agent-executor.js"
+import { getCatalog } from "./mcp/index.js"
+import { buildCapabilityToolTree, createCapabilityRegistryContext } from "./mcp/capability-registry.js"
+import { executeMarketplaceCapability } from "./mcp/marketplace-capabilities.js"
+import { resolveMcpMemberIdentity } from "./mcp/external-capabilities.js"
+import { DEN_MCP_REQUESTED_SCOPES } from "./mcp/scopes.js"
 import { registerMeRoutes } from "./routes/me/index.js"
 import { registerOrgRoutes } from "./routes/org/index.js"
 import { registerTelemetryRoutes } from "./routes/telemetry/index.js"
 import { registerVersionRoutes } from "./routes/version/index.js"
 import { registerWebhookRoutes } from "./routes/webhooks/index.js"
 import { registerWorkerRoutes } from "./routes/workers/index.js"
+import { registerCloudWorkerCompatibilityPreflightRoute } from "./routes/workers/compatibility.js"
 import type { AuthContextVariables } from "./session.js"
 import { sessionMiddleware } from "./session.js"
 import { isOperationalErrorPath, normalizeOperationalErrorResponse, operationalErrorResponse } from "./operational-errors.js"
+import { sanitizePublicResponseHeaders } from "./public-response-headers.js"
 
 type AppVariables = RequestIdVariables & AuthContextVariables & Partial<UserOrganizationsContext> & Partial<OrganizationContextVariables> & Partial<MemberTeamsContext>
 
@@ -64,6 +75,7 @@ const openApiDocumentSchema = z.object({
 }).passthrough().meta({ ref: "OpenApiDocument" })
 
 const app = new Hono<{ Variables: AppVariables }>()
+const strictTransportSecurityHeader = "max-age=31536000; includeSubDomains"
 
 registerObservabilityMiddleware(app)
 app.use("*", requestId({
@@ -72,7 +84,12 @@ app.use("*", requestId({
 }))
 app.use("*", async (c, next) => {
   await next()
-  c.header("X-Request-Id", c.get("requestId"))
+  sanitizePublicResponseHeaders(c.res.headers)
+})
+app.use("*", async (c, next) => {
+  await next()
+  c.header("X-Content-Type-Options", "nosniff")
+  c.header("Strict-Transport-Security", strictTransportSecurityHeader)
 })
 app.use("*", createTelemetryErrorSanitizerMiddleware())
 app.use("*", async (c, next) => {
@@ -106,15 +123,19 @@ app.use(
   }),
 )
 
+// This bearer-token-only compatibility surface must accept native/file-origin
+// preflights before the credentialed browser allowlist can intercept OPTIONS.
+registerCloudWorkerCompatibilityPreflightRoute(app)
+
 if (env.corsOrigins.length > 0) {
   app.use(
     "*",
       cors({
         origin: env.corsOrigins,
         credentials: true,
-        allowHeaders: ["Content-Type", "Authorization", "X-Api-Key", "X-Request-Id", "X-OpenWork-Legacy-Org-Id"],
+        allowHeaders: ["Content-Type", "Authorization", "X-Api-Key", "X-Request-Id", "X-OpenWork-Legacy-Org-Id", "X-OpenWork-Org-Id"],
         allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        exposeHeaders: ["Content-Length", "X-Request-Id"],
+        exposeHeaders: ["Content-Length"],
         maxAge: 600,
     }),
   )
@@ -193,11 +214,11 @@ registerAdminRoutes(app)
 registerAuthRoutes(app)
 registerBootstrapRoutes(app)
 registerCloudRoutes(app)
+registerDeprecatedMemoryRoutes(app)
 registerDeprecatedSkillHubRoutes(app)
 registerDevRoutes(app)
 registerMeRoutes(app)
-registerMemoryRoutes(app)
-registerAutomationRoutes(app)
+registerAutomationRoutes(app, { enabled: env.automations.runtimeEnabled })
 registerOrgRoutes(app)
 registerVersionRoutes(app)
 registerWebhookRoutes(app)
@@ -205,8 +226,72 @@ registerWorkerRoutes(app)
 registerMcpTokenRoutes(app)
 registerMcpRoutes(app)
 registerAgentMcpRoutes(app)
+registerExternalConnectionProxyRoutes(app)
 registerAdminMcpRoutes(app)
 registerTelemetryRoutes(app)
+
+configureCloudAgentExecutor({ execute: executeCloudAgent, runtimeAvailable: cloudAgentRuntimeAvailable })
+
+configureCloudWorkflowExecutor(async ({ organizationId, ownerMemberId, automationRunId, action }) => {
+  const normalizedOrganizationId = normalizeDenTypeId("organization", organizationId)
+  const normalizedOwnerMemberId = normalizeDenTypeId("member", ownerMemberId)
+  const members = await db.select({ userId: MemberTable.userId }).from(MemberTable).where(and(
+    eq(MemberTable.id, normalizedOwnerMemberId),
+    eq(MemberTable.organizationId, normalizedOrganizationId),
+    isNull(MemberTable.removedAt),
+  )).limit(1)
+  const userId = members[0]?.userId
+  if (!userId) return { ok: false, message: "The Automation owner is no longer active.", retryable: false }
+  const organizations = await db.select({ metadata: OrganizationTable.metadata }).from(OrganizationTable).where(
+    eq(OrganizationTable.id, normalizedOrganizationId),
+  ).limit(1)
+  const organizationMetadata = organizations[0]?.metadata
+  const member = await resolveMcpMemberIdentity({ userId, organizationId })
+  if (!member) return { ok: false, message: "The Automation owner is no longer active.", retryable: false }
+  const catalog = await getCatalog(app as unknown as Hono, undefined)
+  const principal = { userId, organizationId, scopes: new Set(DEN_MCP_REQUESTED_SCOPES), payload: {} }
+  const capabilityContext = createCapabilityRegistryContext({
+    app: app as unknown as Hono,
+    env: undefined,
+    catalog,
+    principal,
+    organizationId: normalizedOrganizationId,
+    member,
+    redirectUriBase: env.apiPublicUrl ?? "http://127.0.0.1",
+    generatedArtifactViewsEnabled: env.generatedArtifactViewsEnabled,
+    organizationMetadata,
+    mcpConnectionsGatingEnabled: env.mcpConnectionsGatingEnabled,
+  })
+  const result = await executeMarketplaceCapability({
+    organizationId,
+    member,
+    pluginId: action.script.pluginId,
+    configObjectId: action.script.configObjectId,
+    configObjectVersionId: action.script.configObjectVersionId,
+    automationRunId: normalizeDenTypeId("automationRun", automationRunId),
+    body: action.input,
+    validateScriptOutput: true,
+    buildTools: () => buildCapabilityToolTree(capabilityContext),
+  })
+  if (!result.ok) return {
+    ok: false,
+    message: result.message,
+    retryable: false,
+    ...("receiptId" in result ? { receiptId: result.receiptId ?? null } : {}),
+  }
+  if (result.result.status !== "executed") {
+    return { ok: false, message: result.result.hint ?? "The Workflow could not execute.", retryable: false }
+  }
+  if (!result.result.receiptId) {
+    return { ok: false, message: "The Workflow ran, but its durable artifact receipt could not be recorded.", retryable: true }
+  }
+  return {
+    ok: true,
+    value: result.result.value,
+    canonicalResult: result.result.canonicalResult ?? JSON.stringify(result.result.value),
+    receiptId: result.result.receiptId,
+  }
+})
 
 app.get(
   "/openapi.json",

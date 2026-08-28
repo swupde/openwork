@@ -2,7 +2,6 @@
 
 Cross-references:
 
-- `evals/org-mcp-connections-ux.md`
 - `docs/memory-bank-architecture.md`
 - `ee/apps/den-api/src/mcp/README.md`
 
@@ -343,7 +342,7 @@ Existing contract must keep passing untouched: `evals/flows/mcp-search-capabilit
 
 New eval flow `evals/flows/marketplace-capabilities.flow.mjs`: seed marketplace + plugin + skill config object via the plugin-system API → real chat turn → assert `search_capabilities` returns the `plugin:` match → `execute_capability` returns the skill content → the answer reflects the skill's instructions; control frame proves an opted-out org sees no `plugin:` matches.
 
-Fraimz proof follows `AGENTS.md`: `evals/results/<run-id>/fraimz.html` exists, and every claim is backed by an observable assertion and screenshot.
+Test evidence follows `AGENTS.md`: `evals/results/test-runs/<test-run-id>/test-run.json` exists, and every claim is backed by observable assertion evidence or a validated screenshot.
 
 ---
 

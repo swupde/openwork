@@ -87,6 +87,7 @@ const FULL_SCOPES = [GMAIL_READ_SCOPE, CALENDAR_READ_SCOPE, CALENDAR_EVENTS_SCOP
 let lastAuthorization: string | null = null
 let googleCallCount = 0
 let googleCallUrls: string[] = []
+let googleRequests: Array<{ path: string; method: string; body: unknown }> = []
 let forceGoogleError = false
 let forceGmailThreadError = false
 let lastDriveQuery: string | null = null
@@ -101,12 +102,27 @@ let calendarCreateCount = 0
 let lastDraftPayload: unknown = null
 let lastGmailThreadUrl: string | null = null
 let forceDriveUploadError = false
+let forceNativeFileError = false
 let largeDriveContentHitCount = 0
+// Bun loads these API suites into one process, while Den captures its API base
+// URL once at module import. Expose only the observation state needed by the
+// native-capability suite when both files resolve to this fake server.
+const sharedGoogleTestState = {
+  origin: "",
+  lastAuthorization: null as string | null,
+  callCount: 0,
+}
+;(globalThis as typeof globalThis & {
+  __openworkGoogleApiTestState?: typeof sharedGoogleTestState
+}).__openworkGoogleApiTestState = sharedGoogleTestState
 
 function resetFakeGoogle() {
   lastAuthorization = null
   googleCallCount = 0
+  sharedGoogleTestState.lastAuthorization = null
+  sharedGoogleTestState.callCount = 0
   googleCallUrls = []
+  googleRequests = []
   forceGoogleError = false
   forceGmailThreadError = false
   lastDriveQuery = null
@@ -121,6 +137,7 @@ function resetFakeGoogle() {
   lastDraftPayload = null
   lastGmailThreadUrl = null
   forceDriveUploadError = false
+  forceNativeFileError = false
   largeDriveContentHitCount = 0
 }
 
@@ -139,6 +156,7 @@ function gmailMessagePayload() {
       headers: [
         { name: "From", value: "Ada <ada@example.com>" },
         { name: "To", value: "Ben <ben@example.com>" },
+        { name: "Bcc", value: "Investors <investors@example.com>" },
         { name: "Subject", value: "Quarterly plan" },
         { name: "Date", value: "Tue, 07 Jul 2026 10:00:00 +0000" },
       ],
@@ -156,8 +174,20 @@ const fakeGoogleServer = Bun.serve({
   async fetch(request) {
     const url = new URL(request.url)
     googleCallCount += 1
+    sharedGoogleTestState.callCount += 1
     googleCallUrls.push(request.url)
+    const requestText = request.method === "GET" || request.method === "HEAD" ? "" : await request.clone().text()
+    let requestBody: unknown = requestText
+    if (requestText && request.headers.get("content-type")?.includes("application/json")) {
+      try {
+        requestBody = JSON.parse(requestText)
+      } catch {
+        requestBody = requestText
+      }
+    }
+    googleRequests.push({ path: url.pathname, method: request.method, body: requestBody })
     lastAuthorization = request.headers.get("authorization")
+    sharedGoogleTestState.lastAuthorization = lastAuthorization
 
     if (url.pathname.startsWith("/calendar/v3/calendars/primary/events")) {
       lastCalendarUrl = request.url
@@ -215,10 +245,6 @@ const fakeGoogleServer = Bun.serve({
       return json({ id: "draft_1", message: { id: "draft_msg_1", threadId: "thread_1" } })
     }
 
-    if (url.pathname === "/calendar/v3/users/me/calendarList/primary") {
-      return json({ timeZone: "Europe/Berlin" })
-    }
-
     if (url.pathname === "/calendar/v3/calendars/primary/events" && request.method === "GET") {
       return json({
         items: [
@@ -242,6 +268,9 @@ const fakeGoogleServer = Bun.serve({
           },
         ],
       })
+    }
+    if (url.pathname === "/calendar/v3/calendars/primary" && request.method === "GET") {
+      return json({ timeZone: "Europe/Berlin" })
     }
     if (url.pathname === "/calendar/v3/calendars/primary/events" && request.method === "POST") {
       const body: unknown = await request.json()
@@ -269,6 +298,53 @@ const fakeGoogleServer = Bun.serve({
           entryPoints: [{ entryPointType: "video", uri: "https://meet.google.com/updated-meet" }],
         },
       })
+    }
+
+    if (url.pathname === "/v1/documents" && request.method === "POST") {
+      if (forceNativeFileError) return new Response("native create exploded", { status: 500 })
+      return json({ documentId: "native_doc_1" })
+    }
+    if (url.pathname === "/v1/documents/native_doc_existing" && request.method === "GET") {
+      return json({ documentId: "native_doc_existing", body: { content: [{ endIndex: 12 }] } })
+    }
+    if (/^\/v1\/documents\/native_doc_(?:1|existing):batchUpdate$/.test(url.pathname) && request.method === "POST") {
+      return json({ replies: [] })
+    }
+    if (url.pathname === "/v4/spreadsheets" && request.method === "POST") {
+      return json({ spreadsheetId: "native_sheet_1", sheets: [{ properties: { sheetId: 1, title: "Summary" } }] })
+    }
+    if (url.pathname === "/v4/spreadsheets/native_sheet_existing" && request.method === "GET") {
+      return json({ spreadsheetId: "native_sheet_existing", sheets: [{ properties: { sheetId: 7, title: "Old" } }, { properties: { sheetId: 8, title: "Extra" } }] })
+    }
+    if (/^\/v4\/spreadsheets\/native_sheet_(?:1|existing):batchUpdate$/.test(url.pathname) && request.method === "POST") {
+      return json({ replies: [] })
+    }
+    if (/^\/v4\/spreadsheets\/native_sheet_(?:1|existing)\/values\//.test(url.pathname)) {
+      return json({ updatedRows: 2 })
+    }
+    if (url.pathname === "/v1/presentations" && request.method === "POST") {
+      return json({ presentationId: "native_slides_1", slides: [{ objectId: "default_slide" }] })
+    }
+    if (url.pathname === "/v1/presentations/native_slides_existing" && request.method === "GET") {
+      return json({ presentationId: "native_slides_existing", slides: [{ objectId: "old_slide" }] })
+    }
+    if (/^\/v1\/presentations\/native_slides_(?:1|existing):batchUpdate$/.test(url.pathname) && request.method === "POST") {
+      return json({ replies: [] })
+    }
+
+    const nativeDriveMatch = /^\/drive\/v3\/files\/(native_(?:doc|sheet|slides)_(?:1|existing))$/.exec(url.pathname)
+    if (nativeDriveMatch) {
+      const fileId = nativeDriveMatch[1]
+      if (url.searchParams.get("fields") === "parents" && request.method === "GET") return json({ parents: ["root"] })
+      const type = fileId.includes("doc") ? "document" : fileId.includes("sheet") ? "spreadsheet" : "presentation"
+      const metadata = {
+        id: fileId,
+        name: type === "document" ? "Native document" : type === "spreadsheet" ? "Native spreadsheet" : "Native presentation",
+        mimeType: `application/vnd.google-apps.${type}`,
+        modifiedTime: "2026-08-27T12:00:00Z",
+        webViewLink: `https://docs.google.test/${type}/${fileId}`,
+      }
+      return json(metadata)
     }
 
     if (url.pathname === "/drive/v3/files") {
@@ -382,6 +458,8 @@ const fakeGoogleServer = Bun.serve({
     return new Response(`Unhandled fake Google route: ${url.pathname}`, { status: 404 })
   },
 })
+fakeGoogleServer.unref()
+sharedGoogleTestState.origin = fakeGoogleServer.url.origin
 
 seedRequiredEnv()
 process.env.DEN_GOOGLE_API_BASE_URL = fakeGoogleServer.url.origin
@@ -394,6 +472,7 @@ let session: typeof import("../src/session.js")
 let upsertConnectedAccount: typeof import("../src/capability-sources/oauth-credentials.js").upsertConnectedAccount
 let buildMcpCatalog: typeof import("../src/mcp/catalog.js").buildMcpCatalog
 let searchCapabilities: typeof import("../src/mcp/search.js").searchCapabilities
+let calendarAgendaBounds: typeof import("../src/routes/org/google-workspace.js").calendarAgendaBounds
 
 const userId = createDenTypeId("user")
 const organizationId = createDenTypeId("organization")
@@ -453,7 +532,7 @@ beforeAll(async () => {
   }).db
   mock.module("../src/db.js", () => ({ db: realDb }))
 
-  const [appMod, dbMod, schemaMod, drizzleMod, sessionMod, credentialsMod, catalogMod, searchMod] = await Promise.all([
+  const [appMod, dbMod, schemaMod, drizzleMod, sessionMod, credentialsMod, catalogMod, searchMod, googleWorkspaceMod] = await Promise.all([
     import("../src/app.js"),
     import("../src/db.js"),
     import("@openwork-ee/den-db/schema"),
@@ -462,6 +541,7 @@ beforeAll(async () => {
     import("../src/capability-sources/oauth-credentials.js"),
     import("../src/mcp/catalog.js"),
     import("../src/mcp/search.js"),
+    import("../src/routes/org/google-workspace.js"),
   ])
   app = appMod.default
   db = dbMod.db
@@ -471,6 +551,7 @@ beforeAll(async () => {
   upsertConnectedAccount = credentialsMod.upsertConnectedAccount
   buildMcpCatalog = catalogMod.buildMcpCatalog
   searchCapabilities = searchMod.searchCapabilities
+  calendarAgendaBounds = googleWorkspaceMod.calendarAgendaBounds
 
   await db.insert(schema.AuthUserTable).values({
     id: userId,
@@ -522,7 +603,8 @@ afterAll(async () => {
   await db.delete(schema.OrganizationRoleTable).where(drizzle.eq(schema.OrganizationRoleTable.organizationId, organizationId))
   await db.delete(schema.OrganizationTable).where(drizzle.eq(schema.OrganizationTable.id, organizationId))
   await db.delete(schema.AuthUserTable).where(drizzle.eq(schema.AuthUserTable.id, userId))
-  fakeGoogleServer.stop(true)
+  // Keep the unref'ed server available to later suites that share the imported
+  // Den environment; the Bun process owns and closes it on exit.
   mock.restore()
 })
 
@@ -562,30 +644,67 @@ test("calendar list returns mapped events and sends the member token", async () 
   })
 })
 
-test("calendar agenda resolves the calling member's calendar timezone and never accepts client timestamps", async () => {
-  const response = await request("/v1/capabilities/google-workspace/calendar-agenda?period=next_7_days&maxResults=5")
+test("calendar agenda bounds follow local days and DST", () => {
+  const now = new Date("2026-08-18T10:00:00Z")
+  expect(calendarAgendaBounds({ day: "today", timeZone: "Europe/Berlin", now })).toEqual({
+    date: "2026-08-18",
+    timeMin: "2026-08-17T22:00:00.000Z",
+    timeMax: "2026-08-18T22:00:00.000Z",
+  })
+  expect(calendarAgendaBounds({ day: "tomorrow", timeZone: "Europe/Berlin", now })).toEqual({
+    date: "2026-08-19",
+    timeMin: "2026-08-18T22:00:00.000Z",
+    timeMax: "2026-08-19T22:00:00.000Z",
+  })
+  const dstDay = calendarAgendaBounds({ day: "2026-10-25", timeZone: "Europe/Berlin", now })
+  expect(dstDay).toEqual({
+    date: "2026-10-25",
+    timeMin: "2026-10-24T22:00:00.000Z",
+    timeMax: "2026-10-25T23:00:00.000Z",
+  })
+  expect(
+    new Date(dstDay.timeMax).getTime() - new Date(dstDay.timeMin).getTime(),
+  ).toBe(25 * 60 * 60 * 1000)
+  expect(() => calendarAgendaBounds({ day: "today", timeZone: "Not/AZone", now })).toThrow()
+})
 
+test("calendar agenda resolves tomorrow in the member's local time zone", async () => {
+  const expectedBounds = calendarAgendaBounds({ day: "tomorrow", timeZone: "Europe/Berlin" })
+  const response = await request(
+    "/v1/capabilities/google-workspace/calendar-agenda" +
+    "?day=tomorrow&timeZone=Europe%2FBerlin&maxResults=25",
+  )
   expect(response.status).toBe(200)
   expect(lastAuthorization).toBe("Bearer gws-token")
-  expect(googleCallCount).toBe(2)
+  const url = new URL(expectString(lastCalendarUrl, "calendar agenda URL"))
+  expect(url.searchParams.get("timeMin")).toBe(expectedBounds.timeMin)
+  expect(url.searchParams.get("timeMax")).toBe(expectedBounds.timeMax)
+  expect(url.searchParams.get("singleEvents")).toBe("true")
+  expect(url.searchParams.get("orderBy")).toBe("startTime")
+  expect(url.searchParams.get("maxResults")).toBe("25")
+  const body = expectRecord(await response.json(), "calendar agenda response")
+  expect(body.date).toBe(expectedBounds.date)
+  expect(body.timeZone).toBe("Europe/Berlin")
+  expect(body.timeMin).toBe(expectedBounds.timeMin)
+  expect(body.timeMax).toBe(expectedBounds.timeMax)
+  expect(Array.isArray(body.events)).toBe(true)
+})
 
-  const timezoneUrl = new URL(expectString(googleCallUrls[0], "calendar timezone URL"))
-  expect(timezoneUrl.pathname).toBe("/calendar/v3/users/me/calendarList/primary")
-
-  const eventsUrl = new URL(expectString(googleCallUrls[1], "calendar agenda events URL"))
-  expect(eventsUrl.pathname).toBe("/calendar/v3/calendars/primary/events")
-  expect(eventsUrl.searchParams.get("timeMin")).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/)
-  expect(eventsUrl.searchParams.get("timeMax")).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/)
-  expect(eventsUrl.searchParams.get("singleEvents")).toBe("true")
-  expect(eventsUrl.searchParams.get("orderBy")).toBe("startTime")
-  expect(eventsUrl.searchParams.get("maxResults")).toBe("5")
-
-  const body: unknown = await response.json()
-  const responseBody = expectRecord(body, "calendar agenda response")
-  expect(responseBody.ok).toBe(true)
-  expect(responseBody.period).toBe("next_7_days")
-  expect(responseBody.timeZone).toBe("Europe/Berlin")
-  expect(Array.isArray(responseBody.events)).toBe(true)
+test("calendar agenda defaults to the primary calendar time zone", async () => {
+  const expectedBounds = calendarAgendaBounds({ day: "tomorrow", timeZone: "Europe/Berlin" })
+  const response = await request(
+    "/v1/capabilities/google-workspace/calendar-agenda?day=tomorrow&maxResults=25",
+  )
+  expect(response.status).toBe(200)
+  expect(googleCallUrls.map((value) => new URL(value).pathname)).toEqual([
+    "/calendar/v3/calendars/primary",
+    "/calendar/v3/calendars/primary/events",
+  ])
+  const body = expectRecord(await response.json(), "calendar agenda response")
+  expect(body.date).toBe(expectedBounds.date)
+  expect(body.timeZone).toBe("Europe/Berlin")
+  expect(body.timeMin).toBe(expectedBounds.timeMin)
+  expect(body.timeMax).toBe(expectedBounds.timeMax)
 })
 
 test("calendar create requests a Google Meet link when asked", async () => {
@@ -684,6 +803,7 @@ test("gmail list returns metadata-mapped messages", async () => {
         threadId: "thread_1",
         from: "Ada <ada@example.com>",
         to: "Ben <ben@example.com>",
+        bcc: "Investors <investors@example.com>",
         subject: "Quarterly plan",
         date: "Tue, 07 Jul 2026 10:00:00 +0000",
         snippet: "Gmail snippet",
@@ -1042,6 +1162,95 @@ test("direct Drive upload preserves exact multipart bytes and returns the user-f
   })
 })
 
+test("native Google file create publishes Docs, Sheets, and Slides and returns real Drive links", async () => {
+  await seedConnectedAccount([DRIVE_FILE_SCOPE])
+  const cases = [
+    {
+      body: { type: "document", name: "Native document", folderId: "folder_1", text: "Hello document" },
+      createPath: "/v1/documents",
+      contentPath: "/v1/documents/native_doc_1:batchUpdate",
+      fileId: "native_doc_1",
+    },
+    {
+      body: { type: "spreadsheet", name: "Native spreadsheet", folderId: "folder_1", sheetName: "Summary", values: [["Metric", "Value"], ["Revenue", 1742.42]] },
+      createPath: "/v4/spreadsheets",
+      contentPath: "/v4/spreadsheets/native_sheet_1/values/%27Summary%27!A1",
+      fileId: "native_sheet_1",
+    },
+    {
+      body: { type: "presentation", name: "Native presentation", folderId: "folder_1", slides: [{ title: "Launch", body: "September 17" }] },
+      createPath: "/v1/presentations",
+      contentPath: "/v1/presentations/native_slides_1:batchUpdate",
+      fileId: "native_slides_1",
+    },
+  ] as const
+
+  for (const item of cases) {
+    resetFakeGoogle()
+    const response = await request("/v1/capabilities/google-workspace/native-files", { method: "POST", body: item.body })
+    expect(response.status).toBe(200)
+    const responseBody = expectRecord(await response.json(), "native create response")
+    const file = expectRecord(responseBody.file, "created native file")
+    expect(file.id).toBe(item.fileId)
+    expect(expectString(file.webViewLink, "native webViewLink")).toContain(item.fileId)
+    expect(googleRequests.some((call) => call.path === item.createPath && call.method === "POST")).toBe(true)
+    expect(googleRequests.some((call) => decodeURIComponent(call.path) === decodeURIComponent(item.contentPath))).toBe(true)
+    const placementUrl = googleCallUrls.map((value) => new URL(value)).find((url) => url.pathname === `/drive/v3/files/${item.fileId}` && url.searchParams.get("addParents") === "folder_1")
+    expect(placementUrl?.searchParams.get("removeParents")).toBe("root")
+  }
+})
+
+test("native Google file update replaces whole Docs, Sheets, and Slides content", async () => {
+  await seedConnectedAccount([DRIVE_FILE_SCOPE])
+  const cases = [
+    { fileId: "native_doc_existing", body: { type: "document", text: "Replacement" }, expectedDeletion: "deleteContentRange" },
+    { fileId: "native_sheet_existing", body: { type: "spreadsheet", sheetName: "Summary", values: [["A"], ["B"]] }, expectedDeletion: "deleteSheet" },
+    { fileId: "native_slides_existing", body: { type: "presentation", slides: [{ title: "New", body: "Body" }] }, expectedDeletion: "deleteObject" },
+  ] as const
+
+  for (const item of cases) {
+    resetFakeGoogle()
+    const response = await request(`/v1/capabilities/google-workspace/native-file/${item.fileId}`, { method: "PATCH", body: item.body })
+    expect(response.status).toBe(200)
+    const responseBody = expectRecord(await response.json(), "native update response")
+    expect(expectRecord(responseBody.file, "updated native file").id).toBe(item.fileId)
+    expect(JSON.stringify(googleRequests.map((call) => call.body))).toContain(item.expectedDeletion)
+  }
+})
+
+test("native file validation and Drive scope fail before calling Google", async () => {
+  const invalid = await request("/v1/capabilities/google-workspace/native-files", {
+    method: "POST",
+    body: { type: "spreadsheet", name: "Broken", values: "not rows" },
+  })
+  expect(invalid.status).toBe(400)
+  expect(googleCallCount).toBe(0)
+
+  await seedConnectedAccount([DRIVE_READ_SCOPE])
+  resetFakeGoogle()
+  const missingScope = await request("/v1/capabilities/google-workspace/native-files", {
+    method: "POST",
+    body: { type: "document", name: "No scope", text: "No mutation" },
+  })
+  expect(missingScope.status).toBe(409)
+  expect(googleCallCount).toBe(0)
+})
+
+test("native file Google failures preserve bounded upstream details", async () => {
+  await seedConnectedAccount([DRIVE_FILE_SCOPE])
+  resetFakeGoogle()
+  forceNativeFileError = true
+  const response = await request("/v1/capabilities/google-workspace/native-files", {
+    method: "POST",
+    body: { type: "document", name: "Failure", text: "Content" },
+  })
+  expect(response.status).toBe(502)
+  expect(await response.json()).toEqual({
+    error: "google_api_error",
+    message: "Google Docs create failed: 500 native create exploded",
+  })
+})
+
 test("drive upload requires Drive write scope before calling Google", async () => {
   await seedConnectedAccount([DRIVE_READ_SCOPE])
   resetFakeGoogle()
@@ -1158,9 +1367,29 @@ test("Google Workspace capability tools are discoverable and keep readable names
   const calendarMatch = searchCapabilities(catalog, "calendar events list", 10)[0]
   expect(calendarMatch?.name).toBe("getCapabilitiesGoogleWorkspaceCalendarEvents")
   expect(calendarMatch?.queryParams).toEqual(["timeMin", "timeMax", "maxResults"])
-  const agendaMatch = searchCapabilities(catalog, "calendar agenda today next meeting", 10)[0]
+  expect(calendarMatch?.querySchema).toMatchObject({
+    type: "object",
+    properties: {
+      timeMin: { type: "string", format: "date-time" },
+      timeMax: { type: "string", format: "date-time" },
+      maxResults: { type: "integer", minimum: 1, maximum: 100, default: 25 },
+    },
+    additionalProperties: false,
+  })
+  const agendaMatch = searchCapabilities(catalog, "calendar agenda today tomorrow", 10)[0]
   expect(agendaMatch?.name).toBe("getCapabilitiesGoogleWorkspaceCalendarAgenda")
-  expect(agendaMatch?.queryParams).toEqual(["period", "maxResults"])
+  expect(agendaMatch?.queryParams).toEqual(["day", "timeZone", "maxResults"])
+  expect(agendaMatch?.querySchema).toMatchObject({
+    type: "object",
+    properties: {
+      day: { default: "today" },
+      timeZone: { type: "string", minLength: 1, maxLength: 100 },
+      maxResults: { type: "integer", minimum: 1, maximum: 100, default: 25 },
+    },
+    additionalProperties: false,
+  })
+  expect((agendaMatch?.querySchema as { required?: string[] } | undefined)?.required ?? [])
+    .not.toContain("timeZone")
   expect(searchCapabilities(catalog, "add meet link existing event", 10)[0]?.name).toBe("patchCapabilitiesGoogleWorkspaceCalendarEvent")
   const driveMatch = searchCapabilities(catalog, "drive files", 10)[0]
   expect(driveMatch?.name).toBe("getCapabilitiesGoogleWorkspaceDriveFiles")
@@ -1168,9 +1397,25 @@ test("Google Workspace capability tools are discoverable and keep readable names
   expect(catalog.some((tool) => tool.name === "postCapabilitiesGoogleWorkspaceDriveFiles")).toBe(false)
   expect(catalog.some((tool) => tool.name.includes("DirectUploads"))).toBe(false)
   expect(searchCapabilities(catalog, "share drive file", 10)[0]?.name).toBe("postCapabilitiesGoogleWorkspaceDriveFileShare")
+  expect(searchCapabilities(catalog, "create a Google document spreadsheet presentation", 10)[0]?.name)
+    .toBe("postCapabilitiesGoogleWorkspaceNativeFiles")
+  expect(searchCapabilities(catalog, "replace content in an existing Google document", 10)[0]?.name)
+    .toBe("patchCapabilitiesGoogleWorkspaceNativeFile")
   const gmailMatch = searchCapabilities(catalog, "gmail search read messages", 10)[0]
   expect(gmailMatch?.name).toBe("getCapabilitiesGoogleWorkspaceGmailMessages")
   expect(gmailMatch?.queryParams).toEqual(["q", "maxResults"])
+  expect(gmailMatch?.querySchema).toMatchObject({
+    type: "object",
+    properties: {
+      maxResults: {
+        type: "integer",
+        minimum: 1,
+        maximum: 25,
+        default: 10,
+      },
+    },
+    additionalProperties: false,
+  })
   expect(searchCapabilities(catalog, "outlook mail messages", 20).find((match) => match.name === "getCapabilitiesMicrosoft365MailMessages")?.queryParams).toEqual(["search", "maxResults"])
   const draftMatch = searchCapabilities(catalog, "gmail draft without attachments", 10)[0]
   expect(draftMatch?.name).toBe("postCapabilitiesGoogleWorkspaceGmailDrafts")
@@ -1188,6 +1433,8 @@ test("Google Workspace capability tools are discoverable and keep readable names
     "getCapabilitiesGoogleWorkspaceDriveFiles",
     "getCapabilitiesGoogleWorkspaceDriveFile",
     "postCapabilitiesGoogleWorkspaceDriveFileShare",
+    "postCapabilitiesGoogleWorkspaceNativeFiles",
+    "patchCapabilitiesGoogleWorkspaceNativeFile",
     "postCapabilitiesGoogleWorkspaceGmailDrafts",
   ]
   const catalogNames = new Set(catalog.map((tool) => tool.name))

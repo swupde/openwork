@@ -4,10 +4,16 @@
 // session-route.tsx; settings-route carries a sibling copy that should adopt
 // this hook next.
 import { useCallback, useEffect, useMemo, useState } from "react";
+import type { DataContext } from "@openwork/types/work-context";
 import type { Client, ModelOption } from "@/app/types";
+import { getModelBehaviorSummary } from "@/app/lib/model-behavior";
 import { useCheckDesktopRestriction } from "@/react-app/domains/cloud/desktop-config-provider";
 import { isCloudManagedProviderKey } from "@/react-app/domains/connections/provider-auth/cloud-provider-config";
 import { filterEntitledModelOptions } from "@/react-app/domains/connections/provider-auth/provider-policy";
+import {
+  filterCloudManagedModelOptions,
+  mergeModelOptions,
+} from "@/react-app/domains/connections/provider-auth/assigned-model-options";
 import {
   getConnectedProviderItems,
   useProviderListQuery,
@@ -16,6 +22,10 @@ import {
   openModelPickerEvent,
   pendingModelPickerProviderIdsKey,
 } from "@/react-app/shell/new-providers-listener";
+import {
+  colleagueFacingModelLabel,
+  eligibleModelOptions,
+} from "@/react-app/domains/session/work-context/model-policy";
 
 export type UseModelPickerInput = {
   client: Client | null;
@@ -25,10 +35,25 @@ export type UseModelPickerInput = {
   onOpen?: () => void;
   /** Optional: surface option-load failures (settings shows a toast; the session route stays silent). */
   onLoadError?: (error: unknown) => void;
+  /** Member-scoped models available before a workspace OpenCode client exists. */
+  fallbackOptions?: readonly ModelOption[];
+  /** Account-scoped providers are hidden immediately after cloud sign-out. */
+  cloudProvidersEnabled?: boolean;
+  /** When present, fail-closed OpenWork data-context policy filters the picker. */
+  dataContext?: DataContext;
 };
 
 export function useModelPicker(input: UseModelPickerInput) {
-  const { client, baseUrl, workspaceRoot, onOpen, onLoadError } = input;
+  const {
+    client,
+    baseUrl,
+    workspaceRoot,
+    onOpen,
+    onLoadError,
+    fallbackOptions = [],
+    cloudProvidersEnabled = true,
+    dataContext,
+  } = input;
   const checkDesktopRestriction = useCheckDesktopRestriction();
 
   const [open, setOpenState] = useState(false);
@@ -115,23 +140,28 @@ export function useModelPicker(input: UseModelPickerInput) {
       const isNew = !seenIds.has(provider.id) || recentProviderIds.has(provider.id);
       for (const id of modelIds) {
         const model = provider.models[id];
+        const summary = getModelBehaviorSummary(provider.id, model, null, provider.name);
         next.push({
           providerID: provider.id,
           modelID: id,
-          title: model.name || id,
+          title: colleagueFacingModelLabel(id, model.name || id),
           description: provider.name,
-          behaviorTitle: "Reasoning",
-          behaviorLabel: "Default",
-          behaviorDescription: "",
-          behaviorValue: null,
+          behaviorTitle: summary.title,
+          behaviorLabel: summary.label,
+          behaviorDescription: summary.description,
+          behaviorValue: summary.value,
+          behaviorOptions: summary.options,
           isFree: false,
           isRecommended: isNew,
           source: isCloudManagedProviderKey(provider.id) ? "cloud" : undefined,
         });
       }
     }
-    return next;
-  }, [providerListQuery.data, recentProviderIds]);
+    return filterCloudManagedModelOptions(
+      mergeModelOptions(next, fallbackOptions),
+      cloudProvidersEnabled,
+    );
+  }, [cloudProvidersEnabled, fallbackOptions, providerListQuery.data, recentProviderIds]);
 
   // Apply org-level restrictions (dev #1505) on top of the raw model list
   // so the picker never surfaces blocked options:
@@ -141,11 +171,12 @@ export function useModelPicker(input: UseModelPickerInput) {
     const restrictToCloud = checkDesktopRestriction({
       restriction: "allowCustomProviders",
     });
-    return filterEntitledModelOptions(modelOptions, {
+    const entitled = filterEntitledModelOptions(modelOptions, {
       restrictToCloud,
       checkRestriction: checkDesktopRestriction,
     });
-  }, [checkDesktopRestriction, modelOptions]);
+    return dataContext ? eligibleModelOptions(entitled, dataContext) : entitled;
+  }, [checkDesktopRestriction, dataContext, modelOptions]);
 
   return {
     open,

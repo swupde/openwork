@@ -7,8 +7,10 @@ import {
   WorkerTokenTable,
 } from "@openwork-ee/den-db/schema"
 import { db } from "../db.js"
+import { env } from "../env.js"
 import { appLogger } from "../observability/logger.js"
-import { decodeProviderCredential, readProviderEnvNames } from "./provider-credentials.js"
+import { fetchPreviewNoRedirect, fetchWithConnectRetry, previewFetch } from "../workers/preview-fetch.js"
+import { decodeProviderCredential, readProviderEnvNames, selectLegacyScalarCredentialEnvName, selectPrimaryCredentialEnvName } from "./provider-credentials.js"
 
 type JsonRecord = Record<string, unknown>
 type OrganizationId = typeof LlmProviderTable.$inferSelect.organizationId
@@ -109,6 +111,10 @@ const requestTimeoutMs = 8_000
  * picker.
  */
 const materializedFingerprintByWorkerInstance = new Map<string, string>()
+const materializationFailureByWorkerInstance = new Map<string, {
+  failedAt: number
+  result: Extract<CloudProviderMaterializationResult, { ok: false }>
+}>()
 
 function materializationCacheKey(workerId: WorkerId, instanceUrl: string): string {
   return `${workerId}\u0000${instanceUrl}`
@@ -276,10 +282,15 @@ function providerEnvEntries(provider: CloudProviderMaterializationProvider): Env
   }
 
   if (credential.apiKey && envNames[0]) {
-    upsertEnvEntry(entries, envNames[0], credential.apiKey)
+    upsertEnvEntry(
+      entries,
+      selectLegacyScalarCredentialEnvName(envNames) ?? envNames[0],
+      credential.apiKey,
+    )
   }
 
-  const primaryCredential = credential.apiKey?.trim() || entries[0]?.value || ""
+  const primaryCredentialEnvName = selectPrimaryCredentialEnvName(envNames, entries.map((entry) => entry.key))
+  const primaryCredential = credential.apiKey?.trim() || entries.find((entry) => entry.key === primaryCredentialEnvName)?.value || ""
   if (provider.source === "openwork" && primaryCredential) {
     upsertEnvEntry(entries, "OPENWORK_API_KEY", primaryCredential)
     const baseUrl = readOpenWorkInferenceBaseUrl(provider.providerConfig)
@@ -358,7 +369,7 @@ function providerHasRequiredCredential(provider: CloudProviderMaterializationPro
     return true
   }
 
-  return envEntries.some((entry) => envNames.includes(entry.key))
+  return selectPrimaryCredentialEnvName(envNames, envEntries.map((entry) => entry.key)) !== null
 }
 
 function prepareMaterialization(providers: CloudProviderMaterializationProvider[]): PreparedMaterialization {
@@ -412,7 +423,7 @@ async function fetchWithTimeout(fetchImpl: FetchImpl, url: string, init: Request
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), requestTimeoutMs)
   try {
-    return await fetchImpl(url, { ...init, signal: controller.signal })
+    return await fetchPreviewNoRedirect(fetchImpl, url, { ...init, signal: controller.signal })
   } finally {
     clearTimeout(timeout)
   }
@@ -927,11 +938,18 @@ export async function materializeCloudWorkerProviders(input: {
   store?: CloudProviderMaterializationStore
   fetchImpl?: FetchImpl
   logger?: MaterializationLogger
+  now?: () => number
 }): Promise<CloudProviderMaterializationResult> {
   const materializationLogger = input.logger ?? logger
   const store = input.store ?? databaseMaterializationStore
-  const fetchImpl = input.fetchImpl ?? fetch
+  const fetchImpl = input.fetchImpl ?? ((url, init = {}) => fetchWithConnectRetry({
+    fetchImpl: previewFetch(),
+    url,
+    init,
+  }))
+  const now = input.now ?? Date.now
   const instanceUrl = normalizeBaseUrl(input.instanceUrl)
+  const cacheKey = materializationCacheKey(input.workerId, instanceUrl)
   let fingerprint: string | null = null
   let providerCount = 0
 
@@ -940,13 +958,18 @@ export async function materializeCloudWorkerProviders(input: {
       throw new Error("instance_url_missing")
     }
 
+    const recentFailure = materializationFailureByWorkerInstance.get(cacheKey)
+    if (!input.force && recentFailure && now() - recentFailure.failedAt < env.cloudMaterializationFailureCooldownMs) {
+      return recentFailure.result
+    }
+
     const providers = await store.listProviders(input.organizationId)
     const prepared = prepareMaterialization(providers)
     fingerprint = prepared.fingerprint
     providerCount = prepared.providers.length
 
-    const cacheKey = materializationCacheKey(input.workerId, instanceUrl)
     if (!input.force && materializedFingerprintByWorkerInstance.get(cacheKey) === fingerprint) {
+      materializationFailureByWorkerInstance.delete(cacheKey)
       return { ok: true, status: "cached", fingerprint, providers: providerCount }
     }
 
@@ -978,6 +1001,7 @@ export async function materializeCloudWorkerProviders(input: {
       && materializedEnvStateMatches(prepared.envEntries, envSnapshot)
     ) {
       materializedFingerprintByWorkerInstance.set(cacheKey, fingerprint)
+      materializationFailureByWorkerInstance.delete(cacheKey)
       return { ok: true, status: "noop", fingerprint, providers: providerCount }
     }
 
@@ -1020,11 +1044,13 @@ export async function materializeCloudWorkerProviders(input: {
           instanceUrl,
           clientToken: tokens.clientToken,
         })
-        return unsupportedResult({
+        const result = unsupportedResult({
           reason: unsupportedReason,
           fingerprint: prepared.fingerprint,
           providers: providerCount,
         })
+        materializationFailureByWorkerInstance.set(cacheKey, { failedAt: now(), result })
+        return result
       }
 
       if (providerPatched) {
@@ -1059,6 +1085,7 @@ export async function materializeCloudWorkerProviders(input: {
     }
 
     materializedFingerprintByWorkerInstance.set(cacheKey, fingerprint)
+    materializationFailureByWorkerInstance.delete(cacheKey)
     return { ok: true, status: "applied", fingerprint, providers: providerCount }
   } catch (error) {
     const result = failureResult({
@@ -1074,6 +1101,7 @@ export async function materializeCloudWorkerProviders(input: {
       result,
       cause: error,
     })
+    materializationFailureByWorkerInstance.set(cacheKey, { failedAt: now(), result })
     return result
   }
 }

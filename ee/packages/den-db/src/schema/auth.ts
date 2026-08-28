@@ -57,13 +57,18 @@ export const AuthAccountTable = mysqlTable(
       .notNull()
       .default(sql`CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)`),
   },
-  (table) => [index("account_user_id").on(table.userId)],
+  (table) => [
+    index("account_user_id").on(table.userId),
+    index("account_account_id_provider_id").on(sql`${table.accountId}(191)`, sql`${table.providerId}(191)`),
+  ],
 )
 
 export const AuthVerificationTable = mysqlTable(
   "verification",
   {
-    id: denTypeIdColumn("verification", "id").notNull().primaryKey(),
+    // Better Auth uses both generated IDs and deterministic 43-character
+    // SHA-256 reservations here (for example, SAML assertion replay guards).
+    id: varchar("id", { length: 64 }).notNull().primaryKey(),
     identifier: varchar("identifier", { length: 255 }).notNull(),
     value: text("value").notNull(),
     expiresAt: timestamp("expires_at", { fsp: 3 }).notNull(),
@@ -158,6 +163,11 @@ export const OAuthClientTable = mysqlTable(
     requirePKCE: boolean("require_pkce"),
     referenceId: varchar("reference_id", { length: 64 }),
     metadata: text("metadata"),
+    backchannelLogoutUri: text("backchannel_logout_uri"),
+    backchannelLogoutSessionRequired: boolean("backchannel_logout_session_required"),
+    jwks: text("jwks"),
+    jwksUri: text("jwks_uri"),
+    dpopBoundAccessTokens: boolean("dpop_bound_access_tokens"),
   },
   (table) => [
     uniqueIndex("oauth_client_client_id").on(table.clientId),
@@ -180,8 +190,16 @@ export const OAuthRefreshTokenTable = mysqlTable(
     revoked: timestamp("revoked", { fsp: 3 }),
     authTime: timestamp("auth_time", { fsp: 3 }),
     scopes: text("scopes").notNull(),
+    authorizationCodeId: varchar("authorization_code_id", { length: 64 }),
+    resources: text("resources"),
+    requestedUserInfoClaims: text("requested_user_info_claims"),
+    rotatedAt: timestamp("rotated_at", { fsp: 3 }),
+    rotationReplayResponse: text("rotation_replay_response"),
+    rotationReplayExpiresAt: timestamp("rotation_replay_expires_at", { fsp: 3 }),
+    confirmation: text("confirmation"),
   },
   (table) => [
+    index("oauth_refresh_token_token").on(sql`${table.token}(191)`),
     index("oauth_refresh_token_client_id").on(table.clientId),
     index("oauth_refresh_token_session_id").on(table.sessionId),
     index("oauth_refresh_token_user_id").on(table.userId),
@@ -202,6 +220,11 @@ export const OAuthAccessTokenTable = mysqlTable(
     expiresAt: timestamp("expires_at", { fsp: 3 }).notNull(),
     createdAt: timestamp("created_at", { fsp: 3 }).notNull().defaultNow(),
     scopes: text("scopes").notNull(),
+    authorizationCodeId: varchar("authorization_code_id", { length: 64 }),
+    resources: text("resources"),
+    requestedUserInfoClaims: text("requested_user_info_claims"),
+    revoked: timestamp("revoked", { fsp: 3 }),
+    confirmation: text("confirmation"),
   },
   (table) => [
     index("oauth_access_token_token").on(sql`${table.token}(191)`),
@@ -221,6 +244,8 @@ export const OAuthConsentTable = mysqlTable(
     userId: denTypeIdColumn("user", "user_id"),
     referenceId: varchar("reference_id", { length: 64 }),
     scopes: text("scopes").notNull(),
+    resources: text("resources"),
+    requestedUserInfoClaims: text("requested_user_info_claims"),
     createdAt: timestamp("created_at", { fsp: 3 }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { fsp: 3 })
       .notNull()
@@ -233,6 +258,54 @@ export const OAuthConsentTable = mysqlTable(
   ],
 )
 
+export const OAuthResourceTable = mysqlTable(
+  "oauthResource",
+  {
+    id: varchar("id", { length: 64 }).notNull().primaryKey(),
+    identifier: varchar("identifier", { length: 255 }).notNull(),
+    name: varchar("name", { length: 255 }).notNull(),
+    accessTokenTtl: int("access_token_ttl"),
+    refreshTokenTtl: int("refresh_token_ttl"),
+    signingAlgorithm: varchar("signing_algorithm", { length: 64 }),
+    signingKeyId: varchar("signing_key_id", { length: 255 }),
+    allowedScopes: text("allowed_scopes"),
+    customClaims: text("custom_claims"),
+    dpopBoundAccessTokensRequired: boolean("dpop_bound_access_tokens_required"),
+    disabled: boolean("disabled"),
+    policyVersion: int("policy_version"),
+    metadata: text("metadata"),
+    createdAt: timestamp("created_at", { fsp: 3 }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { fsp: 3 })
+      .notNull()
+      .default(sql`CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)`),
+  },
+  (table) => [uniqueIndex("oauth_resource_identifier").on(table.identifier)],
+)
+
+// `id` is `${client_id}::${resource identifier}`, built by the oauth-provider
+// plugin so the primary key enforces composite client/resource uniqueness.
+export const OAuthClientResourceTable = mysqlTable(
+  "oauthClientResource",
+  {
+    id: varchar("id", { length: 512 }).notNull().primaryKey(),
+    clientId: varchar("client_id", { length: 255 }).notNull(),
+    resourceId: varchar("resource_id", { length: 255 }).notNull(),
+    metadata: text("metadata"),
+    createdAt: timestamp("created_at", { fsp: 3 }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("oauth_client_resource_client_id").on(table.clientId),
+    index("oauth_client_resource_resource_id").on(table.resourceId),
+  ],
+)
+
+// JTI replay cache for private_key_jwt client assertions; `id` is a truncated
+// base64url SHA-256 digest supplied by the oauth-provider plugin.
+export const OAuthClientAssertionTable = mysqlTable("oauthClientAssertion", {
+  id: varchar("id", { length: 64 }).notNull().primaryKey(),
+  expiresAt: timestamp("expires_at", { fsp: 3 }).notNull(),
+})
+
 export const ScimProviderTable = mysqlTable(
   "scim_provider",
   {
@@ -240,6 +313,7 @@ export const ScimProviderTable = mysqlTable(
     providerId: varchar("provider_id", { length: 255 }).notNull(),
     scimToken: encryptedTextColumn("scim_token").notNull(),
     organizationId: denTypeIdColumn("organization", "organization_id").notNull(),
+    userId: denTypeIdColumn("user", "user_id"),
     groupMappingMode: varchar("group_mapping_mode", { length: 32 }).notNull().default("metadata_only"),
     createdAt: timestamp("created_at", { fsp: 3 }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { fsp: 3 })
@@ -374,6 +448,9 @@ export const oauthClient = OAuthClientTable
 export const oauthRefreshToken = OAuthRefreshTokenTable
 export const oauthAccessToken = OAuthAccessTokenTable
 export const oauthConsent = OAuthConsentTable
+export const oauthResource = OAuthResourceTable
+export const oauthClientResource = OAuthClientResourceTable
+export const oauthClientAssertion = OAuthClientAssertionTable
 export const scimProvider = ScimProviderTable
 export const scimSyncEvent = ScimSyncEventTable
 export const ssoProvider = SsoProviderTable

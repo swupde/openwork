@@ -5,6 +5,7 @@ import { NextRequest } from "next/server";
 import { setStructuredLogSink, useJsonStdoutStructuredLogSink } from "../../../observability/runtime-logger.ts";
 
 const previousDenApiBase = process.env.DEN_API_BASE;
+const previousDenBaseUrl = process.env.DEN_BASE_URL;
 const previousDenWebPublicOrigin = process.env.DEN_WEB_PUBLIC_ORIGIN;
 
 describe("Den upstream proxy", () => {
@@ -45,6 +46,41 @@ describe("Den upstream proxy", () => {
           return new Response("upstream unavailable", { status: 502 });
         }
 
+        if (url.pathname === "/v1/internal-headers") {
+          const upstreamOrigin = new URL(request.url).origin;
+          return new Response("sanitized", {
+            headers: {
+              "access-control-expose-headers": "Content-Length, X-Request-Id, X-Origin-Host",
+              "content-location": `${upstreamOrigin}/v1/internal-headers/body`,
+              "link": `<${upstreamOrigin}/v1/internal-headers/next>; rel="next"`,
+              "location": `${upstreamOrigin}/v1/internal-headers/redirect?next=1`,
+              "refresh": `0; url=${upstreamOrigin}/v1/internal-headers/login`,
+              "rndr-id": "render-request",
+              "server": "internal-origin",
+              "via": "internal-proxy",
+              "x-cache-key": "cache:key",
+              "x-content-type-options": "nosniff",
+              "x-origin-host": "den-api.internal",
+              "x-render-origin-server": "Render",
+              "x-request-id": "req_internal",
+              "x-upstream-result": "ok",
+            },
+          });
+        }
+
+        if (url.pathname === "/api/auth/callback/google") {
+          const headers = new Headers({ "content-type": "text/plain" });
+          headers.append(
+            "set-cookie",
+            "__Secure-better-auth.session_token=abc; Path=/; Domain=api.app.example.com; Secure; HttpOnly; SameSite=Lax",
+          );
+          headers.append(
+            "set-cookie",
+            "better-auth.session_data=def; Path=/; Secure; HttpOnly; SameSite=Lax",
+          );
+          return new Response("signed in", { headers });
+        }
+
         return new Response("proxied", {
           status: 207,
           headers: {
@@ -59,6 +95,8 @@ describe("Den upstream proxy", () => {
   });
 
   beforeEach(() => {
+    delete process.env.DEN_BASE_URL;
+    delete process.env.DEN_WEB_PUBLIC_ORIGIN;
     logs = [];
     setStructuredLogSink({
       log(level, message, fields) {
@@ -79,6 +117,11 @@ describe("Den upstream proxy", () => {
       delete process.env.DEN_WEB_PUBLIC_ORIGIN;
     } else {
       process.env.DEN_WEB_PUBLIC_ORIGIN = previousDenWebPublicOrigin;
+    }
+    if (previousDenBaseUrl === undefined) {
+      delete process.env.DEN_BASE_URL;
+    } else {
+      process.env.DEN_BASE_URL = previousDenBaseUrl;
     }
   });
 
@@ -144,13 +187,121 @@ describe("Den upstream proxy", () => {
     const { proxyUpstream } = await import("./upstream-proxy.ts");
     const request = new NextRequest("https://app.example.com/api/auth/session", {
       method: "GET",
-      headers: { origin: INSTANCE_ORIGIN, cookie: "ow_session=sess_test" },
+      headers: { origin: INSTANCE_ORIGIN, cookie: "better-auth.session_token=sess_test" },
     });
 
     const response = await proxyUpstream(request, [], { routePrefix: "/api/auth", upstreamPathPrefix: "api/auth" });
 
     expect(response.headers.get("access-control-allow-origin")).toBeNull();
-    expect(observed.cookie).toBe("ow_session=sess_test");
+    expect(observed.cookie).toBe("better-auth.session_token=sess_test");
+  });
+
+  test("forwards only OpenWork Den and legacy Better Auth cookies through the auth proxy", async () => {
+    const { proxyUpstream } = await import("./upstream-proxy.ts");
+    const request = new NextRequest("https://app.example.com/api/auth/sign-in/social", {
+      method: "POST",
+      headers: {
+        cookie: "ph_posthog=analytics; __Secure-openwork-den.state=oauth-state; openwork-den.session_token=session; better-auth.state=legacy-oauth-state; __Secure-better-auth.session_token=legacy-session; other=value",
+      },
+    });
+
+    await proxyUpstream(request, [], { routePrefix: "/api/auth", upstreamPathPrefix: "api/auth" });
+
+    expect(observed.cookie).toBe("__Secure-openwork-den.state=oauth-state; openwork-den.session_token=session; better-auth.state=legacy-oauth-state; __Secure-better-auth.session_token=legacy-session");
+  });
+
+  test("rewrites auth Set-Cookie domains to the browser origin", async () => {
+    const { proxyUpstream } = await import("./upstream-proxy.ts");
+    const originalFetch = globalThis.fetch;
+    process.env.DEN_API_BASE = "https://api.app.example.com";
+    globalThis.fetch = async () => {
+      const headers = new Headers({ "content-type": "text/plain" });
+      headers.append(
+        "set-cookie",
+        "__Secure-better-auth.session_token=abc; Path=/; Domain=api.app.example.com; Secure; HttpOnly; SameSite=Lax",
+      );
+      headers.append(
+        "set-cookie",
+        "better-auth.session_data=def; Path=/; Secure; HttpOnly; SameSite=Lax",
+      );
+      return new Response("signed in", { headers });
+    };
+    const request = new NextRequest("https://app.example.com/api/auth/callback/google", {
+      method: "GET",
+    });
+
+    let response;
+    try {
+      response = await proxyUpstream(request, ["callback", "google"], { routePrefix: "/api/auth", upstreamPathPrefix: "api/auth" });
+    } finally {
+      globalThis.fetch = originalFetch;
+      process.env.DEN_API_BASE = `http://127.0.0.1:${server.port}`;
+    }
+
+    expect(response.headers.getSetCookie()).toEqual([
+      "__Secure-better-auth.session_token=abc; Path=/; Domain=app.example.com; Secure; HttpOnly; SameSite=Lax",
+      "better-auth.session_data=def; Path=/; Secure; HttpOnly; SameSite=Lax; Domain=app.example.com",
+    ]);
+  });
+
+  test("preserves auth Set-Cookie parent domains shared by sibling web and API hosts", async () => {
+    const { proxyUpstream } = await import("./upstream-proxy.ts");
+    const originalFetch = globalThis.fetch;
+    process.env.DEN_API_BASE = "https://api.openworklabs.com";
+    globalThis.fetch = async () => {
+      const headers = new Headers({ "content-type": "text/plain" });
+      headers.append(
+        "set-cookie",
+        "__Secure-better-auth.session_token=abc; Path=/; Domain=openworklabs.com; Secure; HttpOnly; SameSite=Lax",
+      );
+      return new Response("signed in", { headers });
+    };
+    const request = new NextRequest("https://app.openworklabs.com/api/auth/callback/google", {
+      method: "GET",
+    });
+
+    let response;
+    try {
+      response = await proxyUpstream(request, ["callback", "google"], { routePrefix: "/api/auth", upstreamPathPrefix: "api/auth" });
+    } finally {
+      globalThis.fetch = originalFetch;
+      process.env.DEN_API_BASE = `http://127.0.0.1:${server.port}`;
+    }
+
+    expect(response.headers.getSetCookie()).toEqual([
+      "__Secure-better-auth.session_token=abc; Path=/; Domain=openworklabs.com; Secure; HttpOnly; SameSite=Lax",
+    ]);
+  });
+
+  test("copies auth Set-Cookie from runtimes that only expose the combined header", async () => {
+    const { proxyUpstream } = await import("./upstream-proxy.ts");
+    const originalFetch = globalThis.fetch;
+    process.env.DEN_API_BASE = "https://api.app.example.com";
+    globalThis.fetch = async () => {
+      const response = new Response("signed in", {
+        headers: {
+          "set-cookie": "better-auth.session_token=abc; Path=/; Secure; HttpOnly; SameSite=Lax, better-auth.session_data=def; Path=/; Expires=Tue, 25 Aug 2026 23:54:00 GMT; Secure; HttpOnly; SameSite=Lax",
+        },
+      });
+      Object.defineProperty(response.headers, "getSetCookie", { value: () => [] });
+      return response;
+    };
+    const request = new NextRequest("https://app.example.com/api/auth/callback/google", {
+      method: "GET",
+    });
+
+    let response;
+    try {
+      response = await proxyUpstream(request, ["callback", "google"], { routePrefix: "/api/auth", upstreamPathPrefix: "api/auth" });
+    } finally {
+      globalThis.fetch = originalFetch;
+      process.env.DEN_API_BASE = `http://127.0.0.1:${server.port}`;
+    }
+
+    expect(response.headers.getSetCookie()).toEqual([
+      "better-auth.session_token=abc; Path=/; Secure; HttpOnly; SameSite=Lax; Domain=app.example.com",
+      "better-auth.session_data=def; Path=/; Expires=Tue, 25 Aug 2026 23:54:00 GMT; Secure; HttpOnly; SameSite=Lax; Domain=app.example.com",
+    ]);
   });
 
   test("rejects http and lookalike hostnames", async () => {
@@ -195,7 +346,7 @@ describe("Den upstream proxy", () => {
       tracestate: null,
     });
     expect(response.status).toBe(207);
-    expect(response.headers.get("x-upstream-result")).toBe("ok");
+    expect(response.headers.get("x-upstream-result")).toBeNull();
     expect(response.headers.get("set-cookie")).toContain("sid=abc");
     expect(await response.text()).toBe("proxied");
     expect(logs).toHaveLength(1);
@@ -215,6 +366,33 @@ describe("Den upstream proxy", () => {
     expect(serializedLog).not.toContain("tok_test");
     expect(serializedLog).not.toContain("sess_test");
     expect(serializedLog).not.toContain(JSON.stringify({ ok: true }));
+  });
+
+  test("strips internal upstream response headers and rewrites upstream URLs", async () => {
+    const { proxyUpstream } = await import("./upstream-proxy.ts");
+    const request = new NextRequest("https://app.example.com/api/den/v1/internal-headers");
+
+    const response = await proxyUpstream(request, [], { routePrefix: "/api/den" });
+
+    expect(response.headers.get("access-control-expose-headers")).toBe("Content-Length");
+    for (const header of [
+      "rndr-id",
+      "server",
+      "via",
+      "x-cache-key",
+      "x-origin-host",
+      "x-render-origin-server",
+      "x-request-id",
+      "x-upstream-result",
+    ]) {
+      expect(response.headers.get(header)).toBeNull();
+    }
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(response.headers.get("content-location")).toBe("https://app.example.com/api/den/v1/internal-headers/body");
+    expect(response.headers.get("link")).toBe("<https://app.example.com/api/den/v1/internal-headers/next>; rel=\"next\"");
+    expect(response.headers.get("location")).toBe("https://app.example.com/api/den/v1/internal-headers/redirect?next=1");
+    expect(response.headers.get("refresh")).toBe("0; url=https://app.example.com/api/den/v1/internal-headers/login");
+    expect(await response.text()).toBe("sanitized");
   });
 
   test("drops content-encoding after upstream fetch decompresses the body", async () => {
@@ -286,6 +464,47 @@ describe("Den upstream proxy", () => {
     expect(observed.forwardedPrefix).toBe("/api/den");
     expect(observed.forwardedProto).toBe("https");
     expect(observed.forwarded).toBeNull();
+  });
+
+  test("uses DEN_BASE_URL for forwarded public origin headers", async () => {
+    process.env.DEN_BASE_URL = "http://cloud.example.test:3005";
+    process.env.DEN_WEB_PUBLIC_ORIGIN = "https://migration.example.test";
+    const { proxyUpstream } = await import("./upstream-proxy.ts");
+    const request = new NextRequest("https://request.example.com/api/den/v1/me");
+
+    await proxyUpstream(request, [], { routePrefix: "/api/den" });
+
+    expect(observed.forwardedHost).toBe("cloud.example.test:3005");
+    expect(observed.forwardedProto).toBe("http");
+  });
+
+  test("keeps DEN_WEB_PUBLIC_ORIGIN as the forwarded origin migration fallback", async () => {
+    process.env.DEN_WEB_PUBLIC_ORIGIN = "https://migration.example.test";
+    const { proxyUpstream } = await import("./upstream-proxy.ts");
+    const request = new NextRequest("https://request.example.com/api/den/v1/me");
+
+    await proxyUpstream(request, [], { routePrefix: "/api/den" });
+
+    expect(observed.forwardedHost).toBe("migration.example.test");
+    expect(observed.forwardedProto).toBe("https");
+  });
+
+  test("preserves a rotating public ingress origin when the server request URL is internal", async () => {
+    const { proxyUpstream } = await import("./upstream-proxy.ts");
+    for (const internalHost of ["127.0.0.1", "0.0.0.0"]) {
+      const request = new NextRequest(`http://${internalHost}:3005/api/den/v1/me`, {
+        headers: {
+          "x-forwarded-host": "3005-rotated.daytonaproxy01.net",
+          "x-forwarded-proto": "https",
+        },
+      });
+
+      await proxyUpstream(request, [], { routePrefix: "/api/den" });
+
+      expect(observed.forwardedHost).toBe("3005-rotated.daytonaproxy01.net");
+      expect(observed.forwardedPrefix).toBe("/api/den");
+      expect(observed.forwardedProto).toBe("https");
+    }
   });
 
   test("injects the active W3C trace context into upstream requests", async () => {

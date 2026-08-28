@@ -19,7 +19,6 @@ const composeFile = path.join(rootDir, "packaging", "docker", "docker-compose.we
 const composeProject = "openwork-den-local"
 
 const apiPort = process.env.DEN_API_PORT?.trim() || process.env.DEN_CONTROLLER_PORT?.trim() || "8788"
-const workerProxyPort = process.env.DEN_WORKER_PROXY_PORT?.trim() || "8789"
 const inferencePort = process.env.INFERENCE_PORT?.trim() || "8791"
 const webPort = process.env.DEN_WEB_PORT?.trim() || "3005"
 const appPort = process.env.OPENWORK_APP_PORT?.trim() || process.env.PORT?.trim() || "5173"
@@ -28,6 +27,7 @@ const extraAppPorts = (process.env.OPENWORK_EXTRA_APP_PORTS?.trim() || "5174")
   .map((value) => value.trim())
   .filter(Boolean)
 const databaseUrl = process.env.DATABASE_URL?.trim() || "mysql://root:password@127.0.0.1:3306/openwork_den"
+const databaseRedisUrl = process.env.DATABASE_REDIS_URL?.trim() || "redis://127.0.0.1:6379"
 const dbEncryptionKey =
   process.env.DEN_DB_ENCRYPTION_KEY?.trim() ||
   "local-dev-db-encryption-key-please-change-1234567890"
@@ -59,15 +59,15 @@ function detectWebOrigins() {
   return Array.from(origins).join(",")
 }
 
-function parseDatabaseEndpoint(value) {
+function parseUrlEndpoint(value, defaultPort) {
   const parsed = new URL(value)
   return {
     host: parsed.hostname,
-    port: Number(parsed.port || "3306"),
+    port: Number(parsed.port || defaultPort),
   }
 }
 
-function canReachMysql(host, port) {
+function canReachTcp(host, port) {
   return new Promise((resolve) => {
     const socket = net.createConnection({ host, port })
 
@@ -118,7 +118,7 @@ function run(command, args, options = {}) {
   })
 }
 
-let startedMysql = false
+const startedDockerServices = new Set()
 let turboChild = null
 let cleaningUp = false
 
@@ -151,8 +151,12 @@ async function cleanup(exitCode = 0) {
 
   await stopTurboChild()
 
-  if (startedMysql) {
-    await run("docker", ["compose", "-p", composeProject, "-f", composeFile, "down"], {
+  if (startedDockerServices.size > 0) {
+    const services = Array.from(startedDockerServices)
+    await run("docker", ["compose", "-p", composeProject, "-f", composeFile, "stop", ...services], {
+      stdio: "inherit",
+    }).catch(() => {})
+    await run("docker", ["compose", "-p", composeProject, "-f", composeFile, "rm", "-f", ...services], {
       stdio: "inherit",
     }).catch(() => {})
   }
@@ -167,15 +171,15 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
 }
 
 async function main() {
-  for (const [name, port] of [["den-web", webPort], ["den-api", apiPort], ["den-worker-proxy", workerProxyPort], ["inference", inferencePort]]) {
+  for (const [name, port] of [["den-web", webPort], ["den-api", apiPort], ["inference", inferencePort]]) {
     const available = await canListenOnPort(Number(port))
     if (!available) {
       throw new Error(`${name} local port ${port} is already in use. Stop the existing process or rerun with a different port env override.`)
     }
   }
 
-  const { host, port } = parseDatabaseEndpoint(databaseUrl)
-  const mysqlAvailable = await canReachMysql(host, port)
+  const { host, port } = parseUrlEndpoint(databaseUrl, "3306")
+  const mysqlAvailable = await canReachTcp(host, port)
 
   if (!mysqlAvailable) {
     if (!(host === "127.0.0.1" || host === "localhost")) {
@@ -184,9 +188,23 @@ async function main() {
 
     console.log(`[den] MySQL not reachable at ${host}:${port}; starting Docker MySQL...`)
     await run("docker", ["compose", "-p", composeProject, "-f", composeFile, "up", "-d", "--wait", "mysql"])
-    startedMysql = true
+    startedDockerServices.add("mysql")
   } else {
     console.log(`[den] Using existing MySQL at ${host}:${port}`)
+  }
+
+  const redis = parseUrlEndpoint(databaseRedisUrl, "6379")
+  const redisAvailable = await canReachTcp(redis.host, redis.port)
+  if (!redisAvailable) {
+    if (!(redis.host === "127.0.0.1" || redis.host === "localhost")) {
+      throw new Error(`Redis at ${redis.host}:${redis.port} is not reachable, and auto-start only supports localhost`)
+    }
+
+    console.log(`[den] Redis not reachable at ${redis.host}:${redis.port}; starting Docker Redis...`)
+    await run("docker", ["compose", "-p", composeProject, "-f", composeFile, "up", "-d", "--wait", "redis"])
+    startedDockerServices.add("redis")
+  } else {
+    console.log(`[den] Using existing Redis at ${redis.host}:${redis.port}`)
   }
 
   console.log("[den] Syncing Den schema...")
@@ -210,7 +228,6 @@ async function main() {
       "--output-logs=full",
         "--filter=@openwork-ee/den-api",
         "--filter=@openwork-ee/inference",
-        "--filter=@openwork-ee/den-worker-proxy",
         "--filter=@openwork-ee/den-web",
     ],
     {
@@ -220,14 +237,15 @@ async function main() {
       env: {
         ...process.env,
         DATABASE_URL: databaseUrl,
+        DATABASE_REDIS_URL: databaseRedisUrl,
         DEN_DB_ENCRYPTION_KEY: dbEncryptionKey,
         BETTER_AUTH_URL: process.env.BETTER_AUTH_URL?.trim() || `http://localhost:${webPort}`,
+        DEN_BASE_URL: process.env.DEN_BASE_URL?.trim() || `http://localhost:${webPort}`,
         DEN_MCP_RESOURCE_URL: process.env.DEN_MCP_RESOURCE_URL?.trim() || `http://127.0.0.1:${apiPort}/mcp`,
         DEN_BETTER_AUTH_TRUSTED_ORIGINS: process.env.DEN_BETTER_AUTH_TRUSTED_ORIGINS?.trim() || webOrigins,
         CORS_ORIGINS: process.env.CORS_ORIGINS?.trim() || webOrigins,
         DEN_API_PORT: apiPort,
         DEN_CONTROLLER_PORT: apiPort,
-        DEN_WORKER_PROXY_PORT: workerProxyPort,
         INFERENCE_PORT: inferencePort,
         INFERENCE_PROXY_BASE_URL: process.env.INFERENCE_PROXY_BASE_URL?.trim() || `http://127.0.0.1:${inferencePort}`,
         DEN_WEB_PORT: webPort,

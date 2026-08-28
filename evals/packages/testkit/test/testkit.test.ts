@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { deriveMockEnv } from "../src/mock.ts";
-import { checkNeeds, needs, SkipError } from "../src/needs.ts";
-import { ephemeralDatabaseName, resolvePlace } from "../src/place.ts";
-import { trustedOrigins } from "../src/server.ts";
+import {
+  checkNeeds,
+  deriveMockEnv,
+  ephemeralDatabaseName,
+  needs,
+  resolvePlace,
+  SkipError,
+  trustedOrigins,
+} from "@openwork/env";
 
 test("resolvePlace selects local unless OPENWORK_EVAL_DAYTONA is exactly 1", () => {
   const local = resolvePlace({});
@@ -45,6 +50,23 @@ test("needs throws a named SkipError for every unsatisfied resource", () => {
 test("needs only accepts opt-in gates set exactly to 1", () => {
   assert.throws(() => checkNeeds({ optIn: ["EXACT_OPT_IN"] }, { EXACT_OPT_IN: "true" }), SkipError);
   assert.doesNotThrow(() => checkNeeds({ optIn: ["EXACT_OPT_IN"] }, { EXACT_OPT_IN: "1" }));
+});
+
+test("needs reports an unavailable command", () => {
+  const command = "openwork-impossible-command-for-testkit-test";
+  assert.throws(
+    () => checkNeeds({ commands: [command] }, {}),
+    (error) => error instanceof SkipError && error.message.includes(`install ${command}`),
+  );
+});
+
+test("needs rejects a local-only test on Daytona or an attached Den", () => {
+  assert.doesNotThrow(() => checkNeeds({ placement: "local" }, {}));
+  assert.throws(() => checkNeeds({ placement: "local" }, { OPENWORK_EVAL_DAYTONA: "1" }), SkipError);
+  assert.throws(
+    () => checkNeeds({ placement: "local" }, { OPENWORK_EVAL_DEN_API_URL: "https://den.example.test" }),
+    SkipError,
+  );
 });
 
 test("needs reads process.env at the call site", () => {

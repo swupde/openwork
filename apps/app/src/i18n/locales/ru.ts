@@ -1,12 +1,9 @@
-import { automationsEnglish } from "./automations";
-
 /**
  * Russian translations
  * Product terms like OpenWork, OpenCode, OpenPackage, Skills, Plugins, Commands, Sessions, and MCP stay as project terminology where needed.
  */
 
 export default {
-  ...automationsEnglish,
   "app.compact_command_desc": "Сведите этот сеанс в компактный вид, чтобы уменьшить размер контекста.",
   "app.error_audit_load": "Не удалось загрузить журнал аудита.",
   "app.error_auth_failed": "Ошибка аутентификации",
@@ -548,6 +545,10 @@ export default {
   "session.redo_aria_label": "Повторить последнее отмененное сообщение",
   "session.redo_label": "Повторить",
   "session.redo_title": "Повторить последнее отмененное сообщение",
+  "session.reverted_messages_hidden": "Скрыто предыдущих сообщений: {count}",
+  "session.restore": "Восстановить",
+  "session.restoring": "Восстановление...",
+  "session.restore_failed": "Не удалось восстановить скрытые сообщения. Попробуйте еще раз.",
   "session.rename_description": "Обновите имя для этого сеанса.",
   "session.rename_label": "Имя сеанса",
   "session.rename_placeholder": "Введите новое имя",
@@ -673,7 +674,7 @@ export default {
   "skills.share_team_uploading": "Загрузка…",
   "skills.share_team_sign_in": "Войти, чтобы делиться с командой",
   "skills.share_team_sign_in_hint": "OpenWork Cloud откроется в вашем браузере. Вернитесь сюда после входа.",
-  "skills.share_team_uploaded_success": "Загружено в {org}. Появится в Marketplace.",
+  "skills.share_team_uploaded_success": "Загружено в {org}. Появится в разделе «Коллекции».",
   "skills.share_title": "Поделиться навыком",
   "skills.shown_count": "Показано {count}",
   "skills.skill_creator_already_installed": "Skill Creator уже установлен.",
@@ -1075,14 +1076,14 @@ export default {
   "settings.tab_advanced": "Дополнительно",
   "settings.tab_appearance": "Внешний вид",
   "settings.tab_cloud_account": "Account",
-  "settings.tab_cloud_marketplaces": "Marketplaces & Plugins",
+  "settings.tab_cloud_marketplaces": "Коллекции",
   "settings.tab_cloud_providers": "Cloud Providers",
   "settings.tab_debug": "Отладка",
   "settings.tab_description_advanced": "Проверяйте состояние среды выполнения, состояние подключения и инструменты для разработчика.",
   "settings.tab_description_appearance": "Настройте внешний вид OpenWork на уровне desktop, system theme и рамки приложения.",
   "settings.tab_description_debug": "Просматривайте диагностику среды выполнения, журналы и низкоуровневые инструменты отладки.",
   "settings.tab_description_cloud_account": "Sign in, manage your organization, and configure your cloud connection.",
-  "settings.tab_description_cloud_marketplaces": "Browse and import plugins from your organization's marketplaces.",
+  "settings.tab_description_cloud_marketplaces": "Просматривайте коллекции плагинов вашей организации и импортируйте их в рабочее пространство.",
   "settings.tab_description_cloud_providers": "Проверьте статус синхронизации LLM-провайдеров организации.",
   "settings.tab_description_extensions": "Навыки, подключения и инструменты, которые может использовать ваш агент.",
   "settings.tab_description_general": "Подключайте провайдеров, выбирайте модель по умолчанию, авторизуйте папки и управляйте выбранным workspace OpenWork вместе с его подключением к среде выполнения.",

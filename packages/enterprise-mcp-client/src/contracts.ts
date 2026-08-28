@@ -1,7 +1,14 @@
-import type { OAuthDiscoveryState } from "@modelcontextprotocol/sdk/client/auth.js"
-import type { OAuthClientInformationMixed, OAuthTokens } from "@modelcontextprotocol/sdk/shared/auth.js"
-import type { Client } from "@modelcontextprotocol/sdk/client/index.js"
-import type { Tool } from "@modelcontextprotocol/sdk/types.js"
+import type {
+  Client,
+  Implementation,
+  OAuthDiscoveryState,
+  ServerCapabilities,
+  StoredOAuthClientInformation,
+  StoredOAuthTokens,
+  Tool,
+} from "@modelcontextprotocol/client"
+
+export type { StoredOAuthClientInformation, StoredOAuthTokens } from "@modelcontextprotocol/client"
 
 /** Epoch milliseconds. The package never reads a database or environment clock. */
 export type EnterpriseMcpEpochMs = number
@@ -29,7 +36,7 @@ export type EnterpriseMcpPersistenceContext = {
 }
 
 export type EnterpriseMcpOAuthClientRegistration = {
-  clientInformation: OAuthClientInformationMixed
+  clientInformation: StoredOAuthClientInformation
   /** Opaque adapter-owned compare-and-swap revision. */
   revision: string
   /** Absolute client/client-secret expiration, when the provider declares one. */
@@ -45,7 +52,9 @@ export interface EnterpriseMcpOAuthClientRegistrationPort {
    */
   save(input: {
     context: EnterpriseMcpPersistenceContext
-    clientInformation: OAuthClientInformationMixed
+    clientInformation: StoredOAuthClientInformation
+    /** The redirect URI used for this client registration attempt. */
+    redirectUri: string
     expiresAt?: EnterpriseMcpEpochMs
     source: "client-metadata" | "dynamic"
   }): Promise<EnterpriseMcpOAuthClientRegistration>
@@ -68,7 +77,7 @@ export interface EnterpriseMcpOAuthDiscoveryPort {
 }
 
 export type EnterpriseMcpOAuthCredential = {
-  tokens: OAuthTokens
+  tokens: StoredOAuthTokens
   /** Absolute access-token expiration, computed when tokens are committed. */
   expiresAt?: EnterpriseMcpEpochMs
   /** Opaque adapter-owned compare-and-swap revision. */
@@ -117,7 +126,7 @@ export interface EnterpriseMcpOAuthCredentialPort {
    */
   save(input: {
     context: EnterpriseMcpPersistenceContext
-    tokens: OAuthTokens
+    tokens: StoredOAuthTokens
     expiresAt?: EnterpriseMcpEpochMs
     source: "authorization-code" | "refresh"
     authorization?: EnterpriseMcpOAuthAuthorizationHandle
@@ -153,9 +162,12 @@ export type EnterpriseMcpRequestPhase =
   | "oauth-client-registration"
   | "oauth-token-exchange"
   | "oauth-token-refresh"
+  | "mcp-discovery"
   | "mcp-initialize"
   | "mcp-tool-discovery"
   | "mcp-tool-execution"
+  | "mcp-resource-discovery"
+  | "mcp-resource-read"
   | "unknown-request"
 
 export type EnterpriseMcpOperationPhase =
@@ -166,6 +178,8 @@ export type EnterpriseMcpOperationPhase =
   | "protocol-initialize"
   | "tool-discovery"
   | "tool-execution"
+  | "resource-discovery"
+  | "resource-read"
   | "shutdown"
 
 export type EnterpriseMcpDiagnosticEvent =
@@ -177,6 +191,9 @@ export type EnterpriseMcpDiagnosticEvent =
     outcome: "started" | "succeeded" | "failed"
     durationMs?: number
     httpStatus?: number
+    responseBodyExcerpt?: string
+    protocolEra?: "modern" | "legacy"
+    protocolVersion?: string
   }
   | {
     kind: "credential-invalidation"
@@ -241,7 +258,36 @@ export type EnterpriseMcpCallToolInput = {
   arguments: Record<string, unknown>
 }
 
+export type EnterpriseMcpListResourcesInput = {
+  connection: EnterpriseMcpConnection
+  redirectUri: string
+}
+
+export type EnterpriseMcpReadResourceInput = {
+  connection: EnterpriseMcpConnection
+  redirectUri: string
+  uri: string
+}
+
+export type EnterpriseMcpListResourceTemplatesInput = {
+  connection: EnterpriseMcpConnection
+  redirectUri: string
+}
+
 export type EnterpriseMcpToolResult = Awaited<ReturnType<Client["callTool"]>>
+export type EnterpriseMcpTool = Omit<Tool, "inputSchema" | "outputSchema"> & {
+  inputSchema: Record<string, unknown>
+  outputSchema?: Record<string, unknown>
+}
+export type EnterpriseMcpResourceList = Awaited<ReturnType<Client["listResources"]>>["resources"]
+export type EnterpriseMcpResourceTemplateList = Awaited<ReturnType<Client["listResourceTemplates"]>>["resourceTemplates"]
+export type EnterpriseMcpResourceResult = Awaited<ReturnType<Client["readResource"]>>
+
+export type EnterpriseMcpServerDescriptor = {
+  capabilities: ServerCapabilities
+  serverInfo?: Implementation
+  instructions?: string
+}
 
 export type EnterpriseMcpRequirementWarning = {
   code: string
@@ -271,7 +317,9 @@ export type EnterpriseMcpConnectionRequirements = {
   status: "ready" | "manual_action_required" | "unsupported" | "unreachable"
   server: {
     url: string
+    protocolEra?: "modern" | "legacy"
     protocolVersion?: string
+    /** Protocol-negotiation status; the field name is retained for API compatibility. */
     initialize: "succeeded" | "authentication_required" | "failed"
   }
   authentication: {
@@ -328,6 +376,11 @@ export interface EnterpriseMcpClient {
   connect(input: EnterpriseMcpConnectInput): Promise<EnterpriseMcpConnectResult>
   completeAuthorization(input: EnterpriseMcpCompleteAuthorizationInput): Promise<void>
   abandonAuthorization(input: EnterpriseMcpAbandonAuthorizationInput): Promise<void>
-  listTools(input: EnterpriseMcpListToolsInput): Promise<Tool[]>
+  listTools(input: EnterpriseMcpListToolsInput): Promise<EnterpriseMcpTool[]>
   callTool(input: EnterpriseMcpCallToolInput): Promise<EnterpriseMcpToolResult>
+  callToolRaw(input: EnterpriseMcpCallToolInput): Promise<EnterpriseMcpToolResult>
+  listResources(input: EnterpriseMcpListResourcesInput): Promise<EnterpriseMcpResourceList>
+  readResource(input: EnterpriseMcpReadResourceInput): Promise<EnterpriseMcpResourceResult>
+  listResourceTemplates(input: EnterpriseMcpListResourceTemplatesInput): Promise<EnterpriseMcpResourceTemplateList>
+  describeServer(input: EnterpriseMcpListResourcesInput): Promise<EnterpriseMcpServerDescriptor>
 }

@@ -645,7 +645,6 @@ export function registerOAuthProviderRoutes<T extends { Variables: OrgRouteVaria
           expiresAt: tokens.expires_in ? new Date(Date.now() + tokens.expires_in * 1000) : null,
           scopes: tokens.scope ? tokens.scope.split(" ") : resolveProviderScopes(provider, clientSelectedFeatures(provider, client.extra)),
           pendingCodeVerifier: null,
-          connectedAt: new Date(),
         })
         if (!saved) {
           return c.html(connectCallbackPage({

@@ -16,14 +16,19 @@ describe("normalizeOrganizationCapabilities", () => {
   })
 
   test("reads an explicit opt-in from record metadata", () => {
-    expect(normalizeOrganizationCapabilities({ capabilities: { installLinks: true } })).toEqual({ installLinks: true, mcpConnections: false, cloud: false })
-    expect(normalizeOrganizationCapabilities({ capabilities: { mcpConnections: true } })).toEqual({ installLinks: false, mcpConnections: true, cloud: false })
-    expect(normalizeOrganizationCapabilities({ capabilities: { cloud: true } })).toEqual({ installLinks: false, mcpConnections: false, cloud: true })
+    expect(normalizeOrganizationCapabilities({ capabilities: { installLinks: true } })).toEqual({ ...defaultCapabilities, installLinks: true })
+    expect(normalizeOrganizationCapabilities({ capabilities: { mcpConnections: true } })).toEqual({ ...defaultCapabilities, mcpConnections: true })
+    expect(normalizeOrganizationCapabilities({ capabilities: { cloud: true } })).toEqual({ ...defaultCapabilities, cloud: true })
     expect(normalizeOrganizationCapabilities({ capabilities: { installLinks: false, mcpConnections: false } })).toEqual(defaultCapabilities)
   })
 
   test("reads an explicit opt-in from JSON string metadata", () => {
     expect(normalizeOrganizationCapabilities(JSON.stringify({ capabilities: { installLinks: true, mcpConnections: true, cloud: true } }))).toEqual({ installLinks: true, mcpConnections: true, cloud: true })
+  })
+
+  test("ignores retired rollout keys for features that are now always on", () => {
+    expect(normalizeOrganizationCapabilities({ capabilities: { workflows: true, codemodeScripts: true, remoteMcpApps: true } })).toEqual(defaultCapabilities)
+    expect(normalizeOrganizationCapabilities({ capabilities: { workflows: false, remoteMcpApps: false } })).toEqual(defaultCapabilities)
   })
 
   test("treats anything but literal true as off", () => {
@@ -40,7 +45,7 @@ describe("normalizeOrganizationCapabilities", () => {
       plan: { tier: "enterprise", source: "manual" },
       capabilities: { installLinks: true, mcpConnections: true, cloud: true },
     }
-    expect(normalizeOrganizationCapabilities(metadata)).toEqual({ installLinks: true, mcpConnections: true, cloud: true })
+    expect(normalizeOrganizationCapabilities(metadata)).toEqual({ ...defaultCapabilities, installLinks: true, mcpConnections: true, cloud: true })
   })
 })
 
@@ -53,6 +58,11 @@ describe("readOrganizationCapabilityOverrides", () => {
 
   test("preserves explicit boolean false overrides", () => {
     expect(readOrganizationCapabilityOverrides({ capabilities: { installLinks: false, mcpConnections: false, cloud: false } })).toEqual({ installLinks: false, mcpConnections: false, cloud: false })
+  })
+
+  test("drops retired rollout overrides", () => {
+    expect(readOrganizationCapabilityOverrides({ capabilities: { workflows: false, codemodeScripts: true, remoteMcpApps: true } })).toEqual({})
+    expect(readOrganizationCapabilityOverrides(JSON.stringify({ capabilities: { workflows: true, remoteMcpApps: false } }))).toEqual({})
   })
 
   test("ignores unrelated and non-boolean metadata", () => {

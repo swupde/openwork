@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -8,6 +8,7 @@ import { deflateRawSync } from "node:zlib";
 
 import { buildOpenworkRuntimeConfigObject } from "../openwork-runtime-config.js";
 import { openworkOfficeAttachmentsPluginPath } from "../openwork-extensions-plugin-path.js";
+import { OPENWORK_RUNTIME_STORAGE_ENV, runtimeWorkspaceFilesRoot } from "../runtime-workspace-files.js";
 import { OpenWorkOfficeAttachments } from "./openwork-office-attachments.js";
 
 const DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
@@ -27,12 +28,20 @@ type ZipFile = {
   method?: 0 | 8;
 };
 
-async function withWorkspace(fn: (root: string) => Promise<void>) {
+async function withWorkspace(fn: (root: string, runtimeRoot: string) => Promise<void>) {
   const root = await mkdtemp(join(tmpdir(), "openwork-office-plugin-"));
+  const runtimeRoot = await mkdtemp(join(tmpdir(), "openwork-office-runtime-"));
+  const previousRuntimeRoot = process.env[OPENWORK_RUNTIME_STORAGE_ENV];
+  process.env[OPENWORK_RUNTIME_STORAGE_ENV] = runtimeRoot;
   try {
-    await fn(root);
+    await fn(root, runtimeRoot);
   } finally {
-    await rm(root, { recursive: true, force: true });
+    if (previousRuntimeRoot === undefined) delete process.env[OPENWORK_RUNTIME_STORAGE_ENV];
+    else process.env[OPENWORK_RUNTIME_STORAGE_ENV] = previousRuntimeRoot;
+    await Promise.all([
+      rm(root, { recursive: true, force: true }),
+      rm(runtimeRoot, { recursive: true, force: true }),
+    ]);
   }
 }
 
@@ -58,9 +67,9 @@ function textOf(part: unknown): string {
 }
 
 function pathFromText(text: string): string {
-  const line = text.split("\n").find((item) => item.startsWith("worker_relative_path: "));
-  if (!line) throw new Error("Missing worker_relative_path");
-  return line.slice("worker_relative_path: ".length);
+  const line = text.split("\n").find((item) => item.startsWith("execution_path: "));
+  if (!line) throw new Error("Missing execution_path");
+  return line.slice("execution_path: ".length);
 }
 
 function sha256(buffer: Buffer) {
@@ -166,7 +175,7 @@ async function transform(root: string, messages: unknown[]) {
 
 describe("OpenWorkOfficeAttachments", () => {
   test("extracts DOCX/PPTX text, materializes exact bytes, strips binary parts, and preserves ids", async () => {
-    await withWorkspace(async (root) => {
+    await withWorkspace(async (root, runtimeRoot) => {
       const docx = docxFixture();
       const pptx = pptxFixture();
       const messages = await transform(root, [{
@@ -192,8 +201,12 @@ describe("OpenWorkOfficeAttachments", () => {
       expect(pptxText).toContain(`sha256: ${sha256(pptx)}`);
       expect(JSON.stringify(messages)).not.toContain(docx.toString("base64"));
       expect(JSON.stringify(messages)).not.toContain('"type":"file"');
-      await expect(readFile(join(root, pathFromText(docxText)))).resolves.toEqual(docx);
-      await expect(readFile(join(root, pathFromText(pptxText)))).resolves.toEqual(pptx);
+      const executionRoot = runtimeWorkspaceFilesRoot(runtimeRoot, root);
+      expect(pathFromText(docxText).startsWith(executionRoot)).toBe(true);
+      expect(pathFromText(pptxText).startsWith(executionRoot)).toBe(true);
+      await expect(readFile(pathFromText(docxText))).resolves.toEqual(docx);
+      await expect(readFile(pathFromText(pptxText))).resolves.toEqual(pptx);
+      await expect(stat(join(root, ".opencode", "openwork"))).rejects.toThrow();
     });
   });
 
@@ -222,7 +235,7 @@ describe("OpenWorkOfficeAttachments", () => {
       expect(text).toContain("formula: \"SUM(C2:C3)\"");
       expect(JSON.stringify(messages)).not.toContain(xlsx.toString("base64"));
       expect(JSON.stringify(messages)).not.toContain('"type":"file"');
-      await expect(readFile(join(root, pathFromText(text)))).resolves.toEqual(xlsx);
+      await expect(readFile(pathFromText(text))).resolves.toEqual(xlsx);
     });
   });
 
@@ -246,7 +259,7 @@ describe("OpenWorkOfficeAttachments", () => {
       const secondText = textOf(messageParts((await transform(root, messages))[0])[0]);
       expect(firstText).toBe(secondText);
       expect(firstText).toContain(XLSX_SENTINEL);
-      await expect(readFile(join(root, pathFromText(firstText)))).resolves.toEqual(xlsx);
+      await expect(readFile(pathFromText(firstText))).resolves.toEqual(xlsx);
     });
   });
 
@@ -285,7 +298,7 @@ describe("OpenWorkOfficeAttachments", () => {
         await symlink(outside, join(root, "linked-outside"), "dir");
         const messages = await transform(root, [{ role: "user", parts: [{ type: "file", filename: "QuarterlyBrief.docx", mediaType: DOCX_MIME, url: pathToFileURL(join(root, "linked-outside", "QuarterlyBrief.docx")).toString() }] }]);
         const text = textOf(messageParts(messages[0])[0]);
-        expect(text).toContain("points outside the active workspace");
+        expect(text).toContain("points outside OpenWork-approved storage");
         expect(text).toContain("sha256: unavailable");
       } finally {
         await rm(outside, { recursive: true, force: true });
@@ -311,6 +324,26 @@ describe("OpenWorkOfficeAttachments", () => {
       expect(pptxText).toContain("filename: LaunchRoadmap.pptx");
       expect(pathFromText(docxText)).toContain("QuarterlyBrief.docx");
       expect(pathFromText(pptxText)).toContain("LaunchRoadmap.pptx");
+    });
+  });
+
+  test("reads an uploaded Office file from app-managed execution storage", async () => {
+    await withWorkspace(async (root, runtimeRoot) => {
+      const docx = docxFixture();
+      const executionRoot = runtimeWorkspaceFilesRoot(runtimeRoot, root);
+      const inputPath = join(executionRoot, "inbox", "chat-attachments", "uploaded.docx");
+      await mkdir(dirname(inputPath), { recursive: true });
+      await writeFile(inputPath, docx);
+
+      const messages = await transform(root, [{
+        role: "user",
+        parts: [{ type: "file", filename: "uploaded.docx", mediaType: DOCX_MIME, url: pathToFileURL(inputPath).toString() }],
+      }]);
+      const text = textOf(messageParts(messages[0])[0]);
+
+      expect(text).toContain(DOCX_SENTINEL);
+      expect(pathFromText(text).startsWith(executionRoot)).toBe(true);
+      await expect(readFile(pathFromText(text))).resolves.toEqual(docx);
     });
   });
 
@@ -340,8 +373,10 @@ describe("OpenWorkOfficeAttachments", () => {
       const text = textOf(messageParts(output.messages[0])[0]);
       const materialized = pathFromText(text);
       expect(text).toContain(DOCX_SENTINEL);
-      expect(materialized).toContain(".opencode/openwork/inbox/chat-attachments/");
-      await expect(readFile(join(root, materialized))).resolves.toEqual(docx);
+      expect(materialized).toContain("/workspace-files/");
+      expect(materialized).toContain("/inbox/chat-attachments/");
+      expect(materialized).not.toContain(".opencode/openwork");
+      await expect(readFile(materialized)).resolves.toEqual(docx);
     });
   });
 
@@ -352,7 +387,7 @@ describe("OpenWorkOfficeAttachments", () => {
       const text = textOf(messageParts(messages[0])[0]);
       expect(text).toContain("extraction_error:");
       expect(text).toContain("No text could be safely extracted");
-      await expect(readFile(join(root, pathFromText(text)))).resolves.toEqual(malformed);
+      await expect(readFile(pathFromText(text))).resolves.toEqual(malformed);
     });
   });
 
@@ -363,7 +398,7 @@ describe("OpenWorkOfficeAttachments", () => {
       const text = textOf(messageParts(messages[0])[0]);
       expect(text).toContain("extraction_error:");
       expect(text).toContain("No text could be safely extracted");
-      await expect(readFile(join(root, pathFromText(text)))).resolves.toEqual(malformed);
+      await expect(readFile(pathFromText(text))).resolves.toEqual(malformed);
     });
   });
 
@@ -381,7 +416,8 @@ describe("OpenWorkOfficeAttachments", () => {
       const docx = docxFixture();
       const messages = await transform(root, [{ role: "user", parts: [{ type: "file", filename: "../evil/QuarterlyBrief.docx", mediaType: DOCX_MIME, url: dataUrl(DOCX_MIME, docx) }] }]);
       const materialized = pathFromText(textOf(messageParts(messages[0])[0]));
-      expect(materialized).toContain(".opencode/openwork/inbox/chat-attachments/");
+      expect(materialized).toContain("/workspace-files/");
+      expect(materialized).toContain("/inbox/chat-attachments/");
       expect(materialized).toContain("QuarterlyBrief.docx");
       expect(materialized).not.toContain("evil");
       expect(materialized).not.toContain("..");

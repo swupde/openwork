@@ -67,7 +67,7 @@ Token management (scoped tokens):
 File injection / artifacts:
 
 - `OPENWORK_INBOX_ENABLED` (`1` | `0`)
-- `OPENWORK_INBOX_MAX_BYTES` (default: 50MB, capped)
+- `OPENWORK_INBOX_MAX_BYTES` (default: 250MB; positive integer override)
 - `OPENWORK_OUTBOX_ENABLED` (`1` | `0`)
 
 Sandbox advertisement (for capability discovery):
@@ -121,12 +121,6 @@ Inbox/outbox:
 - `POST /files/sessions/:sessionId/read-batch`
 - `POST /files/sessions/:sessionId/write-batch`
 - `POST /files/sessions/:sessionId/ops`
-
-Toy UI (static assets served by the server):
-
-- `GET /ui`
-- `GET /w/:id/ui`
-- `GET /ui/assets/*`
 
 OpenCode proxy:
 

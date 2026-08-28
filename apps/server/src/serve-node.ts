@@ -79,10 +79,25 @@ async function waitForDrainOrClose(nodeRes: ServerResponse): Promise<void> {
 /**
  * Convert a Node.js IncomingMessage into a Web API Request.
  */
-function toWebRequest(nodeReq: IncomingMessage, hostname: string, port: number): Request {
+function toWebRequest(
+  nodeReq: IncomingMessage,
+  hostname: string,
+  port: number,
+): { request: Request; detachCancellation: () => void } {
   const url = `http://${hostname}:${port}${nodeReq.url ?? "/"}`;
   const method = nodeReq.method ?? "GET";
   const headers = new Headers();
+  const controller = new AbortController();
+  const abort = () => {
+    if (!controller.signal.aborted) {
+      controller.abort(new DOMException("The operation was aborted", "AbortError"));
+    }
+  };
+  if (nodeReq.aborted) abort();
+  else {
+    nodeReq.once("aborted", abort);
+    nodeReq.socket.once("close", abort);
+  }
 
   // Node headers can be string | string[] | undefined
   for (const [key, value] of Object.entries(nodeReq.headers)) {
@@ -102,19 +117,27 @@ function toWebRequest(nodeReq: IncomingMessage, hostname: string, port: number):
     ? (Readable.toWeb(nodeReq) as unknown as ReadableStream<Uint8Array>)
     : null;
 
-  return new Request(url, {
+  const request = new Request(url, {
     method,
     headers,
     body,
+    signal: controller.signal,
     // @ts-expect-error duplex is required for streaming request bodies in Node
     duplex: hasBody ? "half" : undefined,
   });
+  return {
+    request,
+    detachCancellation: () => {
+      nodeReq.off("aborted", abort);
+      nodeReq.socket.off("close", abort);
+    },
+  };
 }
 
 /**
  * Write a Web API Response to a Node.js ServerResponse.
  */
-async function writeWebResponse(webRes: Response, nodeRes: ServerResponse): Promise<void> {
+export async function writeWebResponse(webRes: Response, nodeRes: ServerResponse): Promise<void> {
   const headersObj: Record<string, string | string[]> = {};
   webRes.headers.forEach((value, key) => {
     const existing = headersObj[key];
@@ -135,16 +158,27 @@ async function writeWebResponse(webRes: Response, nodeRes: ServerResponse): Prom
   }
 
   const reader = webRes.body.getReader();
+  let completed = false;
+  const cancelOnDisconnect = () => {
+    void reader.cancel(new Error("Response client disconnected")).catch(() => undefined);
+  };
+  nodeRes.once("close", cancelOnDisconnect);
   try {
     while (true) {
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done) {
+        completed = true;
+        break;
+      }
       if (!isResponseWritable(nodeRes)) break;
       if (!nodeRes.write(value)) {
         await waitForDrainOrClose(nodeRes);
+        if (!isResponseWritable(nodeRes)) break;
       }
     }
   } finally {
+    nodeRes.off("close", cancelOnDisconnect);
+    if (!completed) await reader.cancel().catch(() => undefined);
     reader.releaseLock();
     endResponse(nodeRes);
   }
@@ -167,9 +201,11 @@ export function serve(options: ServeOptions): Promise<ServeResult> {
       console.error("[serve-node] Response stream error:", error);
     });
 
+    let detachCancellation: (() => void) | undefined;
     try {
-      const webReq = toWebRequest(nodeReq, hostname, boundPort);
-      const webRes = await fetchHandler(webReq);
+      const webRequest = toWebRequest(nodeReq, hostname, boundPort);
+      detachCancellation = webRequest.detachCancellation;
+      const webRes = await fetchHandler(webRequest.request);
       await writeWebResponse(webRes, nodeRes);
     } catch (error) {
       if (isExpectedConnectionAbort(error)) {
@@ -184,6 +220,8 @@ export function serve(options: ServeOptions): Promise<ServeResult> {
         nodeRes.writeHead(500, { "Content-Type": "application/json" });
       }
       endResponse(nodeRes, JSON.stringify({ error: "internal_error" }));
+    } finally {
+      detachCancellation?.();
     }
   });
 
@@ -208,7 +246,11 @@ export function serve(options: ServeOptions): Promise<ServeResult> {
       }
       reject(error);
     });
-    server.listen(port, hostname, () => {
+    // A standing "listening" listener, not the listen() callback: Node keeps
+    // the callback-registered once("listening") listener alive across the
+    // EADDRINUSE retry, but Bun does not — under Bun the fallback re-bind
+    // succeeded while this promise hung forever.
+    server.on("listening", () => {
       const addr = server.address();
       if (addr && typeof addr === "object") {
         boundPort = addr.port;
@@ -236,5 +278,6 @@ export function serve(options: ServeOptions): Promise<ServeResult> {
         },
       });
     });
+    server.listen(port, hostname);
   });
 }

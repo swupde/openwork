@@ -60,16 +60,20 @@ export function getOrganizationSsoSignInPath(organizationSlug: string) {
   return `/sso/${encodeURIComponent(organizationSlug)}`
 }
 
+function authCallbackBaseUrl() {
+  return env.apiPublicUrl ?? env.betterAuthUrl
+}
+
 export function getSsoAcsUrl(providerId: string) {
-  return `${env.betterAuthUrl}/api/auth/sso/saml2/sp/acs/${encodeURIComponent(providerId)}`
+  return `${authCallbackBaseUrl()}/api/auth/sso/saml2/sp/acs/${encodeURIComponent(providerId)}`
 }
 
 export function getSsoMetadataUrl(providerId: string) {
-  return `${env.betterAuthUrl}/api/auth/sso/saml2/sp/metadata?providerId=${encodeURIComponent(providerId)}`
+  return `${authCallbackBaseUrl()}/api/auth/sso/saml2/sp/metadata?providerId=${encodeURIComponent(providerId)}`
 }
 
 export function getSsoOidcRedirectUrl(providerId: string) {
-  return `${env.betterAuthUrl}/api/auth/sso/callback/${encodeURIComponent(providerId)}`
+  return `${authCallbackBaseUrl()}/api/auth/sso/callback/${encodeURIComponent(providerId)}`
 }
 
 function isDevLoopbackIssuer(issuer: string) {
@@ -154,8 +158,8 @@ async function registerBetterAuthSsoProvider(input: OrganizationSsoRegistrationI
         samlConfig: {
           entryPoint: input.entryPoint,
           cert: input.cert,
-          callbackUrl: getSsoAcsUrl(providerId),
           audience,
+          callbackUrl: getSsoAcsUrl(providerId),
           idpMetadata: {
             entityID: input.issuer,
           },

@@ -1,12 +1,9 @@
-import { automationsEnglish } from "./automations";
-
 /**
  * Traduções para português do Brasil
  * Termos profissionais (Skills, Plugins, Commands, Sessions, OpenCode, OpenPackage, OpenWork) NÃO são traduzidos
  */
 
 export default {
-  ...automationsEnglish,
   "app.compact_command_desc": "Resumir esta sessão para reduzir o tamanho do contexto.",
   "app.error_audit_load": "Falha ao carregar o log de auditoria.",
   "app.error_auth_failed": "Falha na autenticação",
@@ -634,6 +631,10 @@ export default {
   "session.redo_aria_label": "Refazer última mensagem revertida",
   "session.redo_label": "Refazer",
   "session.redo_title": "Refazer última mensagem revertida",
+  "session.reverted_messages_hidden": "{count} mensagens anteriores estão ocultas",
+  "session.restore": "Restaurar",
+  "session.restoring": "Restaurando...",
+  "session.restore_failed": "Não foi possível restaurar as mensagens ocultas. Tente novamente.",
   "session.rename_description": "Atualizar o nome desta sessão.",
   "session.rename_label": "Nome da sessão",
   "session.rename_placeholder": "Digite um novo nome",
@@ -943,14 +944,14 @@ export default {
   "settings.tab_advanced": "Avançado",
   "settings.tab_appearance": "Aparência",
   "settings.tab_cloud_account": "Account",
-  "settings.tab_cloud_marketplaces": "Marketplaces & Plugins",
+  "settings.tab_cloud_marketplaces": "Coleções",
   "settings.tab_cloud_providers": "Cloud Providers",
   "settings.tab_debug": "Depuração",
   "settings.tab_description_advanced": "Inspecione a saúde do runtime, estado da conexão e controles para desenvolvedores.",
   "settings.tab_description_appearance": "Ajuste a aparência do OpenWork no desktop, tema do sistema e decoração do app.",
   "settings.tab_description_debug": "Revise diagnósticos do runtime, logs e utilitários de depuração de baixo nível.",
   "settings.tab_description_cloud_account": "Sign in, manage your organization, and configure your cloud connection.",
-  "settings.tab_description_cloud_marketplaces": "Browse and import plugins from your organization's marketplaces.",
+  "settings.tab_description_cloud_marketplaces": "Explore as coleções de plugins da sua organização e importe-as para o seu espaço de trabalho.",
   "settings.tab_description_cloud_providers": "Confira o status de sincronização dos provedores LLM da organização.",
   "settings.tab_description_environment": "Save API keys and tokens for local agents, skills, and MCP servers. Secrets stay on this device.",
   "settings.tab_description_extensions": "Skills, conexões e ferramentas que seu agente pode usar.",

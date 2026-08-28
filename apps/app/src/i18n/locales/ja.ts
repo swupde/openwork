@@ -1,11 +1,8 @@
-import { automationsEnglish } from "./automations";
-
 /**
  * Japanese translations (日本語)
  */
 
 export default {
-  ...automationsEnglish,
   "app.compact_command_desc": "このセッションを要約してコンテキストサイズを削減します。",
   "app.error_audit_load": "監査ログの読み込みに失敗しました。",
   "app.error_auth_failed": "認証に失敗しました",
@@ -628,6 +625,10 @@ export default {
   "session.redo_aria_label": "最後に取り消したメッセージをやり直す",
   "session.redo_label": "やり直し",
   "session.redo_title": "最後に取り消したメッセージをやり直す",
+  "session.reverted_messages_hidden": "以前のメッセージ{count}件が非表示です",
+  "session.restore": "復元",
+  "session.restoring": "復元中...",
+  "session.restore_failed": "非表示のメッセージを復元できませんでした。もう一度お試しください。",
   "session.rename_description": "このセッションの名前を更新します。",
   "session.rename_label": "セッション名",
   "session.rename_placeholder": "新しい名前を入力",
@@ -937,14 +938,14 @@ export default {
   "settings.tab_advanced": "詳細",
   "settings.tab_appearance": "外観",
   "settings.tab_cloud_account": "Account",
-  "settings.tab_cloud_marketplaces": "Marketplaces & Plugins",
+  "settings.tab_cloud_marketplaces": "コレクション",
   "settings.tab_cloud_providers": "Cloud Providers",
   "settings.tab_debug": "デバッグ",
   "settings.tab_description_advanced": "初期設定をやり直すためにOpenWorkのローカル状態をリセットします。",
   "settings.tab_description_appearance": "テーマとユーザーインターフェースの外観をカスタマイズします。",
   "settings.tab_description_debug": "ランタイムダイアログ、ログ、低レベルデバッグユーティリティを確認します。",
   "settings.tab_description_cloud_account": "Sign in, manage your organization, and configure your cloud connection.",
-  "settings.tab_description_cloud_marketplaces": "Browse and import plugins from your organization's marketplaces.",
+  "settings.tab_description_cloud_marketplaces": "組織のプラグインコレクションを参照し、ワークスペースにインポートします。",
   "settings.tab_description_cloud_providers": "組織のLLMプロバイダーの同期状態を確認します。",
   "settings.tab_description_extensions": "エージェントが使用できるスキル、接続、ツール。",
   "settings.tab_description_general": "プロバイダーを接続し、デフォルトモデルを選択し、フォルダへのアクセスを許可し、OpenWorkワークスペースとそのランタイム接続を管理します。",

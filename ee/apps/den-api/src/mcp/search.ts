@@ -17,6 +17,7 @@ import { getJsonRequestBodySchema, getParameters, hasJsonRequestBody, pathParame
  */
 
 export const SEARCH_CAPABILITIES_TOOL_NAME = "search_capabilities"
+export const EXECUTE_CAPABILITY_TOOL_NAME = "execute_capability"
 export type SearchCapabilityType = "all" | "api" | "admin" | "mcp" | "marketplace" | "skills"
 
 export type CapabilityMatch = {
@@ -29,6 +30,8 @@ export type CapabilityMatch = {
   pathParams: string[]
   /** Query parameter names this tool documents, if any. */
   queryParams: string[]
+  /** OpenAPI constraints for the query object accepted by execute_capability. */
+  querySchema?: unknown
   /** Whether calling this tool requires a JSON `body`. */
   hasBody: boolean
   /** Exact OpenAPI JSON schema for `body`, present only for JSON mutations. */
@@ -37,12 +40,19 @@ export type CapabilityMatch = {
   argumentsSchema?: unknown
   /** Tells generic execute callers where MCP arguments must be supplied. */
   invocation?: { argumentsField: "body" }
+  /** Exact confined-script path when Code Mode scripts are enabled. */
+  scriptPath?: string
+  /** Callable capability or a source-specific advisory/content kind. */
+  kind?: string
+  /** Standard MCP App binding advertised by the matched provider tool. */
+  mcpApp?: { resourceUri: string }
 }
 
 export function compareCapabilityMatches(a: CapabilityMatch, b: CapabilityMatch): number {
   const statusPriority = Number("kind" in b && b.kind === "connection_status")
     - Number("kind" in a && a.kind === "connection_status")
-  return statusPriority || (b.score - a.score) || a.name.localeCompare(b.name)
+  // Relevance leads globally; an actionable status only wins an equal-score tie.
+  return (b.score - a.score) || statusPriority || a.name.localeCompare(b.name)
 }
 
 export function searchCapabilitySourceFilter(type?: SearchCapabilityType) {
@@ -110,6 +120,22 @@ function scoreOperation(operation: McpToolOperation, queryTokens: string[]): num
   return scoreText(nameTokens, summaryTokens, queryTokens, pathTokens)
 }
 
+export function querySchemaFor(parameters: ReturnType<typeof getParameters>): unknown {
+  const properties = Object.fromEntries(
+    parameters.map((parameter) => [String(parameter.name), parameter.schema ?? {}]),
+  )
+  const required = parameters
+    .filter((parameter) => parameter.required === true)
+    .map((parameter) => String(parameter.name))
+
+  return {
+    type: "object",
+    properties,
+    additionalProperties: false,
+    ...(required.length === 0 ? {} : { required }),
+  }
+}
+
 export function searchCapabilities(
   catalog: McpToolOperation[],
   query: string,
@@ -119,19 +145,22 @@ export function searchCapabilities(
   const boundedLimit = Math.max(1, Math.min(20, Math.trunc(limit) || 5))
 
   return catalog
-    .map((operation) => ({
-      name: operation.name,
-      method: operation.method,
-      path: operation.path,
-      score: scoreOperation(operation, queryTokens),
-      summary: summaryFor(operation),
-      pathParams: pathParameterNamesFromTemplate(operation.path),
-      queryParams: getParameters(operation.operation, "query").map((parameter) => parameter.name as string),
-      hasBody: hasJsonRequestBody(operation.operation),
-      ...(getJsonRequestBodySchema(operation.operation) === undefined
-        ? {}
-        : { bodySchema: getJsonRequestBodySchema(operation.operation) }),
-    }))
+    .map((operation) => {
+      const queryParameters = getParameters(operation.operation, "query")
+      const bodySchema = getJsonRequestBodySchema(operation.operation)
+      return {
+        name: operation.name,
+        method: operation.method,
+        path: operation.path,
+        score: scoreOperation(operation, queryTokens),
+        summary: summaryFor(operation),
+        pathParams: pathParameterNamesFromTemplate(operation.path),
+        queryParams: queryParameters.map((parameter) => parameter.name as string),
+        ...(queryParameters.length === 0 ? {} : { querySchema: querySchemaFor(queryParameters) }),
+        hasBody: hasJsonRequestBody(operation.operation),
+        ...(bodySchema === undefined ? {} : { bodySchema }),
+      }
+    })
     .filter((match) => match.score > 0)
     .sort(compareCapabilityMatches)
     .slice(0, boundedLimit)

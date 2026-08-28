@@ -1,10 +1,11 @@
-import { contextBridge, ipcRenderer } from "electron";
+import { contextBridge, ipcRenderer, webUtils } from "electron";
 
 const NATIVE_DEEP_LINK_EVENT = "openwork:deep-link-native";
 const NATIVE_MENU_OPEN_SETTINGS_EVENT = "openwork:native-menu:open-settings";
 const NATIVE_MENU_TOGGLE_SIDEBAR_EVENT = "openwork:native-menu:toggle-sidebar";
 const NATIVE_MENU_CHECK_UPDATES_EVENT = "openwork:native-menu:check-updates";
 const NATIVE_MENU_ZOOM_EVENT = "openwork:native-menu:zoom";
+const AUTOMATION_RUNNER_CREDENTIAL_REJECTED_EVENT = "openwork:automation-runner:credential-rejected";
 
 function normalizePlatform(value) {
   if (value === "darwin" || value === "linux") return value;
@@ -61,6 +62,18 @@ try {
 contextBridge.exposeInMainWorld("__OPENWORK_ELECTRON__", {
   invokeDesktop(command, ...args) {
     return ipcRenderer.invoke("openwork:desktop", command, ...args);
+  },
+  automationRunner: {
+    onCredentialRejected(callback) {
+      const handler = () => callback();
+      ipcRenderer.on(AUTOMATION_RUNNER_CREDENTIAL_REJECTED_EVENT, handler);
+      return () => ipcRenderer.removeListener(AUTOMATION_RUNNER_CREDENTIAL_REJECTED_EVENT, handler);
+    },
+  },
+  fileSystem: {
+    getPathForFile(file) {
+      return webUtils.getPathForFile(file);
+    },
   },
   shell: {
     openExternal(url) {
@@ -135,6 +148,20 @@ contextBridge.exposeInMainWorld("__OPENWORK_ELECTRON__", {
       };
     },
   },
+  recovery: {
+    recordHealthy() {
+      return ipcRenderer.invoke("openwork:recovery:recordHealthy");
+    },
+    list(policy) {
+      return ipcRenderer.invoke("openwork:recovery:list", policy);
+    },
+    restorePrevious() {
+      return ipcRenderer.invoke("openwork:recovery:restorePrevious");
+    },
+    use(id) {
+      return ipcRenderer.invoke("openwork:recovery:use", id);
+    },
+  },
   browser: {
     show(bounds) { return ipcRenderer.invoke("openwork:browser:show", bounds); },
     hide() { return ipcRenderer.invoke("openwork:browser:hide"); },
@@ -193,8 +220,23 @@ contextBridge.exposeInMainWorld("__OPENWORK_ELECTRON__", {
     initialDeepLinks: [],
     platform: normalizePlatform(process.platform),
     version: process.versions.electron,
+    evalFatalBootstrapFailure: process.env.OPENWORK_EVAL_FATAL_DESKTOP_BOOTSTRAP_FAILURE ?? null,
   },
 });
+
+if (
+  process.env.OPENWORK_EVAL_FATAL_DESKTOP_BOOTSTRAP_FAILURE
+  && (process.env.OPENWORK_EVAL_RECOVERY_CANDIDATES || process.env.OPENWORK_EVAL_RECOVERY_RELEASES)
+) {
+  contextBridge.exposeInMainWorld("__openworkRecoveryControl", {
+    snapshot() {
+      return ipcRenderer.invoke("openwork:recovery:evalSnapshot");
+    },
+    select(id) {
+      return ipcRenderer.invoke("openwork:recovery:use", id);
+    },
+  });
+}
 
 ipcRenderer.on(NATIVE_DEEP_LINK_EVENT, (_event, urls) => {
   if (typeof window === "undefined") return;

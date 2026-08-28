@@ -81,6 +81,8 @@ export interface ApprovalConfig {
   timeoutMs: number;
 }
 
+export type LocalManagedMcpVaultKeyProvider = () => Promise<Uint8Array>;
+
 export interface ServerConfig {
   host: string;
   port: number;
@@ -101,6 +103,8 @@ export interface ServerConfig {
   hostTokenSource: "cli" | "env" | "file" | "generated";
   logFormat: LogFormat;
   logRequests: boolean;
+  /** In-memory secure key custody supplied by an embedding host such as OpenWork Desktop. */
+  localManagedMcpVaultKey?: LocalManagedMcpVaultKeyProvider;
 }
 
 export interface Capabilities {
@@ -113,10 +117,10 @@ export interface Capabilities {
   mcp: { read: boolean; write: boolean };
   commands: { read: boolean; write: boolean };
   config: { read: boolean; write: boolean };
+  engine: { rollover: boolean };
 
   approvals: { mode: ApprovalMode; timeoutMs: number };
   sandbox: { enabled: boolean; backend: SandboxBackend };
-  ui: { toy: boolean };
   tokens: { scoped: boolean; scopes: TokenScope[] };
   proxy: {
     opencode: boolean;
@@ -130,8 +134,7 @@ export interface Capabilities {
     files: {
       injection: boolean;
       outbox: boolean;
-      inboxPath: string;
-      outboxPath: string;
+      storage: "app-managed";
       maxBytes: number;
     };
   };
@@ -187,6 +190,7 @@ export interface SkillItem {
   description: string;
   scope: "project" | "global";
   trigger?: string;
+  error?: string;
 }
 
 export interface CommandItem {

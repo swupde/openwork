@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto"
-import { Daytona, DaytonaConflictError, type CreateSandboxFromImageParams, type CreateSandboxFromSnapshotParams, type Sandbox } from "@daytonaio/sdk"
+import { Daytona, DaytonaConflictError, DaytonaNotFoundError, type CreateSandboxFromImageParams, type CreateSandboxFromSnapshotParams, type Sandbox } from "@daytonaio/sdk"
 import { eq } from "@openwork-ee/den-db/drizzle"
 import { DaytonaSandboxTable, WorkerTable } from "@openwork-ee/den-db/schema"
 import { createDenTypeId } from "@openwork-ee/utils/typeid"
@@ -84,6 +84,7 @@ export type DaytonaProvisioningRuntime = {
   checkpointExists: (input: { workerId: WorkerId; sharedVolume: DaytonaVolumeRuntime }) => Promise<boolean>
   verifyRestoreMarker: (sandbox: DaytonaSandboxRuntime) => Promise<boolean>
   waitForHealth: typeof waitForHealth
+  now?: () => number
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -92,6 +93,8 @@ const signedPreviewRefreshLeadMs = 5 * 60 * 1000
 const wakeStartMaxAttempts = 3
 const wakeStartRetryBackoffMs = 250
 const wakeStartStateChangeTimeoutMs = 60_000
+const createConflictLookupMaxAttempts = 6
+const createConflictLookupBackoffMs = 2_000
 const logger = appLogger.child({ component: "daytona_provisioner" })
 
 const slug = (value: string) =>
@@ -131,14 +134,10 @@ function normalizedSignedPreviewExpirySeconds() {
   )
 }
 
-function signedPreviewRefreshAt(expiresInSeconds: number) {
+function signedPreviewRefreshAt(expiresInSeconds: number, issuedAtMs = Date.now()) {
   return new Date(
-    Date.now() + Math.max(0, expiresInSeconds * 1000 - signedPreviewRefreshLeadMs),
+    issuedAtMs + Math.max(0, expiresInSeconds * 1000 - signedPreviewRefreshLeadMs),
   )
-}
-
-function workerProxyUrl(workerId: WorkerId) {
-  return `${env.daytona.workerProxyBaseUrl.replace(/\/+$/, "")}/${encodeURIComponent(workerId)}`
 }
 
 function workerActivityHeartbeatUrl(workerId: WorkerId) {
@@ -155,6 +154,10 @@ function assertDaytonaConfig() {
 function isDaytonaNotFoundError(error: unknown) {
   if (!(error instanceof Error)) {
     return false
+  }
+
+  if (error instanceof DaytonaNotFoundError || error.name === "DaytonaNotFoundError") {
+    return true
   }
 
   const message = error.message.toLowerCase()
@@ -825,8 +828,9 @@ export async function refreshDaytonaSignedPreview(workerId: WorkerId) {
   await sandbox.refreshData()
 
   const expiresInSeconds = normalizedSignedPreviewExpirySeconds()
+  const issuedAtMs = Date.now()
   const preview = await sandbox.getSignedPreviewUrl(env.daytona.openworkPort, expiresInSeconds)
-  const expiresAt = signedPreviewRefreshAt(expiresInSeconds)
+  const expiresAt = signedPreviewRefreshAt(expiresInSeconds, issuedAtMs)
 
   await db
     .update(DaytonaSandboxTable)
@@ -843,20 +847,6 @@ export async function refreshDaytonaSignedPreview(workerId: WorkerId) {
     signed_preview_url_expires_at: expiresAt,
     region: sandbox.target,
   }
-}
-
-export async function getDaytonaSignedPreviewForProxy(workerId: WorkerId) {
-  const record = await getDaytonaSandboxRecord(workerId)
-  if (!record) {
-    return null
-  }
-
-  if (record.signed_preview_url_expires_at.getTime() > Date.now()) {
-    return record.signed_preview_url
-  }
-
-  const refreshed = await refreshDaytonaSignedPreview(workerId)
-  return refreshed?.signed_preview_url ?? null
 }
 
 function toDaytonaSandboxRuntime(sandbox: Sandbox): DaytonaSandboxRuntime {
@@ -1025,15 +1015,34 @@ async function getSandboxByName(runtime: DaytonaProvisioningRuntime, name: strin
   }
 }
 
+async function getSandboxAfterCreateConflict(
+  runtime: DaytonaProvisioningRuntime,
+  lookupNames: string[],
+  wait: (ms: number) => Promise<unknown>,
+) {
+  for (let attempt = 1; attempt <= createConflictLookupMaxAttempts; attempt += 1) {
+    for (const lookupName of lookupNames) {
+      const sandbox = await getSandboxByName(runtime, lookupName)
+      if (sandbox) return sandbox
+    }
+
+    if (attempt < createConflictLookupMaxAttempts) {
+      await wait(createConflictLookupBackoffMs)
+    }
+  }
+
+  return null
+}
+
 type StartedOpenWorkProcess = {
   signedPreviewUrl: string
   signedPreviewUrlExpiresAt: Date
 }
 
-function provisionedInstance(workerId: WorkerId, region: string | null, imageVersion: string | null | undefined = currentDaytonaImageVersion()): ProvisionedInstance {
+function provisionedInstance(url: string, region: string | null, imageVersion: string | null | undefined = currentDaytonaImageVersion()): ProvisionedInstance {
   return {
     provider: "daytona",
-    url: workerProxyUrl(workerId),
+    url,
     status: "healthy",
     region: region ?? undefined,
     imageVersion,
@@ -1057,11 +1066,12 @@ async function startOpenWorkProcessOnDaytonaSandbox(input: {
   )
 
   const expiresInSeconds = normalizedSignedPreviewExpirySeconds()
+  const issuedAtMs = input.runtime.now ? input.runtime.now() : Date.now()
   const preview = await input.sandbox.getSignedPreviewUrl(env.daytona.openworkPort, expiresInSeconds)
   await input.runtime.waitForHealth(preview.url, env.daytona.healthcheckTimeoutMs, input.sandbox, input.sessionId, command.cmdId)
   return {
     signedPreviewUrl: preview.url,
-    signedPreviewUrlExpiresAt: signedPreviewRefreshAt(expiresInSeconds),
+    signedPreviewUrlExpiresAt: signedPreviewRefreshAt(expiresInSeconds, issuedAtMs),
   }
 }
 
@@ -1103,7 +1113,7 @@ async function startOpenWorkOnDaytonaSandbox(input: {
     dataVolumeId: input.dataVolumeId,
   })
 
-  return provisionedInstance(input.provisionInput.workerId, input.sandbox.target, input.imageVersion)
+  return provisionedInstance(started.signedPreviewUrl, input.sandbox.target, input.imageVersion)
 }
 
 async function startDaytonaSandboxForWake(input: { workerId: WorkerId; sandbox: DaytonaSandboxRuntime }) {
@@ -1204,7 +1214,7 @@ async function recycleDaytonaSandbox(input: {
       dataVolumeId: input.sharedVolume.id,
     })
     await input.oldSandbox.delete(env.daytona.deleteTimeoutSeconds)
-    return provisionedInstance(input.provisionInput.workerId, replacementSandbox.target)
+    return provisionedInstance(started.signedPreviewUrl, replacementSandbox.target)
   } catch (error) {
     if (replacementSandbox) {
       await replacementSandbox.delete(env.daytona.deleteTimeoutSeconds).catch((deleteError) => {
@@ -1242,6 +1252,7 @@ async function adoptDaytonaSandbox(input: {
 export async function provisionWorkerOnDaytonaWithRuntime(
   input: ProvisionInput,
   runtime: DaytonaProvisioningRuntime,
+  options: { sleep?: (ms: number) => Promise<unknown> } = {},
 ): Promise<ProvisionedInstance> {
   const name = currentDaytonaSandboxName(input)
   const lookupNames = daytonaSandboxLookupNames(input)
@@ -1270,11 +1281,9 @@ export async function provisionWorkerOnDaytonaWithRuntime(
     }
 
     if (isDaytonaConflictError(error)) {
-      for (const lookupName of lookupNames) {
-        const conflictSandbox = await getSandboxByName(runtime, lookupName)
-        if (conflictSandbox) {
-          return adoptDaytonaSandbox({ provisionInput: input, runtime, sandbox: conflictSandbox, sharedVolume })
-        }
+      const conflictSandbox = await getSandboxAfterCreateConflict(runtime, lookupNames, options.sleep ?? sleep)
+      if (conflictSandbox) {
+        return adoptDaytonaSandbox({ provisionInput: input, runtime, sandbox: conflictSandbox, sharedVolume })
       }
     }
 

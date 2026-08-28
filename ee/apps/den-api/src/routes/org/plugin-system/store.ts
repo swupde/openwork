@@ -23,12 +23,14 @@ import {
   PluginConfigObjectTable,
   PluginMcpRequirementBindingTable,
   PluginTable,
+  RemoteMcpAppTable,
   TeamTable,
 } from "@openwork-ee/den-db/schema"
 import { createDenTypeId, normalizeDenTypeId } from "@openwork-ee/utils/typeid"
 import { hasSkillFrontmatterName, parseSkillMarkdown } from "@openwork-ee/utils"
 import type { PluginArchActorContext, PluginArchResourceKind, PluginArchRole } from "./access.js"
-import { isPluginArchOrgAdmin, PluginArchAuthorizationError, requirePluginArchResourceRole, resolvePluginArchGrantRole, resolvePluginArchResourceRole } from "./access.js"
+import { isPluginArchOrgAdmin, PluginArchAuthorizationError, pluginArchResourceHasExpandedAudience, requirePluginArchResourceRole, resolvePluginArchGrantRole, resolvePluginArchResourceRole } from "./access.js"
+import { clampCodePoints, clampUtf8Bytes, PROJECTION_TEXT_MAX_BYTES, PROJECTION_TITLE_MAX_CHARS } from "./projection-text.js"
 import {
   buildGithubAppInstallUrl,
   createGithubInstallStateToken,
@@ -68,6 +70,7 @@ import { db } from "../../../db.js"
 import { env } from "../../../env.js"
 import { appLogger } from "../../../observability/logger.js"
 import { roleIncludesOwner } from "../../../orgs.js"
+import { redactWorkflowNormalizedPayloadAuthoringDetails } from "../../../workflow-projections.js"
 import { memberFacingMcpConnectionsEnabled } from "../../../capability-sources/external-mcp-rollout.js"
 import { comparablePluginMcpRequirementUrl, marketplaceMcpServerEntries, resolveMarketplacePluginCloudReadiness } from "../../../mcp/marketplace-capabilities.js"
 import { assertPublicUrl } from "../../../capability-sources/url-guard.js"
@@ -337,8 +340,9 @@ export class PluginArchRouteFailure extends Error {
     readonly status: 400 | 404 | 409 | 502,
     readonly error: string,
     message: string,
+    options?: ErrorOptions,
   ) {
-    super(message)
+    super(message, options)
     this.name = "PluginArchRouteFailure"
   }
 }
@@ -618,7 +622,7 @@ function deriveSkillProjection(value: ConfigObjectInput) {
 
   return {
     description,
-    searchText: [name, description, body].join("\n"),
+    searchText: clampUtf8Bytes([name, description, body].join("\n"), PROJECTION_TEXT_MAX_BYTES),
     title: name,
   }
 }
@@ -652,15 +656,18 @@ function deriveProjection(input: { objectType: ConfigObjectRow["objectType"]; va
       : null,
   ].find((value) => Boolean(normalizeOptionalString(value ?? undefined)))
 
-  const title = normalizeOptionalString(titleCandidate ?? undefined)
-    ?? `${input.objectType.charAt(0).toUpperCase()}${input.objectType.slice(1)} ${new Date().toISOString()}`
+  const title = clampCodePoints(
+    normalizeOptionalString(titleCandidate ?? undefined)
+      ?? `${input.objectType.charAt(0).toUpperCase()}${input.objectType.slice(1)} ${new Date().toISOString()}`,
+    PROJECTION_TITLE_MAX_CHARS,
+  )
 
   const description = normalizeOptionalString(descriptionCandidate ?? undefined)
-  const searchText = [title, description, rawSourceText].filter(Boolean).join("\n") || null
+  const searchText = [title, description, rawSourceText].filter(Boolean).join("\n")
 
   return {
-    description,
-    searchText,
+    description: description ? clampUtf8Bytes(description, PROJECTION_TEXT_MAX_BYTES) : null,
+    searchText: searchText ? clampUtf8Bytes(searchText, PROJECTION_TEXT_MAX_BYTES) : null,
     title,
   }
 }
@@ -696,6 +703,9 @@ async function getLatestVersions(configObjectIds: ConfigObjectId[]) {
 }
 
 function serializeVersion(row: ConfigObjectVersionRow) {
+  // Workflow authoring data belongs to the role-aware Workflow management API.
+  // Generic config-object reads must not bypass that boundary for viewers.
+  const isCodemodeWorkflowVersion = row.schemaVersion === "codemode-script-v1"
   return {
     configObjectId: row.configObjectId,
     connectorSyncEventId: row.connectorSyncEventId,
@@ -704,8 +714,10 @@ function serializeVersion(row: ConfigObjectVersionRow) {
     createdVia: row.createdVia,
     id: row.id,
     isDeletedVersion: row.isDeletedVersion,
-    normalizedPayloadJson: row.normalizedPayloadJson,
-    rawSourceText: row.rawSourceText,
+    normalizedPayloadJson: isCodemodeWorkflowVersion
+      ? redactWorkflowNormalizedPayloadAuthoringDetails(row.normalizedPayloadJson)
+      : row.normalizedPayloadJson,
+    rawSourceText: isCodemodeWorkflowVersion ? null : row.rawSourceText,
     schemaVersion: row.schemaVersion,
     sourceRevisionRef: row.sourceRevisionRef,
   }
@@ -1247,12 +1259,22 @@ async function ensureVisibleConfigObject(context: PluginArchActorContext, config
   return row
 }
 
-async function ensureEditablePlugin(context: PluginArchActorContext, pluginId: PluginId) {
+async function ensureEditablePlugin(
+  context: PluginArchActorContext,
+  pluginId: PluginId,
+  requireFreshSession?: boolean,
+) {
   const row = await getPluginRow(context.organizationContext.organization.id, pluginId)
   if (!row) {
     throw new PluginArchRouteFailure(404, "plugin_not_found", "Plugin not found.")
   }
-  await requirePluginArchResourceRole({ context, resourceId: row.id, resourceKind: "plugin", role: "editor" })
+  await requirePluginArchResourceRole({
+    context,
+    requireFreshSession,
+    resourceId: row.id,
+    resourceKind: "plugin",
+    role: "editor",
+  })
   return row
 }
 
@@ -1595,6 +1617,7 @@ export async function createConfigObject(input: {
   context: PluginArchActorContext
   objectType: ConfigObjectRow["objectType"]
   pluginIds?: PluginId[]
+  requireFreshSession?: boolean
   sourceMode: ConfigObjectRow["sourceMode"]
   value: ConfigObjectInput
 }) {
@@ -1602,8 +1625,11 @@ export async function createConfigObject(input: {
     throw new PluginArchRouteFailure(400, "invalid_request", "Connector-managed config objects must be created through connector sync.")
   }
 
+  const targetExposure = await Promise.all((input.pluginIds ?? []).map((pluginId) =>
+    pluginArchResourceHasExpandedAudience({ context: input.context, resourceId: pluginId, resourceKind: "plugin" })))
+  const requireFreshSession = input.requireFreshSession ?? targetExposure.some(Boolean)
   for (const pluginId of input.pluginIds ?? []) {
-    await ensureEditablePlugin(input.context, pluginId)
+    await ensureEditablePlugin(input.context, pluginId, requireFreshSession)
   }
 
   const now = new Date()
@@ -1734,7 +1760,8 @@ export async function createConfigObjectVersion(input: { context: PluginArchActo
   if (!row) {
     throw new PluginArchRouteFailure(404, "config_object_not_found", "Config object not found.")
   }
-  await requirePluginArchResourceRole({ context: input.context, resourceId: row.id, resourceKind: "config_object", role: "editor" })
+  const requireFreshSession = await pluginArchResourceHasExpandedAudience({ context: input.context, resourceId: row.id, resourceKind: "config_object" })
+  await requirePluginArchResourceRole({ context: input.context, requireFreshSession, resourceId: row.id, resourceKind: "config_object", role: "editor" })
 
   const now = new Date()
   const projection = deriveProjection({ objectType: row.objectType, value: input.value })
@@ -1774,7 +1801,8 @@ export async function setConfigObjectLifecycle(input: { context: PluginArchActor
   if (!row) {
     throw new PluginArchRouteFailure(404, "config_object_not_found", "Config object not found.")
   }
-  await requirePluginArchResourceRole({ context: input.context, resourceId: row.id, resourceKind: "config_object", role: "manager" })
+  const requireFreshSession = await pluginArchResourceHasExpandedAudience({ context: input.context, resourceId: row.id, resourceKind: "config_object" })
+  await requirePluginArchResourceRole({ context: input.context, requireFreshSession, resourceId: row.id, resourceKind: "config_object", role: "manager" })
   const now = new Date()
   const patch = input.action === "archive"
     ? { deletedAt: null, status: "archived" as const, updatedAt: now }
@@ -1811,7 +1839,18 @@ export async function listConfigObjectPlugins(input: { context: PluginArchActorC
 }
 
 export async function attachConfigObjectToPlugin(input: { context: PluginArchActorContext; configObjectId: ConfigObjectId; membershipSource?: PluginMembershipRow["membershipSource"]; pluginId: PluginId }) {
-  await ensureVisibleConfigObject(input.context, input.configObjectId)
+  const configObject = await ensureVisibleConfigObject(input.context, input.configObjectId)
+  if (configObject.objectType === "workflow" || configObject.objectType === "script") {
+    // Adding a Workflow to a Plugin can expand its audience through Plugin and
+    // Marketplace grants, so only a Workflow manager may make that sharing
+    // decision. Other config-object membership behavior stays compatible.
+    await requirePluginArchResourceRole({
+      context: input.context,
+      resourceId: configObject.id,
+      resourceKind: "config_object",
+      role: "manager",
+    })
+  }
   await ensureEditablePlugin(input.context, input.pluginId)
 
   const existing = await db
@@ -1843,7 +1882,15 @@ export async function attachConfigObjectToPlugin(input: { context: PluginArchAct
 }
 
 export async function removeConfigObjectFromPlugin(input: { context: PluginArchActorContext; configObjectId: ConfigObjectId; pluginId: PluginId }) {
-  await ensureVisibleConfigObject(input.context, input.configObjectId)
+  const configObject = await ensureVisibleConfigObject(input.context, input.configObjectId)
+  if (configObject.objectType === "workflow" || configObject.objectType === "script") {
+    await requirePluginArchResourceRole({
+      context: input.context,
+      resourceId: configObject.id,
+      resourceKind: "config_object",
+      role: "manager",
+    })
+  }
   await ensureEditablePlugin(input.context, input.pluginId)
   const rows = await db
     .select()
@@ -1863,7 +1910,13 @@ export async function removeConfigObjectFromPlugin(input: { context: PluginArchA
 
 export async function listResourceAccess(input: { context: PluginArchActorContext } & ResourceTarget) {
   await ensureResourceInOrganization(input.context, input)
-  await requirePluginArchResourceRole({ context: input.context, resourceId: input.resourceId, resourceKind: input.resourceKind, role: "manager" })
+  await requirePluginArchResourceRole({
+    context: input.context,
+    requireFreshSession: false,
+    resourceId: input.resourceId,
+    resourceKind: input.resourceKind,
+    role: "manager",
+  })
 
   if (input.resourceKind === "config_object") {
     const rows = await db.select().from(ConfigObjectAccessGrantTable).where(eq(ConfigObjectAccessGrantTable.configObjectId, input.resourceId)).orderBy(desc(ConfigObjectAccessGrantTable.createdAt))
@@ -2084,7 +2137,7 @@ export async function listTeamEffectivePluginAccess(input: { context: PluginArch
   }
 }
 
-type MePluginAccessEdge =
+export type MePluginAccessEdge =
   | { kind: "mine" }
   | { kind: "person"; sharedBy: { orgMembershipId: MemberId; name: string } | null; grantedAt: string }
   | { kind: "team"; team: { id: TeamId; name: string } }
@@ -2336,15 +2389,15 @@ export async function listMeEffectivePluginAccess(input: { context: PluginArchAc
 export async function listMeLibraryPluginItems(input: { context: PluginArchActorContext }) {
   const result = await listMeEffectivePluginAccessWithComponentKinds(input)
   return result.items.map((item) => ({
-    type: "plugin",
-    id: item.plugin.id,
-    name: item.plugin.name,
-    description: item.plugin.description,
-    componentCount: item.plugin.componentCount,
-    componentKinds: item.plugin.componentKinds,
-    sourceRepositoryUrl: item.plugin.sourceRepositoryUrl,
-    edges: item.edges,
-    role: item.role,
+      type: "plugin" as const,
+      id: item.plugin.id,
+      name: item.plugin.name,
+      description: item.plugin.description,
+      componentCount: item.plugin.componentCount,
+      componentKinds: item.plugin.componentKinds,
+      sourceRepositoryUrl: item.plugin.sourceRepositoryUrl,
+      edges: item.edges,
+      role: item.role,
   }))
 }
 
@@ -2623,6 +2676,7 @@ export async function createPluginBundle(input: {
       context: input.context,
       objectType: component.type,
       pluginIds: [plugin.id],
+      requireFreshSession: false,
       sourceMode: "cloud",
       value: component.value,
     })
@@ -2653,7 +2707,8 @@ export async function createPluginBundle(input: {
 }
 
 export async function updatePlugin(input: { context: PluginArchActorContext; description?: string | null; name?: string; pluginId: PluginId }) {
-  const row = await ensureEditablePlugin(input.context, input.pluginId)
+  const requireFreshSession = await pluginArchResourceHasExpandedAudience({ context: input.context, resourceId: input.pluginId, resourceKind: "plugin" })
+  const row = await ensureEditablePlugin(input.context, input.pluginId, requireFreshSession)
   const updatedAt = new Date()
   await db.update(PluginTable).set({
     description: input.description === undefined ? row.description : normalizeOptionalString(input.description ?? undefined),
@@ -2665,7 +2720,8 @@ export async function updatePlugin(input: { context: PluginArchActorContext; des
 
 export async function setPluginLifecycle(input: { action: "archive" | "restore"; context: PluginArchActorContext; pluginId: PluginId }) {
   const row = await ensureVisiblePlugin(input.context, input.pluginId)
-  await requirePluginArchResourceRole({ context: input.context, resourceId: row.id, resourceKind: "plugin", role: "manager" })
+  const requireFreshSession = await pluginArchResourceHasExpandedAudience({ context: input.context, resourceId: row.id, resourceKind: "plugin" })
+  await requirePluginArchResourceRole({ context: input.context, requireFreshSession, resourceId: row.id, resourceKind: "plugin", role: "manager" })
   const updatedAt = new Date()
   await db.update(PluginTable).set({
     deletedAt: input.action === "archive" ? row.deletedAt : null,
@@ -2680,7 +2736,7 @@ export async function setPluginLifecycle(input: { action: "archive" | "restore";
   return getPluginDetail(input.context, row.id)
 }
 
-export async function listPluginMemberships(input: { context: PluginArchActorContext; pluginId: PluginId; includeConfigObjects?: boolean; onlyActive?: boolean }) {
+export async function listPluginMemberships(input: { context: PluginArchActorContext; pluginId: PluginId; includeConfigObjects?: boolean; legacyWorkflowObjectType?: boolean; onlyActive?: boolean }) {
   await ensureVisiblePlugin(input.context, input.pluginId)
   const memberships = await db
     .select()
@@ -2701,7 +2757,12 @@ export async function listPluginMemberships(input: { context: PluginArchActorCon
     ? memberships.filter((membership) => resolvedConfigObjectIds.has(membership.configObjectId))
     : memberships
   const latestVersions = await getLatestVersions(resolvedConfigObjects.map((row) => row.id))
-  const byId = new Map<string, ReturnType<typeof serializeConfigObject>>(resolvedConfigObjects.map((row) => [row.id, serializeConfigObject(row, latestVersions.get(row.id) ?? null)]))
+  const byId = new Map<string, ReturnType<typeof serializeConfigObject>>(resolvedConfigObjects.map((row) => {
+    const serialized = serializeConfigObject(row, latestVersions.get(row.id) ?? null)
+    return [row.id, input.legacyWorkflowObjectType && serialized.objectType === "workflow"
+      ? { ...serialized, objectType: "script" }
+      : serialized]
+  }))
   return { items: resolvedMemberships.map((membership) => serializeMembership(membership, byId.get(membership.configObjectId))), nextCursor: null }
 }
 
@@ -2754,6 +2815,10 @@ export async function listMarketplaces(input: { context: PluginArchActorContext;
 
 async function ensureDefaultOpenWorkMarketplace(context: PluginArchActorContext) {
   const organizationId = context.organizationContext.organization.id
+  if (await defaultOpenWorkMarketplaceSeedComplete(organizationId)) {
+    return
+  }
+
   await db.transaction(async (tx) => {
     const organization = (await tx
       .select({ id: OrganizationTable.id })
@@ -2796,6 +2861,114 @@ async function ensureDefaultOpenWorkMarketplace(context: PluginArchActorContext)
       marketplaceId: marketplace.id,
     })
   })
+}
+
+async function defaultOpenWorkMarketplaceSeedComplete(organizationId: OrganizationId) {
+  const defaultMarketplaces = await db
+    .select({ id: MarketplaceTable.id, logoUrl: MarketplaceTable.logoUrl, name: MarketplaceTable.name })
+    .from(MarketplaceTable)
+    .where(and(
+      eq(MarketplaceTable.organizationId, organizationId),
+      inArray(MarketplaceTable.name, [DEFAULT_ANTHROPIC_MARKETPLACE_NAME, DEFAULT_OPENWORK_MARKETPLACE_NAME]),
+      eq(MarketplaceTable.status, "active"),
+      isNull(MarketplaceTable.deletedAt),
+    ))
+  const marketplaceIdByName = new Map(defaultMarketplaces.map((marketplace) => [marketplace.name, marketplace.id]))
+  const anthropicMarketplaceId = marketplaceIdByName.get(DEFAULT_ANTHROPIC_MARKETPLACE_NAME)
+  const openWorkMarketplaceId = marketplaceIdByName.get(DEFAULT_OPENWORK_MARKETPLACE_NAME)
+  if (!anthropicMarketplaceId || !openWorkMarketplaceId) {
+    return false
+  }
+  if (!defaultMarketplaces.some((marketplace) => marketplace.name === DEFAULT_ANTHROPIC_MARKETPLACE_NAME && marketplace.logoUrl === DEFAULT_ANTHROPIC_MARKETPLACE_LOGO_URL)) {
+    return false
+  }
+  if (!defaultMarketplaces.some((marketplace) => marketplace.name === DEFAULT_OPENWORK_MARKETPLACE_NAME && marketplace.logoUrl === DEFAULT_OPENWORK_MARKETPLACE_LOGO_URL)) {
+    return false
+  }
+
+  const marketplaceIds = [anthropicMarketplaceId, openWorkMarketplaceId]
+  const marketplaceGrantRows = await db
+    .select({ marketplaceId: MarketplaceAccessGrantTable.marketplaceId, role: MarketplaceAccessGrantTable.role })
+    .from(MarketplaceAccessGrantTable)
+    .where(and(
+      eq(MarketplaceAccessGrantTable.organizationId, organizationId),
+      inArray(MarketplaceAccessGrantTable.marketplaceId, marketplaceIds),
+      eq(MarketplaceAccessGrantTable.orgWide, true),
+      eq(MarketplaceAccessGrantTable.role, "viewer"),
+      isNull(MarketplaceAccessGrantTable.removedAt),
+    ))
+  const marketplaceGrants = new Set(marketplaceGrantRows.map((grant) => grant.marketplaceId))
+  if (!marketplaceIds.every((marketplaceId) => marketplaceGrants.has(marketplaceId))) {
+    return false
+  }
+
+  const anthropicPluginEntries = DEFAULT_ANTHROPIC_STARTER_PLUGINS
+  const openWorkPluginEntries = DEFAULT_OPENWORK_EXTENSION_MANIFESTS.map((manifest) => ({ description: manifest.description, name: manifest.name }))
+  const defaultPluginEntries = [...anthropicPluginEntries, ...openWorkPluginEntries]
+  const defaultPluginRows = await db
+    .select({ id: PluginTable.id, name: PluginTable.name, description: PluginTable.description })
+    .from(PluginTable)
+    .where(and(
+      eq(PluginTable.organizationId, organizationId),
+      inArray(PluginTable.name, defaultPluginEntries.map((entry) => entry.name)),
+      eq(PluginTable.status, "active"),
+      isNull(PluginTable.deletedAt),
+    ))
+
+  const pluginIdByEntry = new Map<string, PluginId>()
+  for (const entry of defaultPluginEntries) {
+    const plugin = defaultPluginRows.find((row) => row.name === entry.name && row.description === entry.description)
+    if (!plugin) {
+      return false
+    }
+    pluginIdByEntry.set(defaultMarketplacePluginEntryKey(entry), plugin.id)
+  }
+
+  const pluginIds = Array.from(pluginIdByEntry.values())
+  const pluginGrantRows = await db
+    .select({ pluginId: PluginAccessGrantTable.pluginId })
+    .from(PluginAccessGrantTable)
+    .where(and(
+      eq(PluginAccessGrantTable.organizationId, organizationId),
+      inArray(PluginAccessGrantTable.pluginId, pluginIds),
+      eq(PluginAccessGrantTable.orgWide, true),
+      eq(PluginAccessGrantTable.role, "viewer"),
+      isNull(PluginAccessGrantTable.removedAt),
+    ))
+  const pluginGrants = new Set(pluginGrantRows.map((grant) => grant.pluginId))
+  if (!pluginIds.every((pluginId) => pluginGrants.has(pluginId))) {
+    return false
+  }
+
+  const expectedMemberships = new Set<string>()
+  for (const entry of anthropicPluginEntries) {
+    const pluginId = pluginIdByEntry.get(defaultMarketplacePluginEntryKey(entry))
+    if (pluginId) expectedMemberships.add(defaultMarketplacePluginMembershipKey(anthropicMarketplaceId, pluginId))
+  }
+  for (const entry of openWorkPluginEntries) {
+    const pluginId = pluginIdByEntry.get(defaultMarketplacePluginEntryKey(entry))
+    if (pluginId) expectedMemberships.add(defaultMarketplacePluginMembershipKey(openWorkMarketplaceId, pluginId))
+  }
+
+  const membershipRows = await db
+    .select({ marketplaceId: MarketplacePluginTable.marketplaceId, pluginId: MarketplacePluginTable.pluginId })
+    .from(MarketplacePluginTable)
+    .where(and(
+      eq(MarketplacePluginTable.organizationId, organizationId),
+      inArray(MarketplacePluginTable.marketplaceId, marketplaceIds),
+      inArray(MarketplacePluginTable.pluginId, pluginIds),
+      isNull(MarketplacePluginTable.removedAt),
+    ))
+  const memberships = new Set(membershipRows.map((membership) => defaultMarketplacePluginMembershipKey(membership.marketplaceId, membership.pluginId)))
+  return Array.from(expectedMemberships).every((membership) => memberships.has(membership))
+}
+
+function defaultMarketplacePluginEntryKey(entry: DefaultMarketplacePluginEntry) {
+  return `${entry.name}\n${entry.description}`
+}
+
+function defaultMarketplacePluginMembershipKey(marketplaceId: MarketplaceId, pluginId: PluginId) {
+  return `${marketplaceId}:${pluginId}`
 }
 
 async function ensureDefaultMarketplacePlugins(input: {
@@ -4144,7 +4317,7 @@ function wrapGithubConnectorError(error: unknown): never {
   }
 
   if (error instanceof GithubConnectorRequestError) {
-    throw new PluginArchRouteFailure(409, "github_connector_request_failed", error.message)
+    throw new PluginArchRouteFailure(409, "github_connector_request_failed", error.message, { cause: error })
   }
 
   throw error
@@ -4653,7 +4826,7 @@ async function derivePluginMcpRequirementAccess(input: {
   pluginId: PluginId
 }): Promise<PluginMcpRequirementAccess> {
   const activeRows = await db
-    .select({ id: PluginConfigObjectTable.id })
+    .select({ id: PluginConfigObjectTable.id, objectType: ConfigObjectTable.objectType })
     .from(PluginConfigObjectTable)
     .innerJoin(PluginTable, eq(PluginConfigObjectTable.pluginId, PluginTable.id))
     .innerJoin(ConfigObjectTable, eq(PluginConfigObjectTable.configObjectId, ConfigObjectTable.id))
@@ -4672,6 +4845,17 @@ async function derivePluginMcpRequirementAccess(input: {
     .limit(1)
   if (!activeRows[0]) {
     return { memberIds: [], orgWide: false, teamIds: [] }
+  }
+  if (activeRows[0].objectType === "app") {
+    const activeApp = await db.select({ configObjectId: RemoteMcpAppTable.configObjectId })
+      .from(RemoteMcpAppTable)
+      .where(and(
+        eq(RemoteMcpAppTable.organizationId, input.organizationId),
+        eq(RemoteMcpAppTable.configObjectId, input.configObjectId),
+        eq(RemoteMcpAppTable.status, "active"),
+      ))
+      .limit(1)
+    if (!activeApp[0]) return { memberIds: [], orgWide: false, teamIds: [] }
   }
 
   const marketplaceIds = await activeMarketplaceIdsForPlugin({ organizationId: input.organizationId, pluginId: input.pluginId })
@@ -4763,7 +4947,7 @@ async function pluginMcpRequirementBindingsForResource(input: ResourceTarget & {
   return []
 }
 
-async function syncPluginMcpRequirementAccessForResource(input: ResourceTarget & { context: PluginArchActorContext }) {
+export async function syncPluginMcpRequirementAccessForResource(input: ResourceTarget & { context: PluginArchActorContext }) {
   const organizationId = input.context.organizationContext.organization.id
   const rows = input.resourceKind === "config_object"
     ? await pluginMcpRequirementBindingsForResource({ organizationId, resourceId: input.resourceId, resourceKind: "config_object" })

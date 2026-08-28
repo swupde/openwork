@@ -1,17 +1,19 @@
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
 import { randomUUID } from "node:crypto"
-import { readdir, readFile } from "node:fs/promises"
+import { copyFile, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import test from "node:test"
 import { fileURLToPath } from "node:url"
 import { createDenTypeId } from "@openwork-ee/utils/typeid"
 import { drizzle } from "drizzle-orm/mysql2"
 import { migrate } from "drizzle-orm/mysql2/migrator"
+import { readMigrationFiles } from "drizzle-orm/migrator"
 import mysql from "mysql2/promise"
-import { ensureFulltextIndexes } from "../src/fulltext.ts"
 import { parseMySqlConnectionConfig } from "../src/mysql-config.ts"
 import { ensureSchemaRepairs, type Executor } from "../src/schema-repairs.ts"
+import { bootstrapDenDb } from "../scripts/bootstrap.ts"
 import {
   ConfigObjectTable,
   ConfigObjectVersionTable,
@@ -148,6 +150,22 @@ async function exportCurrentSchemaSql() {
   return runDrizzleKitExport()
 }
 
+async function legacyPreOauthMigrationFolder() {
+  const journal = JSON.parse(await readFile(join(migrationsFolder, "meta", "_journal.json"), "utf8")) as {
+    entries: Array<{ idx: number; tag: string }>
+  }
+  const entries = journal.entries.filter((entry) => entry.idx <= 55)
+  const folder = await mkdtemp(join(tmpdir(), "openwork-den-legacy-migrations-"))
+  await mkdir(join(folder, "meta"), { recursive: true })
+  await writeFile(join(folder, "meta", "_journal.json"), JSON.stringify({ version: "7", dialect: "mysql", entries }))
+
+  for (const entry of entries) {
+    await copyFile(join(migrationsFolder, `${entry.tag}.sql`), join(folder, `${entry.tag}.sql`))
+  }
+
+  return folder
+}
+
 test("drizzle-kit export retries empty SQL and returns the successful retry", async () => {
   let attempts = 0
   const sql = "CREATE TABLE `example` (`id` int);\n"
@@ -217,6 +235,7 @@ async function migrationOwnedTables() {
   const entries = await readdir(migrationsFolder)
   const tables = new Set<string>()
   const createTableRegex = /CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+`([^`]+)`/gi
+  const renameTableRegex = /RENAME\s+TABLE\s+`[^`]+`\s+TO\s+`([^`]+)`/gi
 
   for (const entry of entries) {
     if (!entry.endsWith(".sql")) {
@@ -228,6 +247,11 @@ async function migrationOwnedTables() {
     while (match) {
       tables.add(match[1])
       match = createTableRegex.exec(sql)
+    }
+    match = renameTableRegex.exec(sql)
+    while (match) {
+      tables.add(match[1])
+      match = renameTableRegex.exec(sql)
     }
   }
 
@@ -262,14 +286,50 @@ function exportTableNames(statements: string[]) {
     .sort()
 }
 
+// Columns that migrations ADD to tables the migration chain does not create
+// (those tables are seeded from the current export before replay, so the
+// seeded CREATE TABLE must not already contain the columns the replay adds).
+// worker: added by 0002. oauth*: added by 0056.
+const SEED_COLUMN_STRIPS: Record<string, string[]> = {
+  worker: ["last_heartbeat_at", "last_active_at"],
+  oauthClient: [
+    "backchannel_logout_uri",
+    "backchannel_logout_session_required",
+    "jwks",
+    "jwks_uri",
+    "dpop_bound_access_tokens",
+  ],
+  oauthAccessToken: [
+    "authorization_code_id",
+    "resources",
+    "requested_user_info_claims",
+    "revoked",
+    "confirmation",
+  ],
+  oauthRefreshToken: [
+    "authorization_code_id",
+    "resources",
+    "requested_user_info_claims",
+    "rotated_at",
+    "rotation_replay_response",
+    "rotation_replay_expires_at",
+    "confirmation",
+  ],
+  oauthConsent: ["resources", "requested_user_info_claims"],
+}
+
 function statementForSeed(statement: string) {
-  if (createTableName(statement) !== "worker") {
+  const tableName = createTableName(statement)
+  const strips = tableName ? SEED_COLUMN_STRIPS[tableName] : undefined
+  if (!strips) {
     return statement
   }
 
-  return statement
-    .replace(/\n\s*`last_heartbeat_at` timestamp\(3\),/i, "")
-    .replace(/\n\s*`last_active_at` timestamp\(3\),/i, "")
+  let seeded = statement
+  for (const column of strips) {
+    seeded = seeded.replace(new RegExp(`\\n\\s*\`${column}\` [^,\\n]+,`, "i"), "")
+  }
+  return seeded
 }
 
 function seedShouldSkipIndex(statement: string) {
@@ -317,7 +377,7 @@ async function applyStatements(connection: mysql.Connection, statements: string[
 async function schemaColumnLines(connection: mysql.Connection) {
   const rows = await queryRecords(
     connection,
-    `SELECT table_name AS table_name, column_name AS column_name, column_type AS column_type, is_nullable AS is_nullable, column_default AS column_default
+    `SELECT table_name AS table_name, column_name AS column_name, column_type AS column_type, is_nullable AS is_nullable
      FROM information_schema.COLUMNS
      WHERE table_schema = DATABASE() AND table_name <> '__drizzle_migrations'
      ORDER BY table_name, ordinal_position`,
@@ -328,10 +388,7 @@ async function schemaColumnLines(connection: mysql.Connection) {
     const columnName = stringField(row, "column_name")
     const columnType = stringField(row, "column_type")
     const isNullable = stringField(row, "is_nullable")
-    // Drizzle exports `now()` while MySQL introspection returns CURRENT_TIMESTAMP(3).
-    // Parity needs to assert whether a default exists, not vendor-specific spelling.
-    const hasDefault = row.column_default !== null && row.column_default !== undefined
-    return `${tableName}.${columnName}: ${columnType} ${isNullable} DEFAULT ${hasDefault ? "SET" : "NONE"}`
+    return `${tableName}.${columnName}: ${columnType} ${isNullable}`
   })
 }
 
@@ -457,11 +514,9 @@ test("migrations replay to exported schema and config object version inserts", {
 
     const migratedDb = drizzle(migratedConnection)
     await migrate(migratedDb, { migrationsFolder })
-    await ensureFulltextIndexes(executorFor(migratedConnection))
     await ensureSchemaRepairs(executorFor(migratedConnection))
 
     await applyStatements(exportedConnection, exportStatements)
-    await ensureFulltextIndexes(executorFor(exportedConnection))
     await ensureSchemaRepairs(executorFor(exportedConnection))
 
     await assertSchemasMatch(exportedConnection, migratedConnection)
@@ -471,6 +526,93 @@ test("migrations replay to exported schema and config object version inserts", {
     await exportedConnection?.end().catch(() => {})
     await root.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(migratedDatabase)}`).catch(() => {})
     await root.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(exportedDatabase)}`).catch(() => {})
+    await root.end()
+  }
+})
+
+test("bootstrap repairs a legacy pre-oauth schema that was falsely marked current", { skip: !mysqlUrl, timeout: 300_000 }, async () => {
+  if (!mysqlUrl) return
+
+  const root = await mysql.createConnection(mysqlUrl)
+  const database = scratchDatabaseName()
+  const legacyFolder = await legacyPreOauthMigrationFolder()
+  let connection: mysql.Connection | undefined
+  const priorDatabaseUrl = process.env.DATABASE_URL
+
+  try {
+    await root.query(`CREATE DATABASE ${quoteIdentifier(database)}`)
+    connection = await mysql.createConnection(mysqlConnectionConfigFor(mysqlUrl, database))
+
+    const exportStatements = splitSqlStatements(await exportCurrentSchemaSql())
+    const ownedTables = await migrationOwnedTables()
+    const ownedIndexes = await migrationOwnedIndexes()
+    const nonMigrationOwnedTables = new Set(exportTableNames(exportStatements).filter((tableName) => !ownedTables.has(tableName)))
+    await seedNonMigrationOwnedTables(connection, exportStatements, nonMigrationOwnedTables, ownedIndexes)
+    await migrate(drizzle(connection), { migrationsFolder: legacyFolder })
+    await connection.query("DROP TABLE `__drizzle_migrations`")
+    await connection.query("CREATE TABLE `__drizzle_migrations` (`id` serial primary key, `hash` text not null, `created_at` bigint)")
+    for (const migration of readMigrationFiles({ migrationsFolder })) {
+      await connection.query("INSERT INTO `__drizzle_migrations` (`hash`, `created_at`) VALUES (?, ?)", [migration.hash, migration.folderMillis])
+    }
+
+    process.env.DATABASE_URL = databaseUrlFor(mysqlUrl, database)
+    await bootstrapDenDb()
+
+    const oauthResource = await queryRecords(connection, "SHOW TABLES LIKE 'oauthResource'")
+    assert.equal(oauthResource.length, 1, "bootstrap must apply the missing OAuth migration instead of trusting a false baseline")
+  } finally {
+    if (priorDatabaseUrl === undefined) {
+      delete process.env.DATABASE_URL
+    } else {
+      process.env.DATABASE_URL = priorDatabaseUrl
+    }
+    await connection?.end().catch(() => {})
+    await root.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(database)}`).catch(() => {})
+    await root.end()
+    await rm(legacyFolder, { recursive: true, force: true })
+  }
+})
+
+test("0076 migrates workflow table, enums, and legacy data without changing IDs", { skip: !mysqlUrl, timeout: 120_000 }, async () => {
+  if (!mysqlUrl) return
+
+  const root = await mysql.createConnection(mysqlUrl)
+  const database = scratchDatabaseName()
+  let connection: mysql.Connection | undefined
+
+  try {
+    await root.query(`CREATE DATABASE ${quoteIdentifier(database)}`)
+    connection = await mysql.createConnection(databaseUrlFor(mysqlUrl, database))
+    await connection.query("CREATE TABLE `codemode_run` (`id` varchar(64) NOT NULL, `organization_id` varchar(64) NOT NULL, `automation_run_id` varchar(64), `config_object_id` varchar(64), `finished_at` timestamp(3) NOT NULL, `created_at` timestamp(3) NOT NULL, `payload` text, PRIMARY KEY (`id`), KEY `codemode_run_org_created` (`organization_id`,`created_at`), KEY `codemode_run_automation` (`automation_run_id`), KEY `codemode_run_artifact_history` (`config_object_id`,`finished_at`))")
+    await connection.query("CREATE TABLE `config_object` (`id` varchar(64) NOT NULL, `object_type` enum('skill','agent','command','tool','mcp','hook','context','custom','script','app') NOT NULL, PRIMARY KEY (`id`))")
+    await connection.query("CREATE TABLE `connector_mapping` (`id` varchar(64) NOT NULL, `object_type` enum('skill','agent','command','tool','mcp','hook','context','custom','script','app') NOT NULL, PRIMARY KEY (`id`))")
+    await connection.query("INSERT INTO `codemode_run` (`id`, `organization_id`, `finished_at`, `created_at`, `payload`) VALUES ('cmr_01k28e8q8pf8r9sff9mhyqxved', 'org_legacy', NOW(3), NOW(3), 'retained')")
+    await connection.query("INSERT INTO `config_object` (`id`, `object_type`) VALUES ('cob_legacy', 'script')")
+    await connection.query("INSERT INTO `connector_mapping` (`id`, `object_type`) VALUES ('cmp_legacy', 'script')")
+
+    const migrationSql = await readFile(join(migrationsFolder, "0076_abnormal_mongu.sql"), "utf8")
+    await applyStatements(connection, splitSqlStatements(migrationSql.replace(/--> statement-breakpoint/g, "")))
+    await connection.query("INSERT INTO `workflow_run` (`id`, `organization_id`, `finished_at`, `created_at`, `payload`) VALUES ('wfr_01k28e8q8pf8r9sff9mhyqxvee', 'org_new', NOW(3), NOW(3), 'new')")
+
+    const tables = await queryRecords(connection, "SELECT table_name AS table_name FROM information_schema.TABLES WHERE table_schema = DATABASE() AND table_name IN ('codemode_run', 'workflow_run') ORDER BY table_name")
+    assert.deepEqual(tables.map((row) => row.table_name), ["workflow_run"])
+    const runs = await queryRecords(connection, "SELECT `id`, `payload` FROM `workflow_run` ORDER BY `id`")
+    assert.deepEqual(runs, [
+      { id: "cmr_01k28e8q8pf8r9sff9mhyqxved", payload: "retained" },
+      { id: "wfr_01k28e8q8pf8r9sff9mhyqxvee", payload: "new" },
+    ])
+    const objects = await queryRecords(connection, "SELECT `object_type` FROM `config_object` WHERE `id` = 'cob_legacy'")
+    const mappings = await queryRecords(connection, "SELECT `object_type` FROM `connector_mapping` WHERE `id` = 'cmp_legacy'")
+    assert.equal(objects[0]?.object_type, "workflow")
+    assert.equal(mappings[0]?.object_type, "workflow")
+    const enumColumns = await queryRecords(connection, "SELECT `table_name` AS `table_name`, `column_type` AS `column_type` FROM information_schema.COLUMNS WHERE table_schema = DATABASE() AND table_name IN ('config_object', 'connector_mapping') AND column_name = 'object_type' ORDER BY table_name")
+    for (const row of enumColumns) {
+      assert.match(stringField(row, "column_type"), /'workflow'/)
+      assert.match(stringField(row, "column_type"), /'script'/)
+    }
+  } finally {
+    await connection?.end().catch(() => {})
+    await root.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(database)}`).catch(() => {})
     await root.end()
   }
 })

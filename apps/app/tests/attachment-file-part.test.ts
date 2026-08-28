@@ -3,12 +3,11 @@ import { describe, expect, test } from "bun:test";
 import type { ComposerAttachment } from "../src/app/types";
 import {
   buildChatAttachmentInboxPath,
-  composerAttachmentsToWorkspaceFileParts,
+  composerAttachmentsToExecutionFileParts,
   composerAttachmentToFilePart,
   modelFacingAttachmentMime,
   resolveAttachmentFileMetadata,
   safeAttachmentFilename,
-  workspaceInboxPath,
   type ChatAttachmentWorkspaceEndpoint,
 } from "../src/react-app/domains/session/sync/attachment-file-part";
 
@@ -67,24 +66,29 @@ function uploadRecorder(workspaceId: string) {
           filename: file.name,
           bytes: Array.from(bytes),
         });
-        return { ok: true, path, bytes: file.size };
+        return {
+          ok: true,
+          path,
+          executionPath: `/runtime/workspace-files/workspace-key/inbox/${path}`,
+          bytes: file.size,
+        };
       },
     },
   };
   return { endpoint, calls };
 }
 
-function textPart(parts: Awaited<ReturnType<typeof composerAttachmentsToWorkspaceFileParts>>) {
+function textPart(parts: Awaited<ReturnType<typeof composerAttachmentsToExecutionFileParts>>) {
   const part = parts[0];
   if (!part || part.type !== "text") throw new Error("Expected first attachment part to be a text note");
   return part;
 }
 
-function textPartText(parts: Awaited<ReturnType<typeof composerAttachmentsToWorkspaceFileParts>>) {
+function textPartText(parts: Awaited<ReturnType<typeof composerAttachmentsToExecutionFileParts>>) {
   return textPart(parts).text;
 }
 
-function filePartUrl(parts: Awaited<ReturnType<typeof composerAttachmentsToWorkspaceFileParts>>, index: number) {
+function filePartUrl(parts: Awaited<ReturnType<typeof composerAttachmentsToExecutionFileParts>>, index: number) {
   const part = parts[index];
   if (!part || part.type !== "file") throw new Error(`Expected attachment part ${index} to be a file`);
   return part.url;
@@ -280,7 +284,7 @@ describe("composer attachment file parts", () => {
     });
   });
 
-  test("generates session-scoped inbox paths under the workspace inbox", () => {
+  test("generates session-scoped paths inside the server-owned inbox", () => {
     const inboxPath = buildChatAttachmentInboxPath({
       sessionId: "ses_123",
       id: "nonce-abc",
@@ -288,18 +292,43 @@ describe("composer attachment file parts", () => {
     });
 
     expect(inboxPath).toBe("chat-attachments/ses_123/nonce-abc-scan one 李.pdf");
-    expect(workspaceInboxPath(inboxPath)).toBe(".opencode/openwork/inbox/chat-attachments/ses_123/nonce-abc-scan one 李.pdf");
+  });
+
+  test("bounds long ASCII attachment names while preserving extension and unique id", () => {
+    const filename = `${"a".repeat(400)}.pdf`;
+    const first = buildChatAttachmentInboxPath({ sessionId: "ses_long", id: "nonce-a", filename });
+    const repeated = buildChatAttachmentInboxPath({ sessionId: "ses_long", id: "nonce-a", filename });
+    const second = buildChatAttachmentInboxPath({ sessionId: "ses_long", id: "nonce-b", filename });
+    const basename = first.split("/").pop();
+    if (!basename) throw new Error("Expected attachment basename");
+
+    expect(new TextEncoder().encode(basename).byteLength).toBe(255);
+    expect(basename.startsWith("nonce-a-")).toBe(true);
+    expect(basename.endsWith(".pdf")).toBe(true);
+    expect(first).toBe(repeated);
+    expect(first).not.toBe(second);
+  });
+
+  test("bounds long multibyte attachment names on UTF-8 character boundaries", () => {
+    const filename = `${"李".repeat(200)}.pdf`;
+    const path = buildChatAttachmentInboxPath({ sessionId: "ses_long", id: "nonce-a", filename });
+    const basename = path.split("/").pop();
+    if (!basename) throw new Error("Expected attachment basename");
+
+    expect(new TextEncoder().encode(basename).byteLength).toBe(255);
+    expect(basename.startsWith("nonce-a-")).toBe(true);
+    expect(basename.endsWith(".pdf")).toBe(true);
+    expect(basename).not.toContain("�");
   });
 
   test("uploads exact bytes to the endpoint workspace id and exposes a worker file URL plus path note", async () => {
     const { endpoint, calls } = uploadRecorder("server-workspace-42");
     const file = new File([PDF_BYTES], "image-only scan.pdf", { type: "application/pdf" });
 
-    const parts = await composerAttachmentsToWorkspaceFileParts({
+    const parts = await composerAttachmentsToExecutionFileParts({
       attachments: [attachmentFor(file)],
       endpoint,
       sessionId: "ses_abc",
-      workspaceRoot: "/workspaces/Worker Root",
       createId: () => "nonce-a",
     });
 
@@ -313,10 +342,11 @@ describe("composer attachment file parts", () => {
       type: "text",
       synthetic: true,
     });
-    expect(textPartText(parts).startsWith("Attached files were copied")).toBe(true);
-    expect(textPartText(parts)).toContain(".opencode/openwork/inbox/chat-attachments/ses_abc/nonce-a-image-only scan.pdf");
+    expect(textPartText(parts).startsWith("Attached files were copied into OpenWork's app-managed execution storage")).toBe(true);
+    expect(textPartText(parts)).toContain("/runtime/workspace-files/workspace-key/inbox/chat-attachments/ses_abc/nonce-a-image-only scan.pdf");
+    expect(textPartText(parts)).not.toContain(".opencode/openwork");
     expect(textPartText(parts)).toContain("Read/Bash/MCP/Docling");
-    expect(filePartUrl(parts, 1)).toBe("file:///workspaces/Worker%20Root/.opencode/openwork/inbox/chat-attachments/ses_abc/nonce-a-image-only%20scan.pdf");
+    expect(filePartUrl(parts, 1)).toBe("file:///runtime/workspace-files/workspace-key/inbox/chat-attachments/ses_abc/nonce-a-image-only%20scan.pdf");
     expect(parts[1]).toMatchObject({
       type: "file",
       filename: "image-only scan.pdf",
@@ -328,11 +358,10 @@ describe("composer attachment file parts", () => {
     const { endpoint, calls } = uploadRecorder("server-workspace-42");
     const file = new File([JPEG_BYTES], "shot.png", { type: "image/png" });
 
-    const parts = await composerAttachmentsToWorkspaceFileParts({
+    const parts = await composerAttachmentsToExecutionFileParts({
       attachments: [attachmentFor(file)],
       endpoint,
       sessionId: "ses_img",
-      workspaceRoot: "/workspaces/Worker Root",
       createId: () => "nonce-img",
     });
 
@@ -343,8 +372,9 @@ describe("composer attachment file parts", () => {
       bytes: Array.from(JPEG_BYTES),
     }]);
     expect(textPart(parts)).toMatchObject({ type: "text", synthetic: true });
-    expect(textPartText(parts)).toContain(".opencode/openwork/inbox/chat-attachments/ses_img/nonce-img-shot.png");
-    expect(textPartText(parts)).toContain("file:///workspaces/Worker%20Root/.opencode/openwork/inbox/chat-attachments/ses_img/nonce-img-shot.png");
+    expect(textPartText(parts)).toContain("/runtime/workspace-files/workspace-key/inbox/chat-attachments/ses_img/nonce-img-shot.png");
+    expect(textPartText(parts)).toContain("file:///runtime/workspace-files/workspace-key/inbox/chat-attachments/ses_img/nonce-img-shot.png");
+    expect(textPartText(parts)).not.toContain(".opencode/openwork");
     expect(filePartUrl(parts, 1).startsWith("data:image/png;base64,")).toBe(true);
     expect(Array.from(decodedDataUrlBytes(filePartUrl(parts, 1)))).toEqual(Array.from(JPEG_BYTES));
     expect(parts[1]).toMatchObject({
@@ -358,16 +388,15 @@ describe("composer attachment file parts", () => {
     const { endpoint, calls } = uploadRecorder("server-workspace-42");
     const file = new File(["<a/>"], "sitemap.xml", { type: "text/xml" });
 
-    const parts = await composerAttachmentsToWorkspaceFileParts({
+    const parts = await composerAttachmentsToExecutionFileParts({
       attachments: [attachmentFor(file)],
       endpoint,
       sessionId: "ses_xml",
-      workspaceRoot: "/workspaces/Worker Root",
       createId: () => "nonce-xml",
     });
 
     expect(calls).toHaveLength(1);
-    expect(filePartUrl(parts, 1)).toBe("file:///workspaces/Worker%20Root/.opencode/openwork/inbox/chat-attachments/ses_xml/nonce-xml-sitemap.xml");
+    expect(filePartUrl(parts, 1)).toBe("file:///runtime/workspace-files/workspace-key/inbox/chat-attachments/ses_xml/nonce-xml-sitemap.xml");
     expect(parts[1]).toMatchObject({
       type: "file",
       filename: "sitemap.xml",
@@ -379,11 +408,10 @@ describe("composer attachment file parts", () => {
     const { endpoint, calls } = uploadRecorder("server-workspace-42");
     const file = new File([PPTX_BYTES], "recording.zip", { type: "application/zip" });
 
-    const parts = await composerAttachmentsToWorkspaceFileParts({
+    const parts = await composerAttachmentsToExecutionFileParts({
       attachments: [attachmentFor(file)],
       endpoint,
       sessionId: "ses_bin",
-      workspaceRoot: "/workspaces/Worker Root",
       createId: () => "nonce-bin",
     });
 
@@ -394,11 +422,12 @@ describe("composer attachment file parts", () => {
       bytes: Array.from(PPTX_BYTES),
     }]);
     expect(textPart(parts)).toMatchObject({ type: "text", synthetic: true });
-    expect(textPartText(parts)).toContain(".opencode/openwork/inbox/chat-attachments/ses_bin/nonce-bin-recording.zip");
+    expect(textPartText(parts)).toContain("/runtime/workspace-files/workspace-key/inbox/chat-attachments/ses_bin/nonce-bin-recording.zip");
+    expect(textPartText(parts)).not.toContain(".opencode/openwork");
     expect(textPartText(parts)).toContain("Read/Bash/MCP/Docling");
     // text/plain file parts never reach the provider (opencode expands them
     // through the Read tool), so binaries keep a transcript badge safely.
-    expect(filePartUrl(parts, 1)).toBe("file:///workspaces/Worker%20Root/.opencode/openwork/inbox/chat-attachments/ses_bin/nonce-bin-recording.zip");
+    expect(filePartUrl(parts, 1)).toBe("file:///runtime/workspace-files/workspace-key/inbox/chat-attachments/ses_bin/nonce-bin-recording.zip");
     expect(parts[1]).toMatchObject({
       type: "file",
       filename: "recording.zip",
@@ -412,11 +441,10 @@ describe("composer attachment file parts", () => {
     const second = new File([PDF_BYTES], "scan.pdf", { type: "application/pdf" });
     const ids = ["nonce-a", "nonce-b"];
 
-    const parts = await composerAttachmentsToWorkspaceFileParts({
+    const parts = await composerAttachmentsToExecutionFileParts({
       attachments: [attachmentFor(first), attachmentFor(second)],
       endpoint,
       sessionId: "ses_dupes",
-      workspaceRoot: "C:\\Users\\Ada Lovelace\\工作区",
       createId: () => {
         const id = ids.shift();
         if (!id) throw new Error("missing nonce");
@@ -429,8 +457,8 @@ describe("composer attachment file parts", () => {
       "chat-attachments/ses_dupes/nonce-b-scan.pdf",
     ]);
     expect(new Set(calls.map((call) => call.path)).size).toBe(2);
-    expect(filePartUrl(parts, 1)).toBe("file:///C:/Users/Ada%20Lovelace/%E5%B7%A5%E4%BD%9C%E5%8C%BA/.opencode/openwork/inbox/chat-attachments/ses_dupes/nonce-a-scan.pdf");
-    expect(filePartUrl(parts, 2)).toBe("file:///C:/Users/Ada%20Lovelace/%E5%B7%A5%E4%BD%9C%E5%8C%BA/.opencode/openwork/inbox/chat-attachments/ses_dupes/nonce-b-scan.pdf");
+    expect(filePartUrl(parts, 1)).toBe("file:///runtime/workspace-files/workspace-key/inbox/chat-attachments/ses_dupes/nonce-a-scan.pdf");
+    expect(filePartUrl(parts, 2)).toBe("file:///runtime/workspace-files/workspace-key/inbox/chat-attachments/ses_dupes/nonce-b-scan.pdf");
   });
 
   test("fails before producing prompt parts when workspace upload fails", async () => {
@@ -444,13 +472,12 @@ describe("composer attachment file parts", () => {
     };
     const file = new File([PDF_BYTES], "scan.pdf", { type: "application/pdf" });
 
-    await expect(composerAttachmentsToWorkspaceFileParts({
+    await expect(composerAttachmentsToExecutionFileParts({
       attachments: [attachmentFor(file)],
       endpoint,
       sessionId: "ses_fail",
-      workspaceRoot: "/workspace/a",
       createId: () => "nonce-a",
-    })).rejects.toThrow("Failed to copy attachment \"scan.pdf\" into this worker workspace: disk full");
+    })).rejects.toThrow("Failed to copy attachment \"scan.pdf\" into OpenWork execution storage: disk full");
   });
 
   test("treats an ok:false upload result as a hard failure", async () => {
@@ -466,12 +493,11 @@ describe("composer attachment file parts", () => {
     };
     const file = new File([PDF_BYTES], "scan.pdf", { type: "application/pdf" });
 
-    await expect(composerAttachmentsToWorkspaceFileParts({
+    await expect(composerAttachmentsToExecutionFileParts({
       attachments: [attachmentFor(file)],
       endpoint,
       sessionId: "ses_rejected",
-      workspaceRoot: "/workspace/a",
       createId: () => "nonce-a",
-    })).rejects.toThrow("Failed to copy attachment \"scan.pdf\" into this worker workspace: upload was rejected");
+    })).rejects.toThrow("Failed to copy attachment \"scan.pdf\" into OpenWork execution storage: upload was rejected");
   });
 });

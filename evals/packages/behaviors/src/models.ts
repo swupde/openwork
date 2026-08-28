@@ -71,7 +71,7 @@ async function executeControl(app: Surface, action: string, args?: unknown): Pro
 }
 
 async function openModelPicker(app: Surface): Promise<void> {
-  const open = await evalIn(app, `Boolean(document.querySelector(${JSON.stringify(MODEL_SEARCH_INPUT)}))`);
+  const open = await evalIn(app, `Boolean(document.querySelector(${JSON.stringify(MODEL_SEARCH_INPUT)}))`).catch(() => false);
   if (open !== true) {
     await waitFor(app, `window.__openworkControl?.listActions().some((entry) => entry.id === "session.model_picker.open" && entry.disabled === false)`, {
       timeoutMs: 30_000,
@@ -111,19 +111,19 @@ export async function readAvailableModels(app: Surface): Promise<ModelFacts[]> {
     });
     for (const header of headers) {
       const group = header.parentElement?.parentElement;
-      if (group && !group.querySelector("span.font-mono")) header.click();
+      if (group && !group.querySelector("button[data-model-id]")) header.click();
     }
     return true;
   })()`);
   await waitFor(app, `(() => {
     const dialog = document.querySelector(${JSON.stringify(MODEL_DIALOG)});
-    return Boolean(dialog && (dialog.querySelector("span.font-mono") || dialog.innerText.includes("No models")));
+    return Boolean(dialog && (dialog.querySelector("button[data-model-id]") || dialog.innerText.includes("No models")));
   })()`, { timeoutMs: 30_000, label: "model rows or empty state" });
   const value = await evalIn(app, `(() => {
     const dialog = document.querySelector(${JSON.stringify(MODEL_DIALOG)});
     if (!dialog) return [];
     return [...dialog.querySelectorAll("button")].flatMap((button) => {
-      const id = button.querySelector("span.font-mono")?.textContent?.trim();
+      const id = button.getAttribute("data-model-id")?.trim();
       if (!id) return [];
       const spans = [...button.querySelectorAll("span")];
       const name = spans.find((span) => !span.classList.contains("font-mono"))?.textContent?.trim() ?? id;
@@ -145,24 +145,42 @@ export async function readAvailableModels(app: Surface): Promise<ModelFacts[]> {
   return parseModels(value);
 }
 
-export async function selectModel(app: Surface, name: string): Promise<ModelFacts> {
+export async function selectModel(app: Surface, name: string, options?: { provider?: string }): Promise<ModelFacts> {
   await openModelPicker(app);
   await fill(app, MODEL_SEARCH_INPUT, name);
   await waitFor(app, `(() => {
     const dialog = document.querySelector(${JSON.stringify(MODEL_DIALOG)});
+    const expectedProvider = ${JSON.stringify(options?.provider?.trim())};
     return [...(dialog?.querySelectorAll("button") ?? [])].some((button) => {
-      const id = button.querySelector("span.font-mono")?.textContent?.trim() ?? "";
-      return !button.disabled && (id === ${JSON.stringify(name)} || (button.textContent ?? "").includes(${JSON.stringify(name)}));
+      const id = button.getAttribute("data-model-id")?.trim() ?? "";
+      let group = button.parentElement;
+      while (group && !group.querySelector(':scope > div > button')) group = group.parentElement;
+      const providerHeader = group?.querySelector(':scope > div > button');
+      const providerName = providerHeader?.querySelector("span.text-dls-text")?.textContent?.trim()
+        ?? providerHeader?.textContent?.replace(/\\d+ models?.*$/, "").trim()
+        ?? "";
+      return !button.disabled
+        && (id === ${JSON.stringify(name)} || (button.textContent ?? "").includes(${JSON.stringify(name)}))
+        && (expectedProvider === undefined || providerName === expectedProvider);
     });
   })()`, { timeoutMs: 30_000, label: `selectable model ${name}` });
   const selected = await evalIn(app, `(() => {
     const dialog = document.querySelector(${JSON.stringify(MODEL_DIALOG)});
+    const expectedProvider = ${JSON.stringify(options?.provider?.trim())};
     const button = [...(dialog?.querySelectorAll("button") ?? [])].find((candidate) => {
-      const id = candidate.querySelector("span.font-mono")?.textContent?.trim() ?? "";
-      return !candidate.disabled && (id === ${JSON.stringify(name)} || (candidate.textContent ?? "").includes(${JSON.stringify(name)}));
+      const id = candidate.getAttribute("data-model-id")?.trim() ?? "";
+      let group = candidate.parentElement;
+      while (group && !group.querySelector(':scope > div > button')) group = group.parentElement;
+      const providerHeader = group?.querySelector(':scope > div > button');
+      const providerName = providerHeader?.querySelector("span.text-dls-text")?.textContent?.trim()
+        ?? providerHeader?.textContent?.replace(/\\d+ models?.*$/, "").trim()
+        ?? "";
+      return !candidate.disabled
+        && (id === ${JSON.stringify(name)} || (candidate.textContent ?? "").includes(${JSON.stringify(name)}))
+        && (expectedProvider === undefined || providerName === expectedProvider);
     });
     if (!button) return null;
-    const id = button.querySelector("span.font-mono")?.textContent?.trim() ?? "";
+    const id = button.getAttribute("data-model-id")?.trim() ?? "";
     const spans = [...button.querySelectorAll("span")];
     const title = spans.find((span) => !span.classList.contains("font-mono"))?.textContent?.trim() ?? id;
     let group = button.parentElement;

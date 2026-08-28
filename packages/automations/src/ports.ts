@@ -7,7 +7,7 @@ import type {
   AutomationRunEventType,
   AutomationRunReceipt,
   AutomationUsage,
-  CreateAutomation,
+  CreateAutomationDefinition,
   UpdateAutomation,
 } from "@openwork/types/automations"
 
@@ -29,7 +29,7 @@ export interface AutomationRepository {
   create(input: {
     organizationId: string
     ownerMemberId: string
-    definition: CreateAutomation
+    definition: CreateAutomationDefinition
     now: number
   }): Awaitable<AutomationListItem>
   update(input: {
@@ -78,6 +78,7 @@ export interface AutomationRepository {
     resultSummary: string | null
     usage: AutomationUsage
     error: AutomationError | null
+    engineReceipt?: Record<string, unknown> | null
     attempt?: number
     now: number
   }): Awaitable<AutomationRun>

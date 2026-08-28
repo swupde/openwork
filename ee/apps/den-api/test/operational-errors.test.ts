@@ -1,10 +1,94 @@
 import { expect, test } from "bun:test"
 import { Hono } from "hono"
+import { HTTPException } from "hono/http-exception"
 import { normalizeOperationalErrorResponse, operationalErrorResponse } from "../src/operational-errors.js"
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null
 }
+
+function operationalErrorApp(path: string, error: Error, requestId: string) {
+  const app = new Hono()
+  app.onError((safeError, c) => operationalErrorResponse(safeError, c, requestId))
+  app.get(path, () => {
+    throw error
+  })
+  return app
+}
+
+test("thrown MCP HTTPException preserves its response and gains a support reference", async () => {
+  const error = new HTTPException(404, {
+    res: new Response(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 7,
+      error: { code: -32000, message: "Unsupported protocol version" },
+    }), {
+      status: 404,
+      headers: { "content-type": "application/json" },
+    }),
+  })
+  const response = await operationalErrorApp("/mcp/agent", error, "req_mcp_404").request("/mcp/agent")
+
+  expect(response.status).toBe(404)
+  const body: unknown = await response.json()
+  expect(body).toMatchObject({
+    jsonrpc: "2.0",
+    id: 7,
+    error: {
+      code: -32000,
+      message: "Unsupported protocol version",
+      data: { referenceId: "req_mcp_404" },
+    },
+  })
+})
+
+test("thrown plain MCP errors remain sanitized 500 responses", async () => {
+  const response = await operationalErrorApp(
+    "/mcp/agent",
+    new Error("provider secret must not escape"),
+    "req_mcp_500",
+  ).request("/mcp/agent")
+
+  expect(response.status).toBe(500)
+  const body: unknown = await response.json()
+  expect(body).toEqual({
+    error: "internal_server_error",
+    message: "An unexpected server error occurred.",
+    referenceId: "req_mcp_500",
+  })
+  expect(JSON.stringify(body)).not.toContain("provider secret")
+})
+
+test("thrown OAuth HTTPException preserves status, fields, headers, and gains a support reference", async () => {
+  const error = new HTTPException(401, {
+    res: new Response(JSON.stringify({
+      error: "invalid_client",
+      error_description: "Client authentication failed.",
+    }), {
+      status: 401,
+      headers: {
+        "content-type": "application/json",
+        "www-authenticate": "Basic realm=oauth",
+      },
+    }),
+  })
+  const response = await operationalErrorApp(
+    "/api/auth/oauth2/token",
+    error,
+    "req_oauth_401",
+  ).request("/api/auth/oauth2/token")
+
+  expect(response.status).toBe(401)
+  expect(response.headers.get("Cache-Control")).toBe("no-store")
+  expect(response.headers.get("Pragma")).toBe("no-cache")
+  expect(response.headers.get("www-authenticate")).toBe("Basic realm=oauth")
+  const body: unknown = await response.json()
+  expect(body).toEqual({
+    error: "invalid_client",
+    error_description: "Client authentication failed.",
+    reference_id: "req_oauth_401",
+  })
+})
 
 test("OAuth token errors include cache headers and a support reference", async () => {
   const response = await normalizeOperationalErrorResponse(
@@ -18,7 +102,7 @@ test("OAuth token errors include cache headers and a support reference", async (
 
   expect(response.headers.get("Cache-Control")).toBe("no-store")
   expect(response.headers.get("Pragma")).toBe("no-cache")
-  expect(response.headers.get("X-Request-Id")).toBe("req_oauth_token")
+  expect(response.headers.get("X-Request-Id")).toBeNull()
   const body: unknown = await response.json()
   expect(isRecord(body) && body.reference_id).toBe("req_oauth_token")
 })
@@ -52,7 +136,7 @@ test("OAuth text/plain JSON 429 errors are parsed and normalized", async () => {
   expect(response.headers.get("Cache-Control")).toBe("no-store")
   expect(response.headers.get("Pragma")).toBe("no-cache")
   expect(response.headers.get("Retry-After")).toBe("23")
-  expect(response.headers.get("X-Request-Id")).toBe("req_text_plain_rate_limit")
+  expect(response.headers.get("X-Request-Id")).toBeNull()
 
   const body: unknown = await response.json()
   expect(body).toMatchObject({
@@ -102,7 +186,7 @@ test("streaming non-JSON MCP errors keep their body and content type", async () 
   )
 
   expect(response.headers.get("content-type")).toBe("text/event-stream")
-  expect(response.headers.get("X-Request-Id")).toBe("req_mcp_stream")
+  expect(response.headers.get("X-Request-Id")).toBeNull()
   await expect(response.text()).resolves.toBe("data: retry\n\n")
 })
 
@@ -123,7 +207,7 @@ test("streaming non-JSON MCP errors are not parsed as JSON", async () => {
   expect(result).toBeInstanceOf(Response)
   if (result instanceof Response) {
     expect(result.headers.get("content-type")).toBe("text/event-stream")
-    expect(result.headers.get("X-Request-Id")).toBe("req_mcp_pending_stream")
+    expect(result.headers.get("X-Request-Id")).toBeNull()
   }
 })
 
@@ -144,7 +228,7 @@ test("streaming JSON-seq MCP errors are not buffered as finite JSON", async () =
   expect(result).toBeInstanceOf(Response)
   if (result instanceof Response) {
     expect(result.headers.get("content-type")).toBe("application/json-seq")
-    expect(result.headers.get("X-Request-Id")).toBe("req_mcp_json_seq")
+    expect(result.headers.get("X-Request-Id")).toBeNull()
   }
 })
 
@@ -165,7 +249,7 @@ test("streaming stream+json MCP errors are not buffered as finite JSON", async (
   expect(result).toBeInstanceOf(Response)
   if (result instanceof Response) {
     expect(result.headers.get("content-type")).toBe("application/stream+json")
-    expect(result.headers.get("X-Request-Id")).toBe("req_mcp_stream_json")
+    expect(result.headers.get("X-Request-Id")).toBeNull()
   }
 })
 
@@ -189,7 +273,7 @@ test("operational route error logging omits provider-controlled exception text",
     expect(response.status).toBe(500)
     expect(response.headers.get("Cache-Control")).toBe("no-store")
     expect(response.headers.get("Pragma")).toBe("no-cache")
-    expect(response.headers.get("X-Request-Id")).toBe("req_safe_log")
+    expect(response.headers.get("X-Request-Id")).toBeNull()
     const body: unknown = await response.json()
     expect(body).toMatchObject({
       error: "server_error",

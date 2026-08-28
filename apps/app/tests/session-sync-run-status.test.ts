@@ -12,6 +12,7 @@ import {
   ensureWorkspaceSessionSync,
   markSessionSnapshotFetchStart,
   seedSessionState,
+  snapshotKey,
   statusKey,
   trackWorkspaceSessionSync,
 } from "../src/react-app/domains/session/sync/session-sync";
@@ -112,6 +113,43 @@ afterEach(() => {
 });
 
 describe("session run status ordering", () => {
+  test("does not publish duplicate activity observations", () => {
+    useSessionActivityStore.getState().setRunStatus(workspaceId, sessionId, { type: "busy" });
+    useSessionActivityStore.getState().markMessageRole(workspaceId, sessionId, "assistant-1", "assistant");
+    useSessionActivityStore.getState().markAssistantOutput(workspaceId, sessionId, "assistant-1");
+    const before = useSessionActivityStore.getState().recordsByWorkspaceId[workspaceId]?.[sessionId];
+    let notifications = 0;
+    const unsubscribe = useSessionActivityStore.subscribe(() => {
+      notifications += 1;
+    });
+
+    useSessionActivityStore.getState().markMessageRole(workspaceId, sessionId, "assistant-1", "assistant");
+    useSessionActivityStore.getState().markAssistantOutput(workspaceId, sessionId, "assistant-1");
+    useSessionActivityStore.getState().replaceWaitingRequests(workspaceId, sessionId, "permission", []);
+    useSessionActivityStore.getState().clearError(workspaceId, sessionId);
+    useSessionActivityStore.getState().setCompacting(workspaceId, sessionId, false);
+
+    unsubscribe();
+    expect(useSessionActivityStore.getState().recordsByWorkspaceId[workspaceId]?.[sessionId]).toBe(before);
+    expect(notifications).toBe(0);
+  });
+
+  test("invalidates the durable snapshot when a tracked run becomes idle", () => {
+    const { input, cleanup, releaseSession } = createTestSync();
+    const queryClient = getReactQueryClient();
+    queryClient.setQueryData(snapshotKey(workspaceId, sessionId), createSnapshot({ type: "busy" }));
+
+    __applySessionSyncEventForTest(input, {
+      type: "session.idle",
+      properties: { sessionID: sessionId },
+    });
+
+    expect(queryClient.getQueryState(snapshotKey(workspaceId, sessionId))?.isInvalidated).toBe(true);
+
+    releaseSession();
+    cleanup();
+  });
+
   test("does not resurrect a finished run from a stale busy snapshot", () => {
     const { input, cleanup, releaseSession } = createTestSync();
     const snapshot = createSnapshot({ type: "busy" });
@@ -194,6 +232,46 @@ describe("session run status ordering", () => {
 });
 
 describe("session run status reconnect reconciliation", () => {
+  test("seeds a missed busy edge into the status cache on connect", async () => {
+    __setWorkspaceSessionSyncSubscriptionFactoryForTest(createSubscription);
+    __setWorkspaceSessionSyncStatusFetcherForTest(async () => ({ [sessionId]: { type: "busy" } }));
+    setSystemTime(100);
+    const input = createSyncInput();
+    ensureWorkspaceSessionSync(input);
+    const releaseSession = trackWorkspaceSessionSync(input, sessionId);
+    await waitForSubscriptions(1);
+    await flushMicrotasks();
+
+    expect(useSessionActivityStore.getState().recordsByWorkspaceId[workspaceId]?.[sessionId]?.status).toBe("thinking");
+    expect(getReactQueryClient().getQueryData(statusKey(workspaceId, sessionId))).toEqual({ type: "busy" });
+
+    releaseSession();
+  });
+
+  test("does not clobber a newer live status with a stale reconnect fetch", async () => {
+    __setWorkspaceSessionSyncSubscriptionFactoryForTest(createSubscription);
+    let resolveStatuses: (statuses: Record<string, SessionStatus>) => void = () => {};
+    __setWorkspaceSessionSyncStatusFetcherForTest(() => new Promise((resolve) => {
+      resolveStatuses = resolve;
+    }));
+    setSystemTime(100);
+    const input = createSyncInput();
+    ensureWorkspaceSessionSync(input);
+    const releaseSession = trackWorkspaceSessionSync(input, sessionId);
+    await waitForSubscriptions(1);
+    await flushMicrotasks();
+
+    setSystemTime(200);
+    applyStatus(input, { type: "busy" });
+    resolveStatuses({});
+    await flushMicrotasks();
+
+    expect(useSessionActivityStore.getState().recordsByWorkspaceId[workspaceId]?.[sessionId]?.runActive).toBe(true);
+    expect(getReactQueryClient().getQueryData(statusKey(workspaceId, sessionId))).toEqual({ type: "busy" });
+
+    releaseSession();
+  });
+
   test("heals an active record when a reconnect reports no active run", async () => {
     __setWorkspaceSessionSyncSubscriptionFactoryForTest(createSubscription);
     __setWorkspaceSessionSyncStatusFetcherForTest(async () => ({}));

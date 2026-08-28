@@ -3,12 +3,13 @@
 // normalization/discovery, and the workspace-facing command operations.
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
   desktopBootstrapPath as resolveDesktopBootstrapPath,
   legacyDesktopBootstrapPath as resolveLegacyDesktopBootstrapPath,
+  normalizeWorkspaceRootPath,
   openworkServerConfigPath as resolveOpenworkServerConfigPath,
 } from "@openwork/paths";
 
@@ -115,8 +116,6 @@ const DEFAULT_DESKTOP_BOOTSTRAP_PATH = resolveDesktopBootstrapPath({ homeDir: os
 // LOCALAPPDATA and XDG_CONFIG_HOME. Keep reading that file when the canonical one
 // is missing so existing installs keep their deployment config.
 const LEGACY_DESKTOP_BOOTSTRAP_PATH = resolveLegacyDesktopBootstrapPath({ homeDir: os.homedir() });
-const DESKTOP_BOOTSTRAP_FILENAME = "desktop-bootstrap.json";
-const STANDARD_DESKTOP_INSTALLER_PATTERN = /^openwork-(?:mac-(?:arm64|x64)-.+\.dmg|win-x64-.+\.exe)$/i;
 const HOSTED_DESKTOP_WEB_URL = "https://app.openworklabs.com";
 const HOSTED_DESKTOP_API_URL = "https://api.openworklabs.com";
 
@@ -167,10 +166,14 @@ export function createWorkspaceStore({
   }
 
   function workspaceStatePath() {
+    const override = process.env.OPENWORK_DESKTOP_WORKSPACE_STATE_PATH?.trim();
+    if (override) return path.resolve(override);
     return path.join(app.getPath("userData"), "openwork-workspaces.json");
   }
 
   function openworkServerTokenStorePath() {
+    const override = process.env.OPENWORK_SERVER_TOKEN_STORE_PATH?.trim();
+    if (override) return path.resolve(override);
     return path.join(app.getPath("userData"), "openwork-server-tokens.json");
   }
 
@@ -400,81 +403,6 @@ export function createWorkspaceStore({
     }
   }
 
-  function bundleSearchRoots() {
-    const roots = [];
-    const override = process.env.OPENWORK_BOOTSTRAP_BUNDLE_DIR?.trim();
-    if (override) roots.push(path.resolve(override));
-    for (const name of ["downloads", "desktop"]) {
-      try {
-        const candidate = app.getPath(name);
-        if (candidate) roots.push(candidate);
-      } catch {
-        // Electron can omit a shell path in constrained environments.
-      }
-    }
-    return Array.from(new Set(roots));
-  }
-
-  async function directoryContainsStandardDesktopInstaller(directory) {
-    try {
-      const entries = await readdir(directory, { withFileTypes: true });
-      return entries.some((entry) => entry.isFile() && STANDARD_DESKTOP_INSTALLER_PATTERN.test(entry.name));
-    } catch {
-      return false;
-    }
-  }
-
-  async function bundledDesktopBootstrapPaths() {
-    const candidates = [];
-    for (const root of bundleSearchRoots()) {
-      candidates.push(path.join(root, DESKTOP_BOOTSTRAP_FILENAME));
-      try {
-        const entries = await readdir(root, { withFileTypes: true });
-        for (const entry of entries) {
-          if (entry.isDirectory()) {
-            candidates.push(path.join(root, entry.name, DESKTOP_BOOTSTRAP_FILENAME));
-          }
-        }
-      } catch {
-        // A missing Downloads/Desktop directory is normal in headless runs.
-      }
-    }
-    return Array.from(new Set(candidates));
-  }
-
-  async function importBundledDesktopBootstrapConfigIfPreferred() {
-    const configPath = desktopBootstrapPath();
-    const primary = await readDesktopBootstrapCandidate(configPath);
-    const legacyPath = legacyDesktopBootstrapPath();
-    const legacy = legacyPath ? await readDesktopBootstrapCandidate(legacyPath) : null;
-    const installedCandidates = [primary, legacy].filter((candidate) => candidate?.ok);
-    installedCandidates.sort((left, right) => compareDesktopBootstrapCandidates(right, left));
-    const installed = installedCandidates[0];
-    if (installed && !isHostedDesktopBootstrapConfig(installed.normalized)) return false;
-
-    const bundledCandidates = [];
-    for (const candidatePath of await bundledDesktopBootstrapPaths()) {
-      if (!(await directoryContainsStandardDesktopInstaller(path.dirname(candidatePath)))) continue;
-      const candidate = await readDesktopBootstrapCandidate(candidatePath);
-      if (candidate.ok) bundledCandidates.push(candidate);
-    }
-    bundledCandidates.sort((left, right) => compareDesktopBootstrapCandidates(right, left));
-    const newest = bundledCandidates[0];
-    if (!newest || (installed && compareDesktopBootstrapCandidates(newest, installed) <= 0)) return false;
-
-    try {
-      await writeJsonFileAtomic(configPath, newest.normalized);
-      console.info("[desktop-bootstrap] imported organization download bundle", {
-        from: newest.path,
-        to: configPath,
-      });
-      return true;
-    } catch (error) {
-      console.warn("[desktop-bootstrap] organization download import failed", error);
-      return false;
-    }
-  }
-
   async function getDesktopBootstrapConfig() {
     const configPath = desktopBootstrapPath();
     const primary = await readDesktopBootstrapCandidate(configPath);
@@ -602,25 +530,26 @@ export function createWorkspaceStore({
       : trimmed.startsWith("~/") || trimmed.startsWith("~\\")
         ? path.join(os.homedir(), trimmed.slice(2))
         : trimmed;
-    const resolved = path.resolve(expanded);
+    const normalized = normalizeWorkspaceRootPath(expanded, { platform: process.platform });
+    const resolved = path.resolve(normalized);
     return realpath(resolved).catch(() => resolved);
   }
 
   function normalizeWorkspacePathKey(value) {
-    const trimmed = String(value ?? "").trim();
-    return trimmed ? path.resolve(trimmed).replace(/\\/g, "/").toLowerCase() : "";
+    try {
+      const normalized = normalizeWorkspaceRootPath(value, { platform: process.platform });
+      return normalized ? path.resolve(normalized).replace(/\\/g, "/").toLowerCase() : "";
+    } catch {
+      return "";
+    }
   }
 
   function normalizeRecoveredWorkspacePath(value) {
-    const trimmed = String(value ?? "").trim();
-    if (!trimmed) return "";
-    if (process.platform !== "win32") return trimmed;
-    return trimmed
-      .replace(/^\\\\\?\\UNC\\/i, "\\\\")
-      .replace(/^\\\\\?\\/i, "")
-      .replace(/^\/\/\?\/UNC\//i, "//")
-      .replace(/^\/\/\?\//i, "")
-      .replace(/\//g, "\\");
+    try {
+      return normalizeWorkspaceRootPath(value, { platform: process.platform });
+    } catch {
+      return "";
+    }
   }
 
   function isRecord(value) {
@@ -999,6 +928,21 @@ export function createWorkspaceStore({
       .filter(Boolean);
   }
 
+  // Binary transfers must derive authority only from app-owned state in
+  // userData, never from workspace-writable configuration, so this list is
+  // intentionally not exposed to that surface (see listLocalWorkspacePaths).
+  async function listRemoteWorkspaceUrlPrefixes() {
+    const prefixes = new Set();
+    for (const workspace of (await readWorkspaceState()).workspaces) {
+      if (workspace?.workspaceType !== "remote") continue;
+      for (const value of [workspace.baseUrl, workspace.openworkHostUrl]) {
+        const raw = typeof value === "string" ? value.trim() : "";
+        if (raw) prefixes.add(raw);
+      }
+    }
+    return [...prefixes];
+  }
+
   function workspacePathKey(workspace) {
     return normalizeWorkspacePathKey(workspace.path);
   }
@@ -1289,8 +1233,8 @@ export function createWorkspaceStore({
     forgetWorkspace,
     getDesktopBootstrapConfig,
     importConfig,
-    importBundledDesktopBootstrapConfigIfPreferred,
     listLocalWorkspacePaths,
+    listRemoteWorkspaceUrlPrefixes,
     migrateLegacyElectronWorkspaceStateIfNeeded,
     readDesktopBootstrapConfigSync,
     readWorkspaceOpenworkConfig,

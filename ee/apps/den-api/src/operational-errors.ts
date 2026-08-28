@@ -1,4 +1,5 @@
 import type { Context } from "hono"
+import { HTTPException } from "hono/http-exception"
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null
@@ -111,8 +112,7 @@ function normalizeRetryAfter(headers: Headers, status: number) {
   if (retryAfter) headers.set("Retry-After", retryAfter)
 }
 
-function normalizeOperationalHeaders(headers: Headers, path: string, status: number, requestId: string) {
-  headers.set("X-Request-Id", requestId)
+function normalizeOperationalHeaders(headers: Headers, path: string, status: number) {
   normalizeRetryAfter(headers, status)
   if (isOAuthOperationalPath(path)) {
     headers.set("Cache-Control", "no-store")
@@ -131,7 +131,7 @@ export async function normalizeOperationalErrorResponse(path: string, response: 
   }
 
   const headers = new Headers(response.headers)
-  normalizeOperationalHeaders(headers, path, response.status, requestId)
+  normalizeOperationalHeaders(headers, path, response.status)
   const jsonBody = await readOperationalJsonBody(path, response, headers)
   if (jsonBody === null) {
     return new Response(response.body, {
@@ -150,11 +150,15 @@ export async function normalizeOperationalErrorResponse(path: string, response: 
   })
 }
 
-export function operationalErrorResponse(error: Error, c: Context, requestId: string) {
+export async function operationalErrorResponse(error: Error, c: Context, requestId: string) {
   const path = c.req.path
   if (!isOperationalErrorPath(path)) {
     console.error(error)
     return new Response("Internal Server Error", { status: 500 })
+  }
+
+  if (error instanceof HTTPException) {
+    return normalizeOperationalErrorResponse(path, error.getResponse(), requestId)
   }
 
   console.error("[operational_error]", {
@@ -166,7 +170,6 @@ export function operationalErrorResponse(error: Error, c: Context, requestId: st
 
   const headers = new Headers({
     "content-type": "application/json",
-    "X-Request-Id": requestId,
   })
   if (isOAuthOperationalPath(path)) {
     headers.set("Cache-Control", "no-store")

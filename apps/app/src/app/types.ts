@@ -134,6 +134,8 @@ export type ComposerDraft = {
   resolvedText?: string;
   /** When set, draft is a slash command invocation */
   command?: { name: string; arguments: string } | undefined;
+  /** User-message boundary to revert immediately before this draft is sent. */
+  revertMessageId?: string | undefined;
 };
 
 export type ArtifactItem = {
@@ -325,6 +327,16 @@ export type McpServerConfig = {
   timeout?: number;
 };
 
+export type ManagedMcpOAuthConnection = {
+  name: string;
+  serverUrl: string;
+  enabled: boolean;
+  status: "needs_auth" | "connecting" | "connected" | "reconnect_required";
+  lastError: string | null;
+  hasCredential: boolean;
+  updatedAt: number;
+};
+
 export type McpServerEntry = {
   id?: string;
   name: string;
@@ -334,6 +346,9 @@ export type McpServerEntry = {
   marketplaceName?: string;
   pluginName?: string;
   connectCapabilityName?: string;
+  /** Den organization connection this MCP is backed by, when sign-in is member-owned. */
+  orgMcpConnectionId?: string;
+  managedOAuth?: ManagedMcpOAuthConnection | null;
 };
 
 export type McpStatus =
@@ -341,6 +356,7 @@ export type McpStatus =
   | { status: "disabled" }
   | { status: "failed"; error: string }
   | { status: "needs_auth" }
+  | { status: "reconnect_required" }
   | { status: "needs_client_registration"; error: string };
 
 export type McpStatusMap = Record<string, McpStatus>;
@@ -399,6 +415,20 @@ export type ModelBehaviorOption = {
   description: string;
 };
 
+export type ModelWorkPolicy = {
+  alias: string;
+  dataContexts: Array<"internal" | "client">;
+  deployment?: {
+    provider: "bedrock" | "vertex";
+    region: string;
+    inferenceMode?: string;
+    providerModelId?: string;
+  };
+  verification?:
+    | { status: "required"; verifiedAt: null; evidenceRef: null }
+    | { status: "verified"; verifiedAt: string; evidenceRef: string };
+};
+
 export type ModelOption = {
   providerID: string;
   modelID: string;
@@ -415,6 +445,8 @@ export type ModelOption = {
   isRecommended?: boolean;
   /** "cloud" for org-managed providers (lpr_*), undefined for local. */
   source?: "cloud";
+  /** UI-only model guidance and data-boundary metadata from model.config.openwork. */
+  workPolicy?: ModelWorkPolicy;
 };
 
 export type SelectedSessionSnapshot = {
