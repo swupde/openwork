@@ -85,7 +85,7 @@ concurrency:
 jobs:
   resolve-production:
     name: Resolve Release Metadata
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     # WARDEN_PRIVATE_KEY lives in this environment; its deployment policy
     # (dev + v* tags) means the key is only reachable from reviewed code —
     # a feature-branch workflow edit cannot mint the tag-push token.
@@ -376,7 +376,7 @@ jobs:
   resolve-benchmark:
     name: Resolve Benchmark Metadata
     if: github.event.inputs.benchmark_only == 'true'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       release_tag: ${{ steps.resolve.outputs.release_tag }}
       release_version: ${{ steps.resolve.outputs.release_version }}
@@ -413,7 +413,7 @@ jobs:
     if: |
       always() &&
       (needs.resolve-production.result == 'success' || needs.resolve-benchmark.result == 'success')
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       release_tag: ${{ needs.resolve-production.outputs.release_tag || needs.resolve-benchmark.outputs.release_tag }}
       release_version: ${{ needs.resolve-production.outputs.release_version || needs.resolve-benchmark.outputs.release_version }}
@@ -435,7 +435,7 @@ jobs:
     # implicit success() check so that skipped sibling does not propagate
     # through the selected release context and suppress verification.
     if: always() && needs.resolve-release.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     env:
       RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
       RELEASE_MODE: ${{ needs.resolve-release.outputs.release_mode }}
@@ -991,7 +991,7 @@ jobs:
       (needs.resolve-release.outputs.build_electron != 'true' || needs.publish-electron-windows.result == 'success') &&
       (needs.publish-npm.result == 'success' || needs.publish-npm.result == 'skipped') &&
       needs.publish-daytona-snapshot.result != 'cancelled'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     env:
       RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
       RELEASE_PRERELEASE: ${{ needs.resolve-release.outputs.prerelease }}
@@ -1052,7 +1052,7 @@ jobs:
       needs.verify-release.result == 'success' &&
       needs.resolve-release.outputs.benchmark_only != 'true' &&
       needs.resolve-release.outputs.publish_npm == 'true'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       publish_server: ${{ steps.npm-versions.outputs.publish_server }}
     env:
@@ -1201,7 +1201,7 @@ jobs:
     # Outages there (e.g. "The AUR is down due to maintenance", 2026-08-04)
     # must not mark an otherwise-published release run as failed.
     continue-on-error: true
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       contents: read
     env:

@@ -17,13 +17,6 @@ import {
   stableVersion,
   verifyCachedRecoveryArtifact,
 } from "./recovery.mjs";
-import {
-  DEFAULT_RELEASE_REPOSITORY,
-  githubReleaseBaseUrl,
-  normalizeReleaseRepository,
-} from "./release-repository.mjs";
-
-export { normalizeReleaseRepository } from "./release-repository.mjs";
 
 const ELECTRON_UPDATER_CHANNEL_FILENAME = "electron-updater-channel.v1.json";
 
@@ -50,6 +43,11 @@ function resolveAppVersion(app) {
   }
   return _cachedAppVersion;
 }
+const ELECTRON_UPDATER_FEEDS = Object.freeze({
+  stable: "https://github.com/different-ai/openwork/releases/latest/download",
+  alpha: "https://github.com/different-ai/openwork/releases/download/alpha-macos-latest",
+});
+
 function normalizeElectronUpdaterChannel(value, manifestChannel = "latest") {
   if (manifestChannel !== "latest") return "stable";
   if (value === "alpha" && process.platform === "darwin") return "alpha";
@@ -82,10 +80,8 @@ async function writeElectronUpdaterChannel(app, channel, manifestChannel = "late
   return normalized;
 }
 
-function electronUpdaterFeedUrl(channel, manifestChannel = "latest", releaseRepository) {
-  return normalizeElectronUpdaterChannel(channel, manifestChannel) === "alpha"
-    ? githubReleaseBaseUrl(releaseRepository, "download/alpha-macos-latest")
-    : githubReleaseBaseUrl(releaseRepository);
+function electronUpdaterFeedUrl(channel, manifestChannel = "latest") {
+  return ELECTRON_UPDATER_FEEDS[normalizeElectronUpdaterChannel(channel, manifestChannel)];
 }
 
 function normalizeStableTargetVersion(value) {
@@ -166,12 +162,7 @@ function isVersionNewer(candidate, current) {
   return comparison === null ? candidate !== current : comparison > 0;
 }
 
-export function targetedStableUpdaterFeed(
-  currentVersion,
-  targetVersion,
-  allowOlder = false,
-  releaseRepository,
-) {
+export function targetedStableUpdaterFeed(currentVersion, targetVersion, allowOlder = false) {
   const normalizedTarget = normalizeStableTargetVersion(targetVersion);
   if (!normalizedTarget) {
     throw new Error("Target update version must use the stable x.y.z format.");
@@ -185,23 +176,17 @@ export function targetedStableUpdaterFeed(
       ? "Recovery target version must differ from the installed version."
       : "Target update version must be newer than the installed version.");
   }
-  return githubReleaseBaseUrl(releaseRepository, `download/v${normalizedTarget}`);
+  return `https://github.com/different-ai/openwork/releases/download/v${normalizedTarget}`;
 }
 
-function updaterChannelState(
-  app,
-  channel,
-  targetVersion = null,
-  manifestChannel = "latest",
-  releaseRepository,
-) {
+function updaterChannelState(app, channel, targetVersion = null, manifestChannel = "latest") {
   const normalized = normalizeElectronUpdaterChannel(channel, manifestChannel);
   const currentVersion = resolveAppVersion(app);
   return {
     channel: normalized,
     feedUrl: targetVersion
-      ? targetedStableUpdaterFeed(currentVersion, targetVersion, false, releaseRepository)
-      : electronUpdaterFeedUrl(normalized, manifestChannel, releaseRepository),
+      ? targetedStableUpdaterFeed(currentVersion, targetVersion)
+      : electronUpdaterFeedUrl(normalized, manifestChannel),
     currentVersion,
   };
 }
@@ -213,7 +198,6 @@ async function applyElectronUpdaterFeed(
   manifestChannel = "latest",
   allowOlder = false,
   channelOverride,
-  releaseRepository,
 ) {
   const channel = channelOverride === undefined
     ? await readElectronUpdaterChannel(app, manifestChannel)
@@ -225,10 +209,10 @@ async function applyElectronUpdaterFeed(
   const state = targetVersion
     ? {
         channel,
-        feedUrl: targetedStableUpdaterFeed(currentVersion, targetVersion, allowOlder, releaseRepository),
+        feedUrl: targetedStableUpdaterFeed(currentVersion, targetVersion, allowOlder),
         currentVersion,
       }
-    : updaterChannelState(app, channel, null, manifestChannel, releaseRepository);
+    : updaterChannelState(app, channel, null, manifestChannel);
   updater.allowPrerelease = state.channel === "alpha";
   // Moving from alpha back to stable can be a semver downgrade; still show
   // the latest stable so users can return to the stable channel deliberately.
@@ -318,10 +302,8 @@ export function registerUpdaterIpc({
   distribution = "public",
   platform = process.platform,
   arch = process.arch,
-  releaseRepository = DEFAULT_RELEASE_REPOSITORY,
   env = process.env,
 }) {
-  const normalizedReleaseRepository = normalizeReleaseRepository(releaseRepository);
   let autoUpdaterInstance = null;
   let autoUpdaterLoadPromise = null;
   let checkedUpdateVersion = null;
@@ -388,15 +370,7 @@ export function registerUpdaterIpc({
                 delta: info.delta ?? 0,
               });
             });
-            await applyElectronUpdaterFeed(
-              app,
-              autoUpdaterInstance,
-              null,
-              manifestChannel,
-              false,
-              undefined,
-              normalizedReleaseRepository,
-            );
+            await applyElectronUpdaterFeed(app, autoUpdaterInstance, null, manifestChannel);
           }
         } catch (error) {
           console.warn("[updater] electron-updater not available", error);
@@ -411,7 +385,7 @@ export function registerUpdaterIpc({
   async function resolveRecoveryArtifact(version) {
     if (!electronNet?.fetch) return null;
     try {
-      const manifestUrl = `${githubReleaseBaseUrl(normalizedReleaseRepository, `download/v${version}`)}/${recoveryManifestName(platform, arch, distribution)}`;
+      const manifestUrl = `https://github.com/different-ai/openwork/releases/download/v${version}/${recoveryManifestName(platform, arch, distribution)}`;
       const response = await electronNet.fetch(manifestUrl, { headers: { Accept: "text/yaml, text/plain, */*" } });
       if (!response.ok) return null;
       return selectRecoveryArtifact(parseRecoveryManifest(await response.text()), {
@@ -419,7 +393,6 @@ export function registerUpdaterIpc({
         platform,
         arch,
         distribution,
-        releaseRepository: normalizedReleaseRepository,
       });
     } catch {
       return null;
@@ -572,15 +545,7 @@ export function registerUpdaterIpc({
     const updater = await ensureAutoUpdater();
     if (updater && app.isPackaged) {
       try {
-        await applyElectronUpdaterFeed(
-          app,
-          updater,
-          release.version,
-          manifestChannel,
-          true,
-          undefined,
-          normalizedReleaseRepository,
-        );
+        await applyElectronUpdaterFeed(app, updater, release.version, manifestChannel, true);
         const result = await updater.checkForUpdates();
         if (compareVersions(result?.updateInfo?.version ?? "", release.version) !== 0) {
           throw new Error("Recovery manifest resolved to a different version.");
@@ -631,7 +596,7 @@ export function registerUpdaterIpc({
 
   ipcMain.handle("openwork:updater:getChannel", async () => queueUpdaterOperation(async () => {
     const channel = await readElectronUpdaterChannel(app, manifestChannel);
-    return updaterChannelState(app, channel, null, manifestChannel, normalizedReleaseRepository);
+    return updaterChannelState(app, channel, null, manifestChannel);
   }));
 
   ipcMain.handle("openwork:updater:setChannel", async (_event, rawChannel) => queueUpdaterOperation(async () => {
@@ -646,17 +611,9 @@ export function registerUpdaterIpc({
       // also prevents an Alpha build from installing automatically on quit
       // after an organization policy moves the desktop back to Stable.
       preventPendingUpdaterInstall(updater);
-      return applyElectronUpdaterFeed(
-        app,
-        updater,
-        null,
-        manifestChannel,
-        false,
-        channel,
-        normalizedReleaseRepository,
-      );
+      return applyElectronUpdaterFeed(app, updater, null, manifestChannel, false, channel);
     }
-    return updaterChannelState(app, channel, null, manifestChannel, normalizedReleaseRepository);
+    return updaterChannelState(app, channel, null, manifestChannel);
   }));
 
   ipcMain.handle("openwork:updater:check", async (_event, rawChannel, rawTargetVersion) => queueUpdaterOperation(async () => {
@@ -674,22 +631,8 @@ export function registerUpdaterIpc({
         throw new Error("Target update version must use the stable x.y.z format.");
       }
       const channelState = updater
-        ? await applyElectronUpdaterFeed(
-            app,
-            updater,
-            targetVersion,
-            manifestChannel,
-            false,
-            channel,
-            normalizedReleaseRepository,
-          )
-        : updaterChannelState(
-            app,
-            channel,
-            targetVersion,
-            manifestChannel,
-            normalizedReleaseRepository,
-          );
+        ? await applyElectronUpdaterFeed(app, updater, targetVersion, manifestChannel, false, channel)
+        : updaterChannelState(app, channel, targetVersion, manifestChannel);
       if (!updater) return { available: false, reason: "unavailable", ...channelState };
 
       const result = await updater.checkForUpdates();
@@ -724,7 +667,6 @@ export function registerUpdaterIpc({
           channel,
           null,
           manifestChannel,
-          normalizedReleaseRepository,
         ),
       };
     }
@@ -741,7 +683,6 @@ export function registerUpdaterIpc({
         manifestChannel,
         false,
         checkedUpdateChannel ?? undefined,
-        normalizedReleaseRepository,
       );
       const currentVersion = resolveAppVersion(app);
       if (!checkedUpdateVersion || !isVersionNewer(checkedUpdateVersion, currentVersion)) {

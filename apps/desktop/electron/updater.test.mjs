@@ -7,7 +7,6 @@ import os from "node:os";
 import path from "node:path";
 
 import {
-  normalizeReleaseRepository,
   preventPendingUpdaterInstall,
   registerUpdaterIpc,
   staleUpdaterStatePaths,
@@ -34,21 +33,6 @@ const desktopVersion = JSON.parse(
 ).version;
 
 let isolatedUpdaterImportId = 0;
-
-describe("normalizeReleaseRepository", () => {
-  it("keeps the upstream repository as the default", () => {
-    assert.equal(normalizeReleaseRepository(undefined), "different-ai/openwork");
-  });
-
-  it("accepts a packaged distribution repository", () => {
-    assert.equal(normalizeReleaseRepository("swupde/openwork"), "swupde/openwork");
-  });
-
-  it("rejects values that are not exact GitHub owner/repository identities", () => {
-    assert.throws(() => normalizeReleaseRepository("https://github.com/swupde/openwork"), /owner\/repository/);
-    assert.throws(() => normalizeReleaseRepository("swupde/openwork/releases"), /owner\/repository/);
-  });
-});
 
 function fakeUpdaterHarness({ version }) {
   const listeners = new Map();
@@ -117,13 +101,6 @@ describe("targetedStableUpdaterFeed", () => {
     assert.equal(
       targetedStableUpdaterFeed("0.17.22", "0.17.23"),
       "https://github.com/different-ai/openwork/releases/download/v0.17.23",
-    );
-  });
-
-  it("targets the packaged distribution repository", () => {
-    assert.equal(
-      targetedStableUpdaterFeed("0.18.39", "0.18.40", false, "swupde/openwork"),
-      "https://github.com/swupde/openwork/releases/download/v0.18.40",
     );
   });
 
@@ -269,27 +246,6 @@ describe("recovery metadata and candidates", () => {
         }), null);
       }
     }
-  });
-
-  it("binds managed recovery artifacts to the packaged distribution repository", () => {
-    assert.deepEqual(selectRecoveryArtifact(
-      [{ url: "openwork-cloud-mac-arm64-0.18.40.dmg", sha512: "verified" }],
-      {
-        version: "0.18.40",
-        platform: "darwin",
-        arch: "arm64",
-        distribution: "cloud",
-        releaseRepository: "swupde/openwork",
-      },
-    ), {
-      version: "0.18.40",
-      platform: "darwin",
-      arch: "arm64",
-      distribution: "cloud",
-      url: "https://github.com/swupde/openwork/releases/download/v0.18.40/openwork-cloud-mac-arm64-0.18.40.dmg",
-      sha512: "verified",
-      repository: "swupde/openwork",
-    });
   });
 
   it("parses representative builder manifests and selects published installer extensions", () => {
@@ -657,33 +613,6 @@ describe("release channel changes", () => {
       assert.deepEqual(await setChannel(null, "alpha"), {
         channel: "stable",
         feedUrl: "https://github.com/different-ai/openwork/releases/latest/download",
-        currentVersion: desktopVersion,
-      });
-    } finally {
-      await rm(userData, { recursive: true, force: true });
-    }
-  });
-
-  it("pins managed builds to their packaged release repository", async () => {
-    const handlers = new Map();
-    const userData = await mkdtemp(path.join(os.tmpdir(), "openwork-managed-updater-"));
-    try {
-      registerUpdaterIpc({
-        app: {
-          isPackaged: false,
-          getVersion: () => desktopVersion,
-          getPath: () => userData,
-        },
-        ipcMain: { handle: (name, handler) => handlers.set(name, handler) },
-        getMainWindow: () => null,
-        manifestChannel: "cloud",
-        releaseRepository: "swupde/openwork",
-      });
-
-      const getChannel = handlers.get("openwork:updater:getChannel");
-      assert.deepEqual(await getChannel(), {
-        channel: "stable",
-        feedUrl: "https://github.com/swupde/openwork/releases/latest/download",
         currentVersion: desktopVersion,
       });
     } finally {

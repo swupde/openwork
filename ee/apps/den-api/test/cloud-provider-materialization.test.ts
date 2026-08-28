@@ -109,10 +109,6 @@ function makeAnthropicProvider(input: {
           tool_call: true,
           attachment: true,
           modalities: { input: ["text", "image"], output: ["text"] },
-          openwork: {
-            alias: "claude-fable",
-            dataContexts: ["internal"],
-          },
         },
       },
     ],

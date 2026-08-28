@@ -39,11 +39,6 @@
       "development": "./src/workflows.ts",
       "default": "./src/workflows.ts"
     },
-    "./work-context": {
-      "types": "./src/work-context.ts",
-      "development": "./src/work-context.ts",
-      "default": "./src/work-context.ts"
-    },
     "./skill-created-app": {
       "types": "./src/skill-created-app.ts",
       "development": "./src/skill-created-app.ts",

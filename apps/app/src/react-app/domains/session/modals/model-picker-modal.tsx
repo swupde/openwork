@@ -30,7 +30,6 @@ import {
   OPENWORK_MODELS_PROVIDER_ID,
   OPENWORK_MODELS_PROVIDER_NAME,
 } from "../../cloud/openwork-models-promo";
-import { shouldShowTechnicalModelId } from "../work-context/model-policy";
 
 export const MODEL_PICKER_DEFAULT_SUBTITLE = "Select a model for this session.";
 export const MODEL_PICKER_UNAVAILABLE_SUBTITLE = "The model you were using is no longer available, please select a different model for this session.";
@@ -490,7 +489,6 @@ function DefaultModelRow({
   return (
     <button
       type="button"
-      data-model-id={opt.modelID}
       className={[
         "flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left transition-colors",
         active ? "bg-green-3/50" : "hover:bg-dls-hover",
@@ -500,9 +498,7 @@ function DefaultModelRow({
       {recommended ? <Star size={12} className="shrink-0 text-amber-9" /> : <div className="w-3 shrink-0" />}
       <div className="min-w-0 flex-1">
         <span className={["text-[12px]", active ? "font-medium text-dls-text" : "text-dls-text"].join(" ")}>{opt.title}</span>
-        {shouldShowTechnicalModelId(opt) ? (
-          <span className="ml-2 font-mono text-[10px] text-dls-secondary/60">{opt.modelID}</span>
-        ) : null}
+        <span className="ml-2 font-mono text-[10px] text-dls-secondary/60">{opt.modelID}</span>
       </div>
       {active ? <Check size={14} className="shrink-0 text-green-11" /> : null}
     </button>

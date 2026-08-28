@@ -41,16 +41,15 @@ describe("Electron distribution configs", () => {
     assert.equal(config.artifactName, "openwork-${os}-${arch}-${version}.${ext}");
   });
 
-  it("defines an enterprise flavor with the standard app identity and managed release provider", async () => {
+  it("defines an enterprise flavor with the standard app identity and release provider", async () => {
     const config = await readConfig("electron-builder.enterprise.yml");
     assert.equal(config.extends, "./electron-builder.base.yml");
     assert.equal(config.appId, "com.differentai.openwork");
     assert.equal(config.productName, "OpenWork Enterprise");
     assert.equal(config.extraMetadata.openworkDistribution, "enterprise");
-    assert.equal(config.extraMetadata.openworkReleaseRepository, "swupde/openwork");
     assert.equal(config.protocols[0].schemes[0], "openwork");
     assert.equal(config.publish[0].provider, "github");
-    assert.equal(config.publish[0].owner, "swupde");
+    assert.equal(config.publish[0].owner, "different-ai");
     assert.equal(config.publish[0].repo, "openwork");
     assert.equal(config.publish[0].channel, "enterprise");
     assert.equal(
@@ -65,11 +64,8 @@ describe("Electron distribution configs", () => {
     assert.equal(config.appId, "com.differentai.openwork");
     assert.equal(config.productName, "OpenWork Cloud");
     assert.equal(config.extraMetadata.openworkDistribution, "cloud");
-    assert.equal(config.extraMetadata.openworkReleaseRepository, "swupde/openwork");
     assert.equal(config.protocols[0].schemes[0], "openwork");
     assert.equal(config.publish[0].channel, "cloud");
-    assert.equal(config.publish[0].owner, "swupde");
-    assert.equal(config.publish[0].repo, "openwork");
     assert.equal(
       config.artifactName,
       "openwork-cloud-${os}-${arch}-${version}.${ext}",
