@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useParams, useSearchParams } from "next/navigation";
 import { denApiCredentials, denApiEndpoint } from "../../(den)/_lib/den-api-origin";
 import { getSocialCallbackUrl } from "../../(den)/_lib/den-flow";
+import { getRuntimeConfig } from "../../(den)/_lib/runtime-config";
 
 export default function OrganizationSsoSignInPage() {
   const params = useParams<{ orgSlug: string }>();
@@ -19,6 +20,7 @@ export default function OrganizationSsoSignInPage() {
 
     void (async () => {
       try {
+        await getRuntimeConfig();
         const endpoint = denApiEndpoint("/api/auth/sign-in/sso");
         const response = await fetch(endpoint, {
           method: "POST",

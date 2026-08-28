@@ -8,6 +8,9 @@ const authScreenPath = fileURLToPath(
 const authPanelPath = fileURLToPath(
   new URL("../app/(den)/_components/auth-panel.tsx", import.meta.url),
 );
+const organizationSsoPagePath = fileURLToPath(
+  new URL("../app/sso/[orgSlug]/page.tsx", import.meta.url),
+);
 
 describe("Den auth landing contract", () => {
   test("keeps the simple bounded split layout and mobile logo", () => {
@@ -61,5 +64,14 @@ describe("Den auth landing contract", () => {
     expect(source).toContain('data-testid="desktop-handoff-copy-link"');
     expect(source).toContain("desktopAuthRequested && user && !authError");
     expect(source).not.toContain("showAuthFeedback && authInfo && !authError");
+  });
+
+  test("loads the runtime API origin before starting organization SSO", () => {
+    const source = readFileSync(organizationSsoPagePath, "utf8");
+    const runtimeConfigCall = source.indexOf("await getRuntimeConfig()");
+    const endpointResolution = source.indexOf('denApiEndpoint("/api/auth/sign-in/sso")');
+
+    expect(runtimeConfigCall).toBeGreaterThan(-1);
+    expect(endpointResolution).toBeGreaterThan(runtimeConfigCall);
   });
 });
