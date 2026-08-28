@@ -22,7 +22,7 @@ import { globalOpencodeConfigDir, workspaceOpencodeConfigCandidates } from "@ope
 import { configureFakeMediaForTests, installMediaPermissionHandlers } from "./media-permissions.mjs";
 import { registerMigrationIpc } from "./migration.mjs";
 import { createRuntimeManager, createSystemCaCertificateVerifyProc } from "./runtime.mjs";
-import { registerUpdaterIpc } from "./updater.mjs";
+import { normalizeReleaseRepository, registerUpdaterIpc } from "./updater.mjs";
 import {
   checkComputerUsePermissions,
   getComputerUseMcpCommand,
@@ -112,6 +112,9 @@ const DESKTOP_DISTRIBUTION = resolveDesktopDistribution({
   packageFlavor: Reflect.get(desktopPackageMetadata, "openworkDistribution"),
   environmentFlavor: process.env.OPENWORK_DESKTOP_DISTRIBUTION,
 });
+const RELEASE_REPOSITORY = normalizeReleaseRepository(
+  Reflect.get(desktopPackageMetadata, "openworkReleaseRepository"),
+);
 const TAURI_APP_IDENTIFIER = DESKTOP_DISTRIBUTION.appIdentifier;
 const DEV_APP_IDENTIFIER = `${DESKTOP_DISTRIBUTION.appIdentifier}.dev`;
 const DESKTOP_PROTOCOL_SCHEME = DESKTOP_DISTRIBUTION.protocolScheme;
@@ -148,8 +151,8 @@ if (BLANK_SLATE_LAUNCH.enabled || process.env.OPENWORK_ELECTRON_USE_MOCK_KEYCHAI
   // system keychain normally.
   app.commandLine.appendSwitch("use-mock-keychain");
 }
-const RELEASE_DOWNLOAD_BASE_URL = "https://github.com/different-ai/openwork/releases/latest/download";
-const RELEASE_PAGE_URL = "https://github.com/different-ai/openwork/releases/latest";
+const RELEASE_DOWNLOAD_BASE_URL = `https://github.com/${RELEASE_REPOSITORY}/releases/latest/download`;
+const RELEASE_PAGE_URL = `https://github.com/${RELEASE_REPOSITORY}/releases/latest`;
 const DOCS_PAGE_URL = "https://openworklabs.com/docs";
 const applicationMenu = createApplicationMenu({
   appName: APP_NAME,
@@ -2678,6 +2681,7 @@ const { ensureAutoUpdater } = registerUpdaterIpc({
   distribution: DESKTOP_DISTRIBUTION.flavor,
   platform: process.platform,
   arch: process.arch,
+  releaseRepository: RELEASE_REPOSITORY,
 });
 
 if (!app.requestSingleInstanceLock()) {

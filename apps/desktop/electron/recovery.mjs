@@ -1,6 +1,11 @@
 import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import {
+  DEFAULT_RELEASE_REPOSITORY,
+  githubReleaseBaseUrl,
+  normalizeReleaseRepository,
+} from "./release-repository.mjs";
 
 const RECOVERY_STATE_FILENAME = "app-recovery.v1.json";
 const RECOVERY_CACHE_DIRECTORY = "app-recovery-cache";
@@ -103,7 +108,13 @@ function validRecoveryArtifactIdentity(artifact) {
   } catch {
     return false;
   }
-  const prefix = `/different-ai/openwork/releases/download/v${version}/`;
+  let releaseRepository;
+  try {
+    releaseRepository = normalizeReleaseRepository(artifact.repository);
+  } catch {
+    return false;
+  }
+  const prefix = `/${releaseRepository}/releases/download/v${version}/`;
   if (url.protocol !== "https:" || url.hostname !== "github.com" || !url.pathname.startsWith(prefix)) return false;
   const assetArch = artifact.platform === "linux" && artifact.arch === "x64" ? "x86_64" : artifact.arch;
   const platformSlug = artifact.platform === "darwin" ? "mac" : artifact.platform === "win32" ? "win" : "linux";
@@ -112,9 +123,19 @@ function validRecoveryArtifactIdentity(artifact) {
   return fileName === `openwork-${distributionSlug}${platformSlug}-${assetArch}-${version}${installerExtension(artifact.platform)}`;
 }
 
-export function selectRecoveryArtifact(files, { version, platform, arch, distribution }) {
+export function selectRecoveryArtifact(
+  files,
+  {
+    version,
+    platform,
+    arch,
+    distribution,
+    releaseRepository = DEFAULT_RELEASE_REPOSITORY,
+  },
+) {
   const normalizedVersion = stableVersion(version);
   if (!normalizedVersion || !["public", "cloud", "enterprise"].includes(distribution)) return null;
+  const normalizedReleaseRepository = normalizeReleaseRepository(releaseRepository);
   const assetArch = platform === "linux" && arch === "x64" ? "x86_64" : arch;
   const extension = installerExtension(platform);
   const matching = files.filter((file) =>
@@ -124,10 +145,10 @@ export function selectRecoveryArtifact(files, { version, platform, arch, distrib
     && typeof file.sha512 === "string"
     && file.sha512.trim(),
   );
-  const baseUrl = `https://github.com/different-ai/openwork/releases/download/v${normalizedVersion}/`;
+  const baseUrl = `${githubReleaseBaseUrl(normalizedReleaseRepository, `download/v${normalizedVersion}`)}/`;
   for (const selected of matching) {
     const url = new URL(selected.url, baseUrl);
-    if (url.origin !== "https://github.com" || !url.pathname.startsWith(`/different-ai/openwork/releases/download/v${normalizedVersion}/`)) {
+    if (url.origin !== "https://github.com" || !url.pathname.startsWith(`/${normalizedReleaseRepository}/releases/download/v${normalizedVersion}/`)) {
       continue;
     }
     const artifact = {
@@ -137,6 +158,9 @@ export function selectRecoveryArtifact(files, { version, platform, arch, distrib
       distribution,
       url: url.toString(),
       sha512: selected.sha512.trim(),
+      ...(normalizedReleaseRepository === DEFAULT_RELEASE_REPOSITORY
+        ? {}
+        : { repository: normalizedReleaseRepository }),
     };
     return validRecoveryArtifactIdentity(artifact) ? artifact : null;
   }
