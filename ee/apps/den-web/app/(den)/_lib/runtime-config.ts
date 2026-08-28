@@ -1,4 +1,4 @@
-import { setDenApiOriginOverride } from "./den-api-origin";
+import { setDenApiBaseUrlOverride } from "./den-api-origin";
 
 export type DenOrgMode = "single_org" | "multi_org";
 
@@ -73,7 +73,7 @@ export function getRuntimeConfig(): Promise<DenWebRuntimeConfig> {
         }
 
         const config = normalizeRuntimeConfig(await response.json());
-        setDenApiOriginOverride(config.denApiUrl);
+        setDenApiBaseUrlOverride(config.denApiUrl);
         return config;
       })
       .catch(() => {

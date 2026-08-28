@@ -1,22 +1,21 @@
-let denApiOriginOverride: string | null = null;
+let denApiBaseUrlOverride: string | null = null;
 
-function normalizeOrigin(input: string | null | undefined): string | null {
+function normalizeBaseUrl(input: string | null | undefined): string | null {
   const trimmed = input?.trim() ?? "";
   if (!trimmed) return null;
   try {
     const url = new URL(trimmed);
     if (url.protocol !== "http:" && url.protocol !== "https:") return null;
-    url.pathname = "";
-    url.search = "";
-    url.hash = "";
-    return url.toString().replace(/\/+$/, "");
+    if (url.username || url.password || url.search || url.hash) return null;
+    const pathname = url.pathname.replace(/\/+$/, "");
+    return `${url.origin}${pathname === "/" ? "" : pathname}`;
   } catch {
     return null;
   }
 }
 
-export function setDenApiOriginOverride(input: string | null | undefined) {
-  denApiOriginOverride = normalizeOrigin(input);
+export function setDenApiBaseUrlOverride(input: string | null | undefined) {
+  denApiBaseUrlOverride = normalizeBaseUrl(input);
 }
 
 export function denApiOriginForWebOrigin(webOrigin: string): string | null {
@@ -46,15 +45,15 @@ export function denApiOriginForWebOrigin(webOrigin: string): string | null {
   return url.toString().replace(/\/$/, "");
 }
 
-function currentDenApiOriginForWebOrigin(webOrigin: string): string | null {
-  return denApiOriginOverride ?? denApiOriginForWebOrigin(webOrigin);
+function currentDenApiBaseUrlForWebOrigin(webOrigin: string): string | null {
+  return denApiBaseUrlOverride ?? denApiOriginForWebOrigin(webOrigin);
 }
 
-export function currentDenApiOrigin(): string | null {
+export function currentDenApiBaseUrl(): string | null {
   if (typeof window === "undefined") {
     return null;
   }
-  return currentDenApiOriginForWebOrigin(window.location.origin);
+  return currentDenApiBaseUrlForWebOrigin(window.location.origin);
 }
 
 export function denApiEndpointForWebOrigin(path: string, webOrigin: string): string {
@@ -62,13 +61,13 @@ export function denApiEndpointForWebOrigin(path: string, webOrigin: string): str
     return path;
   }
 
-  const origin = currentDenApiOriginForWebOrigin(webOrigin);
-  if (!origin) {
+  const baseUrl = currentDenApiBaseUrlForWebOrigin(webOrigin);
+  if (!baseUrl) {
     return path;
   }
 
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
-  return `${origin}${normalizedPath}`;
+  return `${baseUrl}${normalizedPath}`;
 }
 
 const PUBLIC_DEN_API_PATH_PREFIXES = ["/v1/orgs/sso/resolve"];
@@ -82,7 +81,8 @@ export function denApiCredentialsForEndpoint(endpoint: string, webOrigin: string
   try {
     const endpointOrigin = new URL(endpoint).origin;
     const currentOrigin = new URL(webOrigin).origin;
-    const apiOrigin = currentDenApiOriginForWebOrigin(webOrigin);
+    const apiBaseUrl = currentDenApiBaseUrlForWebOrigin(webOrigin);
+    const apiOrigin = apiBaseUrl ? new URL(apiBaseUrl).origin : null;
     if (endpointOrigin === apiOrigin && isPublicDenApiPath(path)) {
       return "omit";
     }
