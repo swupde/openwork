@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { NextRequest } from "next/server";
 
-import { denApiCredentialsForEndpoint, denApiEndpointForWebOrigin, denApiOriginForWebOrigin, setDenApiOriginOverride } from "../app/(den)/_lib/den-api-origin";
+import { denApiCredentialsForEndpoint, denApiEndpointForWebOrigin, denApiOriginForWebOrigin, setDenApiBaseUrlOverride } from "../app/(den)/_lib/den-api-origin";
 import { redirectToDenApi } from "../app/api/_lib/den-api-redirect";
 
 afterEach(() => {
-  setDenApiOriginOverride(null);
+  setDenApiBaseUrlOverride(null);
 });
 
 describe("Den API browser origin", () => {
@@ -25,11 +25,11 @@ describe("Den API browser origin", () => {
     expect(denApiEndpointForWebOrigin("/v1/me", "https://app.openworklabs.com")).toBe("https://api.app.openworklabs.com/v1/me");
   });
 
-  test("uses the runtime-config API origin override when present", () => {
-    setDenApiOriginOverride("https://api.override.example.test/v1/ignored");
+  test("preserves a path prefix in the runtime-config API base URL", () => {
+    setDenApiBaseUrlOverride("https://api.override.example.test/api/den/");
 
-    expect(denApiEndpointForWebOrigin("/v1/me", "https://app.openworklabs.com")).toBe("https://api.override.example.test/v1/me");
-    expect(denApiCredentialsForEndpoint("https://api.override.example.test/v1/me", "https://app.openworklabs.com")).toBe("include");
+    expect(denApiEndpointForWebOrigin("/v1/me", "https://app.openworklabs.com")).toBe("https://api.override.example.test/api/den/v1/me");
+    expect(denApiCredentialsForEndpoint("https://api.override.example.test/api/den/v1/me", "https://app.openworklabs.com")).toBe("include");
   });
 
   test("redirects legacy app/proxy MCP callbacks to the direct API callback path", () => {
