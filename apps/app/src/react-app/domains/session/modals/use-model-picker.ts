@@ -4,7 +4,6 @@
 // session-route.tsx; settings-route carries a sibling copy that should adopt
 // this hook next.
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { DataContext } from "@openwork/types/work-context";
 import type { Client, ModelOption } from "@/app/types";
 import { getModelBehaviorSummary } from "@/app/lib/model-behavior";
 import { useCheckDesktopRestriction } from "@/react-app/domains/cloud/desktop-config-provider";
@@ -22,10 +21,6 @@ import {
   openModelPickerEvent,
   pendingModelPickerProviderIdsKey,
 } from "@/react-app/shell/new-providers-listener";
-import {
-  colleagueFacingModelLabel,
-  eligibleModelOptions,
-} from "@/react-app/domains/session/work-context/model-policy";
 
 export type UseModelPickerInput = {
   client: Client | null;
@@ -39,8 +34,6 @@ export type UseModelPickerInput = {
   fallbackOptions?: readonly ModelOption[];
   /** Account-scoped providers are hidden immediately after cloud sign-out. */
   cloudProvidersEnabled?: boolean;
-  /** When present, fail-closed OpenWork data-context policy filters the picker. */
-  dataContext?: DataContext;
 };
 
 export function useModelPicker(input: UseModelPickerInput) {
@@ -52,7 +45,6 @@ export function useModelPicker(input: UseModelPickerInput) {
     onLoadError,
     fallbackOptions = [],
     cloudProvidersEnabled = true,
-    dataContext,
   } = input;
   const checkDesktopRestriction = useCheckDesktopRestriction();
 
@@ -144,7 +136,7 @@ export function useModelPicker(input: UseModelPickerInput) {
         next.push({
           providerID: provider.id,
           modelID: id,
-          title: colleagueFacingModelLabel(id, model.name || id),
+          title: model.name || id,
           description: provider.name,
           behaviorTitle: summary.title,
           behaviorLabel: summary.label,
@@ -171,12 +163,11 @@ export function useModelPicker(input: UseModelPickerInput) {
     const restrictToCloud = checkDesktopRestriction({
       restriction: "allowCustomProviders",
     });
-    const entitled = filterEntitledModelOptions(modelOptions, {
+    return filterEntitledModelOptions(modelOptions, {
       restrictToCloud,
       checkRestriction: checkDesktopRestriction,
     });
-    return dataContext ? eligibleModelOptions(entitled, dataContext) : entitled;
-  }, [checkDesktopRestriction, dataContext, modelOptions]);
+  }, [checkDesktopRestriction, modelOptions]);
 
   return {
     open,

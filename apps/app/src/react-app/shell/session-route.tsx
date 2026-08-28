@@ -121,11 +121,6 @@ import { getModelBehaviorSummary, nextModelBehaviorValue, previousModelBehaviorV
 import { computeModelAvailability, createUnavailableConfirmationGate, type ModelAvailability } from "@/react-app/domains/session/surface/model-availability";
 import { useSessionFindStore } from "@/react-app/domains/session/surface/find-store";
 import { useModelPicker } from "@/react-app/domains/session/modals/use-model-picker";
-import { useWorkContext } from "@/react-app/domains/session/work-context/use-work-context";
-import {
-  buildWorkContextSystemGuidance,
-  isModelEligible,
-} from "@/react-app/domains/session/work-context/model-policy";
 import { getSessionModelSelection, useSessionModelStore } from "@/react-app/domains/session/surface/session-model-store";
 import { useWorkbenchStore } from "@/react-app/domains/session/chat/workbench-store";
 import { resolveWorkbenchPaneEndpoint } from "@/react-app/domains/session/chat/pane-runtime";
@@ -711,10 +706,6 @@ export function SessionRoute() {
     workspaceId: selectedWorkspaceEndpoint?.workspaceId ?? null,
     providerModel: cloudMcpProviderModel,
   });
-  const workspaceWorkContext = useWorkContext(
-    selectedWorkspaceEndpoint?.client ?? null,
-    selectedWorkspaceEndpoint?.workspaceId ?? null,
-  );
   // Agent selection is persisted in local prefs (like the model variant) so
   // it survives reloads instead of silently falling back to "build" (#2101).
   const selectedAgent = local.prefs.selectedAgent;
@@ -1065,7 +1056,6 @@ export function SessionRoute() {
     onOpen: handleModelPickerOpen,
     fallbackOptions: organizationAssignedModelOptions,
     cloudProvidersEnabled: denAuth.isSignedIn,
-    dataContext: workspaceWorkContext.context.dataContext,
   });
   // Which session the open model picker targets. Selecting a model while a
   // session is targeted remembers it for that conversation only; null means
@@ -1418,13 +1408,6 @@ export function SessionRoute() {
       resolveModelAvailability,
       organizationModelsEmpty,
       selectedModel: local.prefs.defaultModel ?? { providerID: "", modelID: "" },
-      modelOptions: modelPicker.options,
-      workContext: workspaceWorkContext.context,
-      workContextBusy: workspaceWorkContext.loading || workspaceWorkContext.saving,
-      workContextError: workspaceWorkContext.error,
-      onWorkContextChange: (next: typeof workspaceWorkContext.context) => {
-        void workspaceWorkContext.update(next).catch(() => undefined);
-      },
       openWorkModelsEntitled,
       openWorkModelsSyncing,
       onRefreshOrganizationModels: refreshOrganizationModelAccess,
@@ -1470,20 +1453,6 @@ export function SessionRoute() {
         if (resolveModelAvailability(sendModel ?? null).status === "unavailable") {
           throw new Error("Selected model is unavailable. Choose another model before sending.");
         }
-        if (workspaceWorkContext.loading || workspaceWorkContext.saving) {
-          throw new Error("Work context is still being saved. Wait a moment before sending.");
-        }
-        const sendOption = sendModel
-          ? modelPicker.options.find((option) => option.providerID === sendModel.providerID && option.modelID === sendModel.modelID)
-          : undefined;
-        if (!sendModel || !isModelEligible(sendModel, sendOption, workspaceWorkContext.context.dataContext)) {
-          throw new Error(
-            workspaceWorkContext.context.dataContext === "client"
-              ? "Client data requires the approved EU-hosted Nemotron model. Choose it before sending."
-              : "The selected model is not available for Internal work. Choose one of the retained OpenAI or Claude models.",
-          );
-        }
-
         return submitWithCloudMcpReadiness({
           // Temporarily bypass the pre-send Cloud MCP gate: it blocks every
           // message, including tasks that do not use connected services.
@@ -1557,15 +1526,13 @@ export function SessionRoute() {
                   cacheKey: targetSessionId,
                   runtimeKey: environmentRuntimeKey,
                 });
-                const workSystemContext = buildWorkContextSystemGuidance(workspaceWorkContext.context);
-                const systemContext = [envSystemContext, workSystemContext].filter(Boolean).join("\n\n");
                 const result = await opencodeClient.session.promptAsync({
                   sessionID: targetSessionId,
                   parts,
                   model: sendModel ?? undefined,
                   agent: selectedAgent ?? undefined,
                   ...(sendVariant ? { variant: sendVariant } : {}),
-                  system: systemContext,
+                  ...(envSystemContext ? { system: envSystemContext } : {}),
                 });
                 if (result.error) {
                   throw new Error(serializeSDKError(result.error));
@@ -1729,11 +1696,6 @@ export function SessionRoute() {
     sessionsByWorkspaceId,
     submitWithCloudMcpReadiness,
     token,
-    workspaceWorkContext.context,
-    workspaceWorkContext.error,
-    workspaceWorkContext.loading,
-    workspaceWorkContext.saving,
-    workspaceWorkContext.update,
   ]);
   const resolvePaneRuntime = useCallback((session: OpenSessionTab): SessionPagePaneRuntime => {
     const candidateWorkspace = workspaces.find((candidate) => candidate.id === session.workspaceId);
@@ -2069,12 +2031,6 @@ export function SessionRoute() {
       },
       isRemoteWorkspace: selectedWorkspace?.workspaceType === "remote",
       isSandboxWorkspace: selectedWorkspace ? isSandboxWorkspace(selectedWorkspace) : false,
-      workContext: workspaceWorkContext.context,
-      workContextBusy: workspaceWorkContext.loading || workspaceWorkContext.saving,
-      workContextError: workspaceWorkContext.error,
-      onWorkContextChange: (next) => {
-        void workspaceWorkContext.update(next).catch(() => undefined);
-      },
       onOpenSettingsSection: (section: ComposerSettingsSection) => {
         openComposerConfigure(section, {
           openLibrary: handleOpenExtensions,
@@ -2107,11 +2063,6 @@ export function SessionRoute() {
     selectedWorkspaceRoot,
     sessionProviderAuthStore,
     setSelectedAgent,
-    workspaceWorkContext.context,
-    workspaceWorkContext.error,
-    workspaceWorkContext.loading,
-    workspaceWorkContext.saving,
-    workspaceWorkContext.update,
   ]);
 
   const handleOpenCreateWorkspace = useCallback(() => {

@@ -6,7 +6,6 @@ import {
   type AgentContextDiagnosticsRequest,
 } from "@openwork/types/agent-context-diagnostics";
 import { normalizeBaseUrl } from "@openwork/types/url";
-import type { WorkContext } from "@openwork/types/work-context";
 import {
   AGENT_CONTEXT_DIAGNOSTICS_REQUEST_TIMEOUT_MS,
   requestAgentContextDiagnosticsPayload,
@@ -1587,20 +1586,6 @@ export function createOpenworkServerClient(options: { baseUrl: string; token?: s
         timeoutMs: timeouts.binary,
       }),
     listWorkspaces: () => requestJson<OpenworkWorkspaceList>(baseUrl, "/workspaces", { token, hostToken, timeoutMs: timeouts.listWorkspaces }),
-    getWorkContext: (workspaceId: string) =>
-      requestJson<WorkContext>(baseUrl, `/workspace/${encodeURIComponent(workspaceId)}/work-context`, {
-        token,
-        hostToken,
-        timeoutMs: timeouts.config,
-      }),
-    updateWorkContext: (workspaceId: string, context: WorkContext) =>
-      requestJson<WorkContext>(baseUrl, `/workspace/${encodeURIComponent(workspaceId)}/work-context`, {
-        token,
-        hostToken,
-        method: "PUT",
-        body: context,
-        timeoutMs: timeouts.config,
-      }),
     createLocalWorkspace: (payload: { folderPath: string; name: string; preset: string }) =>
       requestJson<WorkspaceList>(baseUrl, "/workspaces/local", {
         token,

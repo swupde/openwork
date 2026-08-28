@@ -131,7 +131,7 @@ describe("buildCloudProviderConfig", () => {
     expect(config.models).toEqual({});
   });
 
-  test("materializes image capabilities without leaking UI-only work policy", () => {
+  test("materializes image capabilities", () => {
     const provider: DenOrgLlmProviderConnection = {
       id: "lpr_litellm",
       source: "custom",
@@ -144,7 +144,6 @@ describe("buildCloudProviderConfig", () => {
         config: {
           attachment: true,
           modalities: { input: ["text", "image"], output: ["text"] },
-          openwork: { alias: "openai-terra", dataContexts: ["internal"] },
         },
       }],
       createdAt: "2024-01-01T00:00:00.000Z",
