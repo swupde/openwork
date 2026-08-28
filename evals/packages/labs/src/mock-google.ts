@@ -24,6 +24,13 @@ export interface MockGoogleDriveUpload extends MockGoogleAttachment {
   at: string;
 }
 
+export interface MockGoogleNativeOperation {
+  method: string;
+  path: string;
+  body: unknown;
+  at: string;
+}
+
 export interface MockGoogleHandle {
   /** Base URL for DEN_GOOGLE_API_BASE_URL. */
   apiUrl: string;
@@ -37,6 +44,8 @@ export interface MockGoogleHandle {
   draftsFor(email: string, opts?: { since?: string; timeoutMs?: number; atLeast?: number }): Promise<MockGoogleDraft[]>;
   /** Drive uploads attributed to ONE account, including provider-observed bytes. */
   driveUploadsFor(email: string, opts?: { since?: string; timeoutMs?: number; atLeast?: number }): Promise<MockGoogleDriveUpload[]>;
+  /** Native Docs/Sheets/Slides provider calls attributed to ONE account. */
+  nativeOperationsFor(email: string, opts?: { since?: string; timeoutMs?: number; atLeast?: number }): Promise<MockGoogleNativeOperation[]>;
   authorizeRequestSince(iso: string, opts?: { timeoutMs?: number }): Promise<{ params: URLSearchParams }>;
   stop(): Promise<void>;
   [Symbol.asyncDispose](): Promise<void>;
@@ -153,6 +162,14 @@ export async function startMockGoogle(options: StartMockGoogleOptions): Promise<
     return { ...attachment, tokenId: value.tokenId, at: value.at };
   }
 
+  function parseNativeOperation(value: unknown): MockGoogleNativeOperation | null {
+    if (!isRecord(value)
+      || typeof value.method !== "string"
+      || typeof value.path !== "string"
+      || typeof value.at !== "string") return null;
+    return { method: value.method, path: value.path, body: value.body, at: value.at };
+  }
+
   async function readDrafts(email: string, since: string | undefined, timeoutMs: number): Promise<MockGoogleDraft[]> {
     const endpoint = new URL("/__mock-google/drafts", url);
     endpoint.searchParams.set("email", email.trim().toLowerCase());
@@ -172,6 +189,17 @@ export async function startMockGoogle(options: StartMockGoogleOptions): Promise<
     return body.uploads.flatMap((value) => {
       const upload = parseDriveUpload(value);
       return upload && (!since || upload.at >= since) ? [upload] : [];
+    });
+  }
+
+  async function readNativeOperations(email: string, since: string | undefined, timeoutMs: number): Promise<MockGoogleNativeOperation[]> {
+    const endpoint = new URL("/__mock-google/native-operations", url);
+    endpoint.searchParams.set("email", email.trim().toLowerCase());
+    const body = await json(endpoint.toString(), timeoutMs);
+    if (!isRecord(body) || !Array.isArray(body.operations)) return [];
+    return body.operations.flatMap((value) => {
+      const operation = parseNativeOperation(value);
+      return operation && (!since || operation.at >= since) ? [operation] : [];
     });
   }
 
@@ -241,6 +269,14 @@ export async function startMockGoogle(options: StartMockGoogleOptions): Promise<
       const timeoutMs = opts.timeoutMs ?? 120_000;
       return pollForAtLeast(
         (remainingMs) => readDriveUploads(email, opts.since, remainingMs),
+        opts.atLeast,
+        timeoutMs,
+      );
+    },
+    async nativeOperationsFor(email, opts = {}) {
+      const timeoutMs = opts.timeoutMs ?? 120_000;
+      return pollForAtLeast(
+        (remainingMs) => readNativeOperations(email, opts.since, remainingMs),
         opts.atLeast,
         timeoutMs,
       );

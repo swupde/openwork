@@ -106,6 +106,12 @@ function makeAnthropicProvider(input: {
           id: modelId,
           name: modelId,
           tool_call: true,
+          attachment: true,
+          modalities: { input: ["text", "image"], output: ["text"] },
+          openwork: {
+            alias: "claude-fable",
+            dataContexts: ["internal"],
+          },
         },
       },
     ],
@@ -119,6 +125,8 @@ function makeAnthropicRuntimeProvider(modelId = "claude-fable-5") {
     models: {
       [modelId]: {
         tool_call: true,
+        attachment: true,
+        modalities: { input: ["text", "image"], output: ["text"] },
         name: modelId,
         id: modelId,
       },
@@ -402,6 +410,8 @@ describe("Cloud provider materialization", () => {
               id: "claude-fable-5",
               name: "claude-fable-5",
               tool_call: true,
+              attachment: true,
+              modalities: { input: ["text", "image"], output: ["text"] },
             },
           },
           npm: "@ai-sdk/anthropic",

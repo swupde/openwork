@@ -8,6 +8,8 @@ import { startEmbeddedServer, type EmbeddedServerHandle, type EmbeddedServerOpti
 import { readEngineRegistry } from "./engine-registry.js";
 import * as managedOpencodeModule from "./managed-opencode.js";
 import { writeOpenworkRuntimeConfigFile } from "./openwork-runtime-config.js";
+import { runtimeStorageDir } from "./runtime-db.js";
+import { OPENWORK_RUNTIME_STORAGE_ENV } from "./runtime-workspace-files.js";
 import { writeRuntimeOpencodeConfig } from "./runtime-opencode-config-store.js";
 import * as serverModule from "./server.js";
 import type { ServerConfig } from "./types.js";
@@ -54,6 +56,7 @@ async function writeFakeOpencodeBin(root: string): Promise<string> {
     "const append = (line) => { if (logPath) appendFileSync(logPath, `${line}\\n`); };",
     "append(`vault-key:${process.env.OPENWORK_ENCRYPTION_KEY ? 'present' : 'absent'}`);",
     "append(`server-url:${process.env.OPENWORK_SERVER_URL ?? ''}`);",
+    `append(\`runtime-storage:\${process.env.${OPENWORK_RUNTIME_STORAGE_ENV} ?? ''}\`);`,
     "const server = Bun.serve({",
     "  hostname: '127.0.0.1',",
     "  port: requestedPort,",
@@ -219,6 +222,7 @@ describe("embedded server lifecycle", () => {
       expect(handle.port).not.toBe(blockedPort);
       expect(handle.config.port).toBe(handle.port);
       expect(await logLines(fixture.logPath)).toContain(`server-url:http://${HOST}:${handle.port}`);
+      expect(await logLines(fixture.logPath)).toContain(`runtime-storage:${runtimeStorageDir(handle.config)}`);
 
       const entries = await readEngineRegistry(handle.config);
       expect(entries).toHaveLength(1);

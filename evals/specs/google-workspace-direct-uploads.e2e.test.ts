@@ -258,15 +258,18 @@ test.skipIf(!localPlacement || !mysqlOpen)(title, async ({ evidence, place }) =>
     expect(driveUpload?.filename).toBe("witness.png");
     expect(driveUpload?.mimeType).toBe("image/png");
     expect(driveUpload?.content).toEqual(fixture);
-    expect(requireRecord(requireRecord(driveResult, "Drive action result").file, "Drive result file")).toMatchObject({
+    const driveResultFile = requireRecord(requireRecord(driveResult, "Drive action result").file, "Drive result file");
+    expect(driveResultFile).toMatchObject({
       name: "witness.png",
       mimeType: "image/png",
       size: String(fixture.byteLength),
     });
+    expect(requireString(driveResultFile.webViewLink, "Drive result webViewLink"))
+      .toMatch(/^https:\/\/drive\.google\.test\/file\/d\/[^/]+\/view$/);
     evidence.recordAssertionEvidence(
-      "Drive receives the exact authorized workspace file",
-      `Mock Drive observed witness.png as image/png with ${driveUpload?.content.toString("hex")} bytes.`,
-      driveUpload?.content.equals(fixture) === true,
+      "Drive receives the exact authorized workspace file and returns its real link",
+      `Mock Drive observed witness.png as image/png with ${driveUpload?.content.toString("hex")} bytes and returned ${String(driveResultFile.webViewLink)}.`,
+      driveUpload?.content.equals(fixture) === true && typeof driveResultFile.webViewLink === "string",
     );
 
     const draftSince = new Date().toISOString();

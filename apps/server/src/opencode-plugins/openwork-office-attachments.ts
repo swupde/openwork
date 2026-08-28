@@ -1,8 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import { inflateRawSync } from "node:zlib";
 import { link, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
-import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { OPENWORK_RUNTIME_STORAGE_ENV, runtimeWorkspaceFilesRoot } from "../runtime-workspace-files.js";
 
 const DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 const PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
@@ -25,7 +27,7 @@ const MAX_EXTRACTED_TEXT_CHARS = 24_000;
 const MAX_XLSX_SHEETS = 24;
 const MAX_XLSX_CELLS = 600;
 const MAX_XLSX_SHARED_STRINGS = 4_000;
-const MATERIALIZED_DIR = join(".opencode", "openwork", "inbox", "chat-attachments");
+const MATERIALIZED_DIR = join("inbox", "chat-attachments");
 
 type RuntimeContext = {
   directory?: string;
@@ -43,7 +45,7 @@ type OfficeFilePart = {
 
 type MaterializedAttachment = {
   sha256: string;
-  relativePath: string;
+  executionPath: string;
 };
 
 type ZipEntry = {
@@ -74,6 +76,11 @@ function normalizeOpenCodeContext(value: unknown): RuntimeContext {
 
 function workspaceRoot(factoryContext: RuntimeContext): string | null {
   return factoryContext.directory ? resolve(factoryContext.directory) : null;
+}
+
+function executionFilesRoot(root: string | null): string | null {
+  const runtimeRoot = process.env[OPENWORK_RUNTIME_STORAGE_ENV]?.trim();
+  return root && runtimeRoot ? runtimeWorkspaceFilesRoot(runtimeRoot, root) : null;
 }
 
 function sha256(buffer: Buffer): string {
@@ -143,10 +150,6 @@ function isWithin(root: string, candidate: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
-function toWorkerRelativePath(root: string, path: string): string {
-  return relative(root, path).split(sep).join("/");
-}
-
 function base64Value(code: number): number {
   if (code >= 65 && code <= 90) return code - 65;
   if (code >= 97 && code <= 122) return code - 71;
@@ -187,16 +190,16 @@ function decodeDataUrl(url: string): Buffer {
   return buffer;
 }
 
-async function bytesFromPart(part: OfficeFilePart, root: string | null): Promise<Buffer> {
+async function bytesFromPart(part: OfficeFilePart, allowedRoots: Array<string | null>): Promise<Buffer> {
   if (part.url.startsWith("data:")) return decodeDataUrl(part.url);
   const url = new URL(part.url);
-  if (url.protocol !== "file:") throw new Error("Office attachment URL was not a supported data: or workspace file: URL.");
-  if (!root) throw new Error("Workspace root is unavailable for file: Office attachment URLs.");
+  if (url.protocol !== "file:") throw new Error("Office attachment URL was not a supported data: or approved file: URL.");
   const filePath = resolve(fileURLToPath(url));
-  if (!isWithin(root, filePath)) throw new Error("Office attachment file URL points outside the active workspace.");
-  const realRoot = await realpath(root);
+  const lexicalRoot = allowedRoots.find((root): root is string => Boolean(root && isWithin(root, filePath)));
+  if (!lexicalRoot) throw new Error("Office attachment file URL points outside OpenWork-approved storage.");
+  const realRoot = await realpath(lexicalRoot);
   const realFilePath = await realpath(filePath);
-  if (!isWithin(realRoot, realFilePath)) throw new Error("Office attachment file URL points outside the active workspace.");
+  if (!isWithin(realRoot, realFilePath)) throw new Error("Office attachment file URL points outside OpenWork-approved storage.");
   const buffer = await readFile(realFilePath);
   if (buffer.byteLength > MAX_COMPRESSED_BYTES) throw new Error("Office attachment exceeds the compressed byte limit.");
   return buffer;
@@ -220,23 +223,23 @@ async function linkBytesAtomically(target: string, bytes: Buffer): Promise<void>
   }
 }
 
-async function materializeAttachment(root: string | null, filename: string, kind: OfficeKind, bytes: Buffer): Promise<MaterializedAttachment | null> {
-  if (!root) return null;
+async function materializeAttachment(executionRoot: string | null, filename: string, kind: OfficeKind, bytes: Buffer): Promise<MaterializedAttachment | null> {
+  if (!executionRoot) return null;
   const digest = sha256(bytes);
-  const directory = join(root, MATERIALIZED_DIR);
+  const directory = join(executionRoot, MATERIALIZED_DIR);
   await mkdir(directory, { recursive: true });
   const names = [`${digest.slice(0, 16)}-${safeFilename(filename, kind)}`, `${digest}-${safeFilename(filename, kind)}`];
   for (const name of names) {
     const target = join(directory, name);
     const current = await existingSha(target);
-    if (current === digest) return { sha256: digest, relativePath: toWorkerRelativePath(root, target) };
+    if (current === digest) return { sha256: digest, executionPath: target };
     if (current !== null) continue;
     try {
       await linkBytesAtomically(target, bytes);
-      return { sha256: digest, relativePath: toWorkerRelativePath(root, target) };
+      return { sha256: digest, executionPath: target };
     } catch (cause) {
       const afterRace = await existingSha(target);
-      if (afterRace === digest) return { sha256: digest, relativePath: toWorkerRelativePath(root, target) };
+      if (afterRace === digest) return { sha256: digest, executionPath: target };
       if (afterRace !== null) continue;
       throw cause;
     }
@@ -671,7 +674,7 @@ function normalizedText(part: OfficeFilePart, materialized: MaterializedAttachme
     `filename: ${safeFilename(part.filename, part.kind)}`,
     `canonical_mime: ${part.mime}`,
     `sha256: ${materialized?.sha256 ?? "unavailable"}`,
-    `worker_relative_path: ${materialized?.relativePath ?? "unavailable"}`,
+    `execution_path: ${materialized?.executionPath ?? "unavailable"}`,
     ...(error ? [`extraction_error: ${error}`] : []),
     "extracted_text:",
     extractedText,
@@ -682,10 +685,10 @@ function textPartFrom(part: OfficeFilePart, text: string): Record<string, unknow
   return { ...basePartIds(part.part), type: "text", text };
 }
 
-async function normalizeOfficePart(part: OfficeFilePart, root: string | null): Promise<Record<string, unknown>> {
+async function normalizeOfficePart(part: OfficeFilePart, root: string | null, executionRoot: string | null): Promise<Record<string, unknown>> {
   try {
-    const bytes = await bytesFromPart(part, root);
-    const materialized = await materializeAttachment(root, part.filename, part.kind, bytes);
+    const bytes = await bytesFromPart(part, [root, executionRoot]);
+    const materialized = await materializeAttachment(executionRoot, part.filename, part.kind, bytes);
     try {
       const extractedText = extractOfficeText(part.kind, bytes);
       return textPartFrom(part, normalizedText(part, materialized, extractedText));
@@ -699,15 +702,15 @@ async function normalizeOfficePart(part: OfficeFilePart, root: string | null): P
   }
 }
 
-async function transformPart(value: unknown, root: string | null): Promise<unknown> {
+async function transformPart(value: unknown, root: string | null, executionRoot: string | null): Promise<unknown> {
   const part = officeFilePart(value);
-  return part ? await normalizeOfficePart(part, root) : value;
+  return part ? await normalizeOfficePart(part, root, executionRoot) : value;
 }
 
-async function transformMessage(value: unknown, root: string | null): Promise<unknown> {
+async function transformMessage(value: unknown, root: string | null, executionRoot: string | null): Promise<unknown> {
   if (!isRecord(value)) return value;
-  if (Array.isArray(value.parts)) return { ...value, parts: await Promise.all(value.parts.map((part) => transformPart(part, root))) };
-  if (Array.isArray(value.content)) return { ...value, content: await Promise.all(value.content.map((part) => transformPart(part, root))) };
+  if (Array.isArray(value.parts)) return { ...value, parts: await Promise.all(value.parts.map((part) => transformPart(part, root, executionRoot))) };
+  if (Array.isArray(value.content)) return { ...value, content: await Promise.all(value.content.map((part) => transformPart(part, root, executionRoot))) };
   return value;
 }
 
@@ -719,7 +722,8 @@ export const OpenWorkOfficeAttachments = async (factoryInput?: unknown) => {
     "experimental.chat.messages.transform": async (input: unknown, output: { messages: unknown[] }) => {
       void input;
       const root = workspaceRoot(factoryContext);
-      const messages = await Promise.all(output.messages.map((message) => transformMessage(message, root)));
+      const executionRoot = executionFilesRoot(root);
+      const messages = await Promise.all(output.messages.map((message) => transformMessage(message, root, executionRoot)));
       output.messages.splice(0, output.messages.length, ...messages);
     },
   };

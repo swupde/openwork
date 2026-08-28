@@ -415,6 +415,20 @@ export type ModelBehaviorOption = {
   description: string;
 };
 
+export type ModelWorkPolicy = {
+  alias: string;
+  dataContexts: Array<"internal" | "client">;
+  deployment?: {
+    provider: "bedrock" | "vertex";
+    region: string;
+    inferenceMode?: string;
+    providerModelId?: string;
+  };
+  verification?:
+    | { status: "required"; verifiedAt: null; evidenceRef: null }
+    | { status: "verified"; verifiedAt: string; evidenceRef: string };
+};
+
 export type ModelOption = {
   providerID: string;
   modelID: string;
@@ -431,6 +445,8 @@ export type ModelOption = {
   isRecommended?: boolean;
   /** "cloud" for org-managed providers (lpr_*), undefined for local. */
   source?: "cloud";
+  /** UI-only model guidance and data-boundary metadata from model.config.openwork. */
+  workPolicy?: ModelWorkPolicy;
 };
 
 export type SelectedSessionSnapshot = {

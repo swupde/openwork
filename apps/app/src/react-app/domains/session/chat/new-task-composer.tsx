@@ -1,6 +1,7 @@
 /** @jsxImportSource react */
 import { useRef, useState } from "react";
 import type { Agent } from "@opencode-ai/sdk/v2/client";
+import type { WorkContext } from "@openwork/types/work-context";
 
 import type { CloudImportedPlugin } from "@/app/cloud/import-state";
 import { createDenClient, readDenSettings } from "@/app/lib/den";
@@ -22,6 +23,8 @@ import {
 } from "@/react-app/domains/connections/cloud-inventory-cache";
 import { connectPluginsForComposer, EMPTY_CONNECT_CAPABILITY_INVENTORY } from "@/react-app/domains/session/surface/connect-capability-inventory";
 import { resolveAttachmentFileMetadata } from "@/react-app/domains/session/sync/attachment-file-part";
+import { WorkContextBar } from "@/react-app/domains/session/work-context/work-context-bar";
+import { isModelEligible } from "@/react-app/domains/session/work-context/model-policy";
 
 /**
  * Workspace-scoped wiring for the new-task composer. Everything here is
@@ -56,6 +59,10 @@ export type NewTaskComposerContext = {
   isRemoteWorkspace: boolean;
   isSandboxWorkspace: boolean;
   onOpenSettingsSection?: (section: ComposerSettingsSection) => void;
+  workContext: WorkContext;
+  workContextBusy: boolean;
+  workContextError: string | null;
+  onWorkContextChange: (context: WorkContext) => void;
 };
 
 export type NewTaskComposerProps = {
@@ -96,6 +103,12 @@ export function NewTaskComposer(props: NewTaskComposerProps) {
   const context = props.context;
   const workspaceClient = context?.client ?? null;
   const workspaceId = context?.workspaceId ?? null;
+  const selectedModelOption = context?.modelOptions?.find(
+    (option) => option.providerID === context.selectedModel.providerID && option.modelID === context.selectedModel.modelID,
+  );
+  const workContextModelEligible = context
+    ? isModelEligible(context.selectedModel, selectedModelOption, context.workContext.dataContext)
+    : true;
 
   const listSkills = workspaceClient && workspaceId
     ? async (): Promise<SkillCard[]> => {
@@ -243,6 +256,7 @@ export function NewTaskComposer(props: NewTaskComposerProps) {
   };
 
   const handleRunTask = () => {
+    if (context && (context.workContextBusy || !workContextModelEligible)) return;
     props.onRunTask(resolvePastedTextPlaceholders(props.draft, pastedText), attachments);
   };
 
@@ -252,8 +266,19 @@ export function NewTaskComposer(props: NewTaskComposerProps) {
   };
 
   return (
-    <ReactSessionComposer
-      draft={props.draft}
+    <>
+      {context ? (
+        <WorkContextBar
+          context={context.workContext}
+          busy={context.workContextBusy}
+          error={context.workContextError}
+          modelEligible={workContextModelEligible}
+          onChange={context.onWorkContextChange}
+          onOpenModelPicker={() => context.onModelPickerOpenChange(true)}
+        />
+      ) : null}
+      <ReactSessionComposer
+        draft={props.draft}
       mentions={mentions}
       onDraftChange={handleDraftChange}
       onSend={handleRunTask}
@@ -264,9 +289,13 @@ export function NewTaskComposer(props: NewTaskComposerProps) {
       steering={false}
       submissionPreparing={props.busy}
       queuedCount={0}
-      disabled={Boolean(context?.modelUnavailable)}
-      modelUnavailable={context?.modelUnavailable}
-      modelUnavailableMessage={context?.modelUnavailableMessage}
+      disabled={Boolean(context?.modelUnavailable) || Boolean(context?.workContextBusy) || !workContextModelEligible}
+      modelUnavailable={Boolean(context?.modelUnavailable) || !workContextModelEligible}
+      modelUnavailableMessage={context?.modelUnavailableMessage ?? (!workContextModelEligible
+        ? context?.workContext.dataContext === "client"
+          ? "Client data requires the approved EU-hosted Nemotron model."
+          : "Choose one of the retained OpenAI or Claude models for Internal work."
+        : null)}
       organizationModelsEmpty={context?.organizationModelsEmpty}
       statusLabel=""
       modelPickerOpen={context?.modelPickerOpen ?? false}
@@ -313,9 +342,10 @@ export function NewTaskComposer(props: NewTaskComposerProps) {
       isSandboxWorkspace={context?.isSandboxWorkspace ?? false}
       onUploadInboxFiles={null}
       // The hero owns its own page padding, so the composer must fill the hero column and line up with the suggestion cards.
-      flush
-      draftScopeKey={`new-task:${workspaceId ?? "chat-first"}`}
-    />
+        flush
+        draftScopeKey={`new-task:${workspaceId ?? "chat-first"}`}
+      />
+    </>
   );
 }
 

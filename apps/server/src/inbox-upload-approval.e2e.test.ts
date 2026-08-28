@@ -20,8 +20,9 @@ afterEach(async () => {
 });
 
 async function startManualApprovalServer() {
-  const root = await mkdtemp(join(tmpdir(), "openwork-inbox-approval-"));
-  roots.push(root);
+  const root = await mkdtemp(join(tmpdir(), "openwork-inbox-workspace-"));
+  const runtimeRoot = await mkdtemp(join(tmpdir(), "openwork-inbox-runtime-"));
+  roots.push(root, runtimeRoot);
   const config: ServerConfig = {
     host: "127.0.0.1",
     port: 0,
@@ -39,10 +40,11 @@ async function startManualApprovalServer() {
     hostTokenSource: "cli",
     logFormat: "pretty",
     logRequests: false,
+    configPath: join(runtimeRoot, "server.json"),
   };
   const server = await startServer(config) as Served;
   stops.push(() => server.stop(true));
-  return { base: `http://127.0.0.1:${server.port}`, token: config.token, root };
+  return { base: `http://127.0.0.1:${server.port}`, token: config.token, root, runtimeRoot };
 }
 
 describe("inbox uploads under manual approval mode", () => {
@@ -92,7 +94,7 @@ describe("inbox uploads under manual approval mode", () => {
   });
 
   test("preserves a valid upload whose destination basename is exactly 255 bytes", async () => {
-    const { base, token, root } = await startManualApprovalServer();
+    const { base, token, root, runtimeRoot } = await startManualApprovalServer();
     const bytes = new TextEncoder().encode("boundary upload");
     const form = new FormData();
     form.append("file", new File([bytes], "valid.txt", { type: "text/plain" }));
@@ -106,9 +108,14 @@ describe("inbox uploads under manual approval mode", () => {
 
     expect(new TextEncoder().encode(basename).byteLength).toBe(255);
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ ok: true, path: inboxPath, bytes: bytes.length });
-    const dest = join(root, ".opencode", "openwork", "inbox", inboxPath);
+    const payload = await response.json() as Record<string, unknown>;
+    expect(payload).toMatchObject({ ok: true, path: inboxPath, bytes: bytes.length });
+    expect(typeof payload.executionPath).toBe("string");
+    const dest = String(payload.executionPath);
+    expect(dest.startsWith(join(runtimeRoot, "workspace-files"))).toBe(true);
+    expect(dest.startsWith(root)).toBe(false);
     expect(Array.from(new Uint8Array(await readFile(dest)))).toEqual(Array.from(bytes));
+    await expect(stat(join(root, ".opencode", "openwork"))).rejects.toThrow();
   });
 
   test("rejects Windows-unsafe destination segments before an approval-free upload", async () => {
@@ -131,12 +138,12 @@ describe("inbox uploads under manual approval mode", () => {
 
       expect(response.status).toBe(400);
       expect(await response.json()).toMatchObject({ code: "invalid_path" });
-      await expect(stat(join(root, ".opencode", "openwork", "inbox", inboxPath))).rejects.toThrow();
+      await expect(stat(join(root, ".opencode", "openwork"))).rejects.toThrow();
     }
   });
 
   test("chat-attachment inbox upload succeeds immediately without host approval", async () => {
-    const { base, token, root } = await startManualApprovalServer();
+    const { base, token, root, runtimeRoot } = await startManualApprovalServer();
     const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3, 4]);
     const form = new FormData();
     form.append("file", new File([bytes], "screenshot.png", { type: "image/png" }));
@@ -151,7 +158,9 @@ describe("inbox uploads under manual approval mode", () => {
 
     // Positive half: the upload lands and reports the exact byte count.
     expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ ok: true, path: inboxPath, bytes: bytes.length });
+    const payload = await response.json() as Record<string, unknown>;
+    expect(payload).toMatchObject({ ok: true, path: inboxPath, bytes: bytes.length });
+    expect(typeof payload.executionPath).toBe("string");
 
     // Negative half: it must not have parked on the approval queue. Before the
     // fix this request waited the full approval timeout and returned 403
@@ -159,8 +168,11 @@ describe("inbox uploads under manual approval mode", () => {
     expect(elapsedMs).toBeLessThan(APPROVAL_TIMEOUT_MS);
 
     // The bytes are intact and confined to the inbox drop area.
-    const dest = join(root, ".opencode", "openwork", "inbox", inboxPath);
+    const dest = String(payload.executionPath);
+    expect(dest.startsWith(join(runtimeRoot, "workspace-files"))).toBe(true);
+    expect(dest.startsWith(root)).toBe(false);
     expect(Array.from(new Uint8Array(await readFile(dest)))).toEqual(Array.from(bytes));
+    await expect(stat(join(root, ".opencode", "openwork"))).rejects.toThrow();
   });
 
   test("other workspace writes remain approval-gated (fix is not a blanket bypass)", async () => {

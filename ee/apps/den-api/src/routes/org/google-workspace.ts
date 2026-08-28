@@ -31,6 +31,11 @@ import {
 } from "../../capability-sources/google-workspace-api.js"
 import type { ConnectedAccountRow } from "../../capability-sources/oauth-credentials.js"
 import { getNativeOAuthProvider } from "../../capability-sources/provider-registry.js"
+import {
+  createNativeGoogleFile,
+  NativeGoogleFileApiError,
+  updateNativeGoogleFile,
+} from "../../google-workspace/native-files.js"
 import { listTeamsForMember } from "../../orgs.js"
 import { readInternalCapabilityConnectorId } from "../../session.js"
 import type { OrgRouteVariables } from "./shared.js"
@@ -278,6 +283,77 @@ const uploadDriveFileResponseSchema = z.object({
   file: driveFileSummarySchema,
 }).meta({ ref: "GoogleWorkspaceUploadDriveFileResponse" })
 
+const nativeFileParamSchema = z.object({
+  fileId: z.string().trim().min(1).max(512).describe("Existing Google Docs, Sheets, or Slides file id."),
+})
+
+const nativeFileCellSchema = z.union([
+  z.string().max(50_000),
+  z.number().finite(),
+  z.boolean(),
+  z.null(),
+])
+
+const nativeSpreadsheetValuesSchema = z.array(z.array(nativeFileCellSchema).max(200)).min(1).max(2_000)
+  .superRefine((rows, context) => {
+    const cellCount = rows.reduce((total, row) => total + row.length, 0)
+    if (cellCount > 20_000) context.addIssue({ code: "custom", message: "Spreadsheet content is limited to 20,000 cells." })
+  })
+
+const nativeSlidesSchema = z.array(z.object({
+  title: z.string().max(5_000),
+  body: z.string().max(50_000),
+}).strict()).min(1).max(100)
+
+const nativeFileCreateBodySchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("document"),
+    name: z.string().trim().min(1).max(250),
+    folderId: z.string().trim().min(1).max(512).optional(),
+    text: z.string().min(1).max(1_000_000),
+  }).strict(),
+  z.object({
+    type: z.literal("spreadsheet"),
+    name: z.string().trim().min(1).max(250),
+    folderId: z.string().trim().min(1).max(512).optional(),
+    sheetName: z.string().trim().min(1).max(100).default("Sheet1"),
+    values: nativeSpreadsheetValuesSchema,
+  }).strict(),
+  z.object({
+    type: z.literal("presentation"),
+    name: z.string().trim().min(1).max(250),
+    folderId: z.string().trim().min(1).max(512).optional(),
+    slides: nativeSlidesSchema,
+  }).strict(),
+]).meta({ ref: "GoogleWorkspaceNativeFileCreateBody" })
+
+const nativeFileUpdateBodySchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("document"),
+    name: z.string().trim().min(1).max(250).optional(),
+    folderId: z.string().trim().min(1).max(512).optional(),
+    text: z.string().min(1).max(1_000_000),
+  }).strict(),
+  z.object({
+    type: z.literal("spreadsheet"),
+    name: z.string().trim().min(1).max(250).optional(),
+    folderId: z.string().trim().min(1).max(512).optional(),
+    sheetName: z.string().trim().min(1).max(100).default("Sheet1"),
+    values: nativeSpreadsheetValuesSchema,
+  }).strict(),
+  z.object({
+    type: z.literal("presentation"),
+    name: z.string().trim().min(1).max(250).optional(),
+    folderId: z.string().trim().min(1).max(512).optional(),
+    slides: nativeSlidesSchema,
+  }).strict(),
+]).meta({ ref: "GoogleWorkspaceNativeFileUpdateBody" })
+
+const nativeFileResponseSchema = z.object({
+  ok: z.literal(true),
+  file: driveFileSummarySchema,
+}).meta({ ref: "GoogleWorkspaceNativeFileResponse" })
+
 const driveFileResponseSchema = z.object({
   ok: z.literal(true),
   file: driveFileSummarySchema.extend({
@@ -331,6 +407,23 @@ function calendarApiBase(): string {
 function driveApiBase(): string {
   // Calendar and Drive normally share www.googleapis.com; one env knob keeps Google API tests simple.
   return (env.googleApiBaseUrl ?? "https://www.googleapis.com").replace(/\/+$/, "")
+}
+
+function nativeFileApiBase(type: "document" | "spreadsheet" | "presentation"): string {
+  if (env.googleApiBaseUrl) return env.googleApiBaseUrl.replace(/\/+$/, "")
+  if (type === "document") return "https://docs.googleapis.com"
+  if (type === "spreadsheet") return "https://sheets.googleapis.com"
+  return "https://slides.googleapis.com"
+}
+
+function nativeFileError(error: unknown): { error: "google_api_error"; message: string } {
+  if (error instanceof NativeGoogleFileApiError) {
+    return { error: "google_api_error", message: error.message }
+  }
+  return {
+    error: "google_api_error",
+    message: error instanceof Error ? error.message : "Google native file operation failed.",
+  }
 }
 
 export function missingScope(account: ConnectedAccountRow, anyOf: string[]): boolean {
@@ -1176,6 +1269,94 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
         end: event.end,
         meetLink: event.meetLink,
       })
+    },
+  )
+
+  app.post(
+    "/v1/capabilities/google-workspace/native-files",
+    describeRoute({
+      tags: ["Capability Sources"],
+      summary: "Create a native Google document, spreadsheet, or presentation",
+      description: "Creates exactly one Google Docs document, Google Sheets spreadsheet, or Google Slides presentation from structured content, optionally moves it into a Drive folder, and returns the real Drive link. Use this only when the user explicitly asks to create or publish the Google file; drafting local content does not call this capability.",
+      responses: {
+        200: jsonResponse("Native Google file created.", nativeFileResponseSchema),
+        400: jsonResponse("The native file request was invalid.", invalidRequestSchema),
+        401: jsonResponse("The caller must be signed in.", unauthorizedSchema),
+        409: jsonResponse("The calling member has not connected their Google account or is missing permission.", needsConnectionSchema),
+        502: jsonResponse("Google rejected the request.", upstreamErrorSchema),
+      },
+    }),
+    orgMemberRoute(),
+    jsonValidator(nativeFileCreateBodySchema),
+    async (c) => {
+      const payload = c.get("organizationContext")
+      const token = await googleWorkspaceToken({
+        organizationId: payload.organization.id,
+        orgMembershipId: payload.currentMember.id,
+      })
+      if (token.kind === "google_api_error") return c.json({ error: "google_api_error", message: token.message }, 502)
+      if (token.kind === "needs_connection") return c.json({ error: "needs_connection", message: token.message }, 409)
+      if (missingScope(token.account, [DRIVE_FILE_SCOPE, DRIVE_FULL_SCOPE])) {
+        return c.json({ error: "needs_connection", message: missingPermissionMessage("Google Drive write") }, 409)
+      }
+
+      const input = c.req.valid("json")
+      try {
+        const file = await createNativeGoogleFile(input, {
+          accessToken: token.accessToken,
+          apiBase: nativeFileApiBase(input.type),
+          driveApiBase: driveApiBase(),
+          fetch: googleWorkspaceApiFetch,
+        })
+        return c.json({ ok: true, file })
+      } catch (error) {
+        return c.json(nativeFileError(error), 502)
+      }
+    },
+  )
+
+  app.patch(
+    "/v1/capabilities/google-workspace/native-file/:fileId",
+    describeRoute({
+      tags: ["Capability Sources"],
+      summary: "Replace a native Google document, spreadsheet, or presentation",
+      description: "Replaces the complete editable content of one existing Google Docs document, Google Sheets spreadsheet, or Google Slides presentation by file id. It can also rename or move the file and returns the real Drive link. Use this only when the user explicitly asks to update that existing Google file.",
+      responses: {
+        200: jsonResponse("Native Google file updated.", nativeFileResponseSchema),
+        400: jsonResponse("The native file request was invalid.", invalidRequestSchema),
+        401: jsonResponse("The caller must be signed in.", unauthorizedSchema),
+        409: jsonResponse("The calling member has not connected their Google account or is missing permission.", needsConnectionSchema),
+        502: jsonResponse("Google rejected the request.", upstreamErrorSchema),
+      },
+    }),
+    orgMemberRoute(),
+    paramValidator(nativeFileParamSchema),
+    jsonValidator(nativeFileUpdateBodySchema),
+    async (c) => {
+      const payload = c.get("organizationContext")
+      const token = await googleWorkspaceToken({
+        organizationId: payload.organization.id,
+        orgMembershipId: payload.currentMember.id,
+      })
+      if (token.kind === "google_api_error") return c.json({ error: "google_api_error", message: token.message }, 502)
+      if (token.kind === "needs_connection") return c.json({ error: "needs_connection", message: token.message }, 409)
+      if (missingScope(token.account, [DRIVE_FILE_SCOPE, DRIVE_FULL_SCOPE])) {
+        return c.json({ error: "needs_connection", message: missingPermissionMessage("Google Drive write") }, 409)
+      }
+
+      const { fileId } = c.req.valid("param")
+      const input = c.req.valid("json")
+      try {
+        const file = await updateNativeGoogleFile(fileId, input, {
+          accessToken: token.accessToken,
+          apiBase: nativeFileApiBase(input.type),
+          driveApiBase: driveApiBase(),
+          fetch: googleWorkspaceApiFetch,
+        })
+        return c.json({ ok: true, file })
+      } catch (error) {
+        return c.json(nativeFileError(error), 502)
+      }
     },
   )
 

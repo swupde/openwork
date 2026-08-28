@@ -3,6 +3,7 @@ import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } fro
 import type { UIMessage } from "ai";
 import { useQuery } from "@tanstack/react-query";
 import type { SessionStatus } from "@opencode-ai/sdk/v2/client";
+import type { WorkContext } from "@openwork/types/work-context";
 import { Check, Minimize2 } from "lucide-react";
 import { toast } from "@/components/ui/sonner";
 
@@ -25,6 +26,7 @@ import type {
   McpServerEntry,
   McpStatusMap,
   ModelRef,
+  ModelOption,
   PendingPermission,
   PendingQuestion,
   SkillCard,
@@ -41,6 +43,8 @@ import type {
   CloudMcpSubmissionResult,
 } from "@/react-app/domains/connections/cloud-mcp-submit-readiness";
 import { ReactSessionComposer } from "./composer/composer";
+import { WorkContextBar } from "@/react-app/domains/session/work-context/work-context-bar";
+import { isModelEligible } from "@/react-app/domains/session/work-context/model-policy";
 import { useSessionModelSelection } from "./session-model-store";
 import type { ProviderCatalog } from "./use-model-behavior";
 import { decodeComposerMentionValue, encodeComposerMentionValue, type ComposerMentionKind } from "./composer/mention-encoding";
@@ -311,6 +315,11 @@ export type SessionSurfaceProps = {
   modelUnavailableMessage?: string | null;
   organizationModelsEmpty?: boolean;
   selectedModel: ModelRef;
+  modelOptions: ModelOption[];
+  workContext: WorkContext;
+  workContextBusy: boolean;
+  workContextError: string | null;
+  onWorkContextChange: (context: WorkContext) => void;
   /** providerID → modelID → provider model, for per-session variant options. */
   providerCatalog?: ProviderCatalog;
   /** Den/import includes OpenWork Models for this org member (not just local sync). */
@@ -733,6 +742,17 @@ export function SessionSurface(props: SessionSurfaceProps) {
   const handleOpenModelPicker = useCallback(() => {
     props.onModelClick(props.sessionId);
   }, [props.onModelClick, props.sessionId]);
+  const workContextModelOption = props.modelOptions.find(
+    (option) => option.providerID === sessionModel.selectedModel.providerID && option.modelID === sessionModel.selectedModel.modelID,
+  );
+  const workContextModelEligible = isModelEligible(
+    sessionModel.selectedModel,
+    workContextModelOption,
+    props.workContext.dataContext,
+  );
+  const workContextModelMessage = props.workContext.dataContext === "client"
+    ? "Client data requires the approved EU-hosted Nemotron model."
+    : "Choose one of the retained OpenAI or Claude models for Internal work.";
   const [error, setError] = useState<SessionError | null>(null);
   const [restoringRevertedMessages, setRestoringRevertedMessages] = useState(false);
   const [showDelayedLoading, setShowDelayedLoading] = useState(false);
@@ -2121,6 +2141,14 @@ export function SessionSurface(props: SessionSurfaceProps) {
       </div>
 
       <div ref={composerShellRef} className="shrink-0 px-0 pb-2 pt-2">
+        <WorkContextBar
+          context={props.workContext}
+          busy={props.workContextBusy}
+          error={props.workContextError}
+          modelEligible={workContextModelEligible}
+          onChange={props.onWorkContextChange}
+          onOpenModelPicker={handleOpenModelPicker}
+        />
         {(props.providerConnectedCount ?? 0) === 0 ? (
           <button
             type="button"
@@ -2165,9 +2193,9 @@ export function SessionSurface(props: SessionSurfaceProps) {
         steering={steering}
         submissionPreparing={preparingCloudTools}
         queuedCount={queuedItems.length}
-        disabled={model.transitionState !== "idle" || Boolean(props.modelUnavailable)}
-        modelUnavailable={Boolean(props.modelUnavailable)}
-        modelUnavailableMessage={props.modelUnavailableMessage}
+        disabled={model.transitionState !== "idle" || Boolean(props.modelUnavailable) || props.workContextBusy || !workContextModelEligible}
+        modelUnavailable={Boolean(props.modelUnavailable) || !workContextModelEligible}
+        modelUnavailableMessage={props.modelUnavailableMessage ?? (!workContextModelEligible ? workContextModelMessage : null)}
         organizationModelsEmpty={props.organizationModelsEmpty}
         statusLabel={statusLabel(snapshot ?? undefined, chatStreaming)}
         modelPickerOpen={modelPickerOpen}

@@ -35,6 +35,8 @@ import { findManagedEngineWorkspace } from "./workspaces.js";
 import { keepOpenworkRuntimeConfigFileFresh, writeOpenworkRuntimeConfigFile } from "./openwork-runtime-config.js";
 import { sweepLegacyOpenCodeConfig } from "./legacy-config-sweep.js";
 import { resolveOpencodeModelsUrl } from "./opencode-models-url.js";
+import { runtimeStorageDir } from "./runtime-db.js";
+import { OPENWORK_RUNTIME_STORAGE_ENV } from "./runtime-workspace-files.js";
 import type { ServeResult } from "./serve-node.js";
 import type { LocalManagedMcpVaultKeyProvider, ServerConfig } from "./types.js";
 
@@ -212,6 +214,7 @@ export async function startEmbeddedServer(options: EmbeddedServerOptions): Promi
         OPENWORK_SERVER_TOKEN: config.token,
         OPENCODE_CONFIG: runtimeConfigPath,
         OPENCODE_MODELS_URL: opencodeModelsUrl,
+        [OPENWORK_RUNTIME_STORAGE_ENV]: runtimeStorageDir(config),
       };
       engineSpawnTemplate = {
         bin: opencodeBin,
