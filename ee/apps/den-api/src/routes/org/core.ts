@@ -9,7 +9,6 @@ import { auth } from "../../auth.js"
 import { verifyBotProtection } from "../../bot-protection.js"
 import { validateBrandIconUrl } from "../../brand-icon-validation.js"
 import { organizationCloudEnabled } from "../../capability-sources/cloud-rollout.js"
-import { workflowsEnabled } from "../../capability-sources/workflow-rollout.js"
 import { memberFacingMcpConnectionsEnabled } from "../../capability-sources/external-mcp-rollout.js"
 import { organizationInstallLinksEnabled } from "../../capability-sources/install-links-rollout.js"
 import { db } from "../../db.js"
@@ -20,6 +19,7 @@ import { authenticatedRoute, jsonValidator, orgMemberRoute, orgRoleRoute, public
 import { denTypeIdSchema, enterprisePlanRequiredSchema, forbiddenSchema, invalidRequestSchema, jsonResponse, notFoundSchema, unauthorizedSchema } from "../../openapi.js"
 import { validateInvitationAcceptVerification } from "../../organization-join-verification.js"
 import { normalizeOrganizationMetadata } from "../../organization-limits.js"
+import { isOpenWorkWebAvailable } from "../../openwork-web-availability.js"
 import {
   acceptInvitationForUser,
   createOrganizationForUser,
@@ -708,15 +708,27 @@ export function registerOrgCoreRoutes<T extends { Variables: OrgRouteVariables }
         plan: parseOrganizationPlan(payload.organization.metadata),
         entitlements: getOrganizationEntitlements(payload.organization.metadata),
         capabilities: {
+          // Protocol capability: clients must see this explicit signal before
+          // calling the dashboard routes. Older Den versions omit the field,
+          // allowing newer Desktop builds to fail closed during a staggered
+          // rollout instead of calling an endpoint that does not exist yet.
+          orgManagedDashboards: true,
           // Expose the effective value, not the raw stored flag: Connect is
           // member-facing default-on unless an explicit org kill switch says no.
           mcpConnections: memberFacingMcpConnectionsEnabled(payload.organization.metadata, {
             gatingEnabled: env.mcpConnectionsGatingEnabled,
           }),
-          workflows: workflowsEnabled(payload.organization.metadata),
+          // Workflows/Code Mode are enabled for every organization; the field
+          // remains for published clients that still read it.
+          workflows: true,
           installLinks: organizationInstallLinksEnabled(payload.organization.metadata, {
             gatingEnabled: env.installLinksGatingEnabled,
           }),
+          // Deployment capability: OpenWork Web is generally available to all
+          // organizations only when a hosted-style multi-org Den has the
+          // dedicated Stripe Web product configured. This is never read from
+          // mutable organization metadata.
+          openworkWeb: isOpenWorkWebAvailable(),
           ...(cloudEnabled ? { cloud: true } : {}),
         },
         authMethods: {

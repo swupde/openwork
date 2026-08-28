@@ -63,6 +63,14 @@ import {
   searchNativeCapabilities,
 } from "./native-capabilities.js"
 import {
+  executeRemoteSessionCapability,
+  parseRemoteSessionCapabilityName,
+  remoteSessionCapabilitiesEnabled,
+  searchRemoteSessionCapabilities,
+  type RemoteSessionAction,
+} from "./remote-session-capabilities.js"
+import { DEN_MCP_WRITE_SCOPE } from "./scopes.js"
+import {
   compareCapabilityMatches,
   EXECUTE_CAPABILITY_TOOL_NAME,
   searchCapabilities,
@@ -74,7 +82,7 @@ import {
 import type { AgentToolContentPart } from "./tool-content.js"
 import { externalToolContent } from "./tool-content.js"
 
-export const CAPABILITY_SOURCE_KINDS = ["catalog", "native", "externalMcp", "marketplace", "builtinSkill", "admin"] as const
+export const CAPABILITY_SOURCE_KINDS = ["catalog", "native", "externalMcp", "marketplace", "builtinSkill", "remoteSession", "admin"] as const
 export type CapabilitySourceKind = (typeof CAPABILITY_SOURCE_KINDS)[number]
 
 export type ParsedCapability =
@@ -83,6 +91,7 @@ export type ParsedCapability =
   | { kind: "externalMcp"; name: string; connectionId: string; toolName: string }
   | { kind: "marketplace"; name: string; configObjectId: string; pluginId: string }
   | { kind: "builtinSkill"; name: string }
+  | { kind: "remoteSession"; name: string; action: RemoteSessionAction }
   | { kind: "admin"; name: string; toolName: string }
 
 export type ExecuteCapabilityToolResult = {
@@ -108,10 +117,9 @@ export type CapabilityRegistryContext = {
   organizationId: DenTypeId<"organization">
   member: McpMemberIdentity | null
   redirectUriBase: string
-  codemodeEnabled: boolean
   generatedArtifactViewsEnabled: boolean
   externalMcpConnectionsEnabled: boolean
-  mcpAppsEnabled: boolean
+  remoteSessionsEnabled: boolean
   resolvePlatformAdmin: () => Promise<boolean>
   resolveNamespaceContext: () => Promise<CodemodeConnectionNamespaceContext>
 }
@@ -124,11 +132,9 @@ export type CapabilityRegistryContextInput = {
   organizationId: DenTypeId<"organization">
   member: McpMemberIdentity | null
   redirectUriBase: string
-  codemodeEnabled: boolean
   generatedArtifactViewsEnabled: boolean
   organizationMetadata: Parameters<typeof memberFacingMcpConnectionsEnabled>[0]
   mcpConnectionsGatingEnabled: boolean
-  mcpAppsEnabled?: boolean
 }
 
 export function createCapabilityRegistryContext(input: CapabilityRegistryContextInput): CapabilityRegistryContext {
@@ -157,10 +163,9 @@ export function createCapabilityRegistryContext(input: CapabilityRegistryContext
     organizationId: input.organizationId,
     member: input.member,
     redirectUriBase: input.redirectUriBase,
-    codemodeEnabled: input.codemodeEnabled,
     generatedArtifactViewsEnabled: input.generatedArtifactViewsEnabled,
     externalMcpConnectionsEnabled,
-    mcpAppsEnabled: input.mcpAppsEnabled === true,
+    remoteSessionsEnabled: remoteSessionCapabilitiesEnabled(input.organizationMetadata),
     resolvePlatformAdmin,
     resolveNamespaceContext,
   }
@@ -420,7 +425,6 @@ async function executeMarketplaceSource(
     pluginId: parsed.pluginId,
     configObjectId: parsed.configObjectId,
     body: input.body,
-    codemodeEnabled: ctx.codemodeEnabled,
     validateScriptOutput: true,
     enabled: ctx.externalMcpConnectionsEnabled,
     redirectUriBase: ctx.redirectUriBase,
@@ -443,9 +447,7 @@ const catalogSource: CapabilitySource = {
       )),
       query,
       limit,
-    ).map((match) => ctx.codemodeEnabled
-      ? { ...match, scriptPath: codemodeScriptPath("den", match.name) }
-      : match)
+    ).map((match) => ({ ...match, scriptPath: codemodeScriptPath("den", match.name) }))
   },
   enumerate: (ctx) => Promise.resolve(leavesFromBuilt(buildDenCatalogToolTree({
     ...ctx,
@@ -490,8 +492,7 @@ const nativeSource: CapabilitySource = {
       query,
       catalog: ctx.catalog,
       limit,
-      includeScriptPaths: ctx.codemodeEnabled,
-      namespaceContext: ctx.codemodeEnabled ? await ctx.resolveNamespaceContext() : undefined,
+      namespaceContext: await ctx.resolveNamespaceContext(),
     })
   },
   enumerate: async (ctx) => leavesFromBuilt(await buildNativeProviderToolTree({
@@ -530,9 +531,7 @@ const externalMcpSource: CapabilitySource = {
       query,
       redirectUriBase: ctx.redirectUriBase,
       limit,
-      includeScriptPaths: ctx.codemodeEnabled,
-      namespaceContext: ctx.codemodeEnabled ? await ctx.resolveNamespaceContext() : undefined,
-      mcpAppsEnabled: ctx.mcpAppsEnabled,
+      namespaceContext: await ctx.resolveNamespaceContext(),
       reportCoverage: (coverage) => ctx.reportExternalCoverage(externalMcpSearchCoverageHint(coverage)),
     })
   },
@@ -585,7 +584,6 @@ const externalMcpSource: CapabilitySource = {
       args: normalizeToolBody(input.body),
       schemaDigest: input.schemaDigest,
       redirectUriBase: ctx.redirectUriBase,
-      mcpAppsEnabled: ctx.mcpAppsEnabled,
     })
     return result.ok
       ? externalCapabilitySuccessToolResult(result)
@@ -602,7 +600,6 @@ const marketplaceSource: CapabilitySource = {
   search: async (ctx, query, limit) => {
     if (!ctx.sourceFilter.marketplace || !ctx.externalMcpConnectionsEnabled) return []
     const matches = await searchMarketplaceCapabilities({
-      codemodeEnabled: ctx.codemodeEnabled,
       organizationId: ctx.organizationId,
       member: ctx.member,
       objectTypes: ctx.marketplaceObjectTypes,
@@ -610,7 +607,7 @@ const marketplaceSource: CapabilitySource = {
       limit,
       enabled: ctx.externalMcpConnectionsEnabled,
     })
-    return matches.map((match) => ctx.codemodeEnabled && match.kind !== "workflow"
+    return matches.map((match) => match.kind !== "workflow"
       ? { ...match, scriptPath: codemodeScriptPath("marketplace", match.name) }
       : match)
   },
@@ -670,9 +667,7 @@ const builtinSkillSource: CapabilitySource = {
     : null,
   search: async (ctx, query, limit) => {
     if (!ctx.sourceFilter.skills) return []
-    return searchBuiltinSkillCapabilities(query, limit).map((match) => ctx.codemodeEnabled
-      ? { ...match, scriptPath: codemodeScriptPath("skills", match.name) }
-      : match)
+    return searchBuiltinSkillCapabilities(query, limit).map((match) => ({ ...match, scriptPath: codemodeScriptPath("skills", match.name) }))
   },
   enumerate: (ctx) => Promise.resolve(listBuiltinSkillDescriptors().map((skill) => contentLeaf({
     namespace: "skills",
@@ -692,6 +687,54 @@ const builtinSkillSource: CapabilitySource = {
   },
 }
 
+const remoteSessionSource: CapabilitySource = {
+  kind: "remoteSession",
+  parseName: (name) => {
+    const action = parseRemoteSessionCapabilityName(name)
+    return action ? { kind: "remoteSession", name, action } : null
+  },
+  search: async (ctx, query, limit) => {
+    // Remote sessions require an active membership and the organization's
+    // Cloud capability flag: a member of a flag-off org never discovers
+    // these capabilities. Worker provisioning state is checked at execute
+    // time and reported as an actionable needs-setup result.
+    if (!ctx.sourceFilter.api || !ctx.member || !ctx.remoteSessionsEnabled) return []
+    return searchRemoteSessionCapabilities(query, limit)
+  },
+  // Deliberately absent from the confined-script tool tree in v1: remote
+  // sessions are long-lived side effects that agents should drive through
+  // explicit execute_capability calls, not batched scripts.
+  enumerate: () => Promise.resolve([]),
+  execute: async (ctx, parsed, input) => {
+    if (!parsedForKind(parsed, "remoteSession")) return unknownCapabilityResult(input.name)
+    if (!ctx.remoteSessionsEnabled) {
+      return {
+        isError: true,
+        content: textContent(JSON.stringify({
+          error: "unknown_capability",
+          message: "Remote session capabilities are not available for this organization.",
+        })),
+      }
+    }
+    if (!ctx.member) {
+      return {
+        isError: true,
+        content: textContent(JSON.stringify({
+          error: "membership_required",
+          message: "Remote sessions require an active organization membership.",
+        })),
+      }
+    }
+    return executeRemoteSessionCapability({
+      action: parsed.action,
+      organizationId: ctx.organizationId,
+      userId: ctx.principal.userId,
+      hasWriteScope: ctx.principal.scopes.has(DEN_MCP_WRITE_SCOPE),
+      body: input.body,
+    })
+  },
+}
+
 const adminSource: CapabilitySource = {
   kind: "admin",
   parseName: (name) => {
@@ -701,9 +744,7 @@ const adminSource: CapabilitySource = {
   search: async (ctx, query, limit) => {
     if (!ctx.sourceFilter.admin) return []
     const matches = await searchAvailableAdminCapabilities(await ctx.resolvePlatformAdmin(), query, limit)
-    return matches.map((match) => ctx.codemodeEnabled
-      ? { ...match, scriptPath: codemodeScriptPath("admin", parseAdminCapabilityName(match.name) ?? match.name) }
-      : match)
+    return matches.map((match) => ({ ...match, scriptPath: codemodeScriptPath("admin", parseAdminCapabilityName(match.name) ?? match.name) }))
   },
   enumerate: async (ctx) => {
     const matches = await listAvailableAdminCapabilities(await ctx.resolvePlatformAdmin())
@@ -741,6 +782,7 @@ export const CAPABILITY_SOURCES: Record<CapabilitySourceKind, CapabilitySource> 
   externalMcp: externalMcpSource,
   marketplace: marketplaceSource,
   builtinSkill: builtinSkillSource,
+  remoteSession: remoteSessionSource,
   admin: adminSource,
 }
 

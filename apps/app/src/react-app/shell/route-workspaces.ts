@@ -102,10 +102,46 @@ export function classifyRouteSessionReadError(error: unknown): "not-found" | "re
     ? error.code
     : "";
   if (code === "session_not_found") return "not-found";
-  if (status === 502 || status === 503 || status === 504 || isTransientStartupError(describeRouteError(error))) {
+  if (
+    code === "opencode_unconfigured" ||
+    code === "opencode_engine_unreachable" ||
+    status === 502 ||
+    status === 503 ||
+    status === 504 ||
+    isTransientStartupError(describeRouteError(error))
+  ) {
     return "retryable";
   }
   return "error";
+}
+
+/**
+ * Runtime-backed session reads can briefly land between the desktop server
+ * accepting requests and the selected workspace engine becoming ready. Keep
+ * that startup gap inside a bounded retry instead of turning it into a route
+ * error. Terminal authorization and workspace errors still fail immediately.
+ */
+export async function readRouteSessionsWithRetry<T>(input: {
+  load: () => Promise<T>;
+  retryDelaysMs?: readonly number[];
+  wait?: (delayMs: number) => Promise<void>;
+}): Promise<T> {
+  const retryDelaysMs = input.retryDelaysMs ?? [];
+  const wait = input.wait ?? ((delayMs: number) => new Promise<void>((resolve) => {
+    window.setTimeout(resolve, delayMs);
+  }));
+
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await input.load();
+    } catch (error) {
+      const retryDelayMs = retryDelaysMs[attempt];
+      if (retryDelayMs === undefined || classifyRouteSessionReadError(error) !== "retryable") {
+        throw error;
+      }
+      await wait(retryDelayMs);
+    }
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -286,6 +322,39 @@ export function orderRouteWorkspaces(workspaces: RouteWorkspace[], orderIds: str
   }
 
   return ordered;
+}
+
+/**
+ * Capture the first visible workspace order and extend it without letting the
+ * server's active-workspace-first list reshuffle existing sidebar entries.
+ * IDs that are temporarily absent stay in the preference so a transient
+ * discovery gap cannot move them when they return.
+ */
+export function stabilizeRouteWorkspaceOrder(
+  workspaces: RouteWorkspace[],
+  orderIds: string[],
+): { orderIds: string[]; workspaces: RouteWorkspace[] } {
+  const stableOrderIds: string[] = [];
+  const seenIds = new Set<string>();
+
+  for (const value of orderIds) {
+    const id = value.trim();
+    if (!id || seenIds.has(id)) continue;
+    stableOrderIds.push(id);
+    seenIds.add(id);
+  }
+
+  for (const workspace of workspaces) {
+    const id = workspace.id.trim();
+    if (!id || seenIds.has(id)) continue;
+    stableOrderIds.push(id);
+    seenIds.add(id);
+  }
+
+  return {
+    orderIds: stableOrderIds,
+    workspaces: orderRouteWorkspaces(workspaces, stableOrderIds),
+  };
 }
 
 export function toSessionGroups(

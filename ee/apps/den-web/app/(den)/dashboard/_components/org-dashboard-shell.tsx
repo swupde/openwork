@@ -13,6 +13,7 @@ import {
   GitFork,
   Globe,
   Home,
+  LayoutDashboard,
   LibraryBig,
   LogOut,
   Menu,
@@ -39,6 +40,7 @@ import {
   getCustomLlmProvidersRoute,
   getDiagnosticsRoute,
   getDesktopPoliciesRoute,
+  getManagedDashboardsRoute,
   getOrgAccessFlags,
   getIntegrationsRoute,
   getInferenceRoute,
@@ -60,10 +62,10 @@ import {
 import { useOrgListWindow } from "../../_lib/use-org-list-window";
 import { useOrgDashboard } from "../_providers/org-dashboard-provider";
 import { buildDenFeedbackUrl } from "../../_lib/feedback";
-import { OrgSelectionScreen } from "./org-selection-screen";
+import { OrgSelectionScreen } from "../_features/org-selection/org-selection-screen";
 import { UserProfileDialog } from "./user-profile-dialog";
 
-const OPENWORK_DOCS_URL = "/docs";
+const OPENWORK_DOCS_URL = "https://openworklabs.com/docs";
 
 type DashboardNavChild = {
   href: string;
@@ -299,6 +301,9 @@ function getDashboardPageTitle(pathname: string, orgSlug: string | null) {
   if (pathname.startsWith(getMcpConnectionsRoute(orgSlug))) {
     return "Connectors";
   }
+  if (pathname.startsWith(getManagedDashboardsRoute(orgSlug))) {
+    return "Dashboards";
+  }
   if (pathname.startsWith(getYourConnectionsRoute(orgSlug))) {
     return "Your Connections";
   }
@@ -328,7 +333,7 @@ export function OrgDashboardShell({ children }: { children: React.ReactNode }) {
     activeOrg,
     orgDirectory,
     orgContext,
-    orgSelectionRequired,
+    orgSelectionOpen,
     orgBusy,
     orgError,
     mutationBusy,
@@ -376,14 +381,15 @@ export function OrgDashboardShell({ children }: { children: React.ReactNode }) {
     };
   }, [switcherOpen]);
 
-  if (orgSelectionRequired) {
+  // The picker replaces the whole shell until a workspace is chosen.
+  if (orgSelectionOpen) {
     return (
       <OrgSelectionScreen
         orgs={orgDirectory}
-        onSelect={switchOrganization}
+        pending={mutationBusy === "switch-organization"}
+        errorMessage={orgError}
+        onPick={switchOrganization}
         onSignOut={() => void signOut()}
-        busy={mutationBusy === "switch-organization"}
-        error={orgError}
       />
     );
   }
@@ -406,12 +412,12 @@ export function OrgDashboardShell({ children }: { children: React.ReactNode }) {
     orgSlug: activeOrg?.slug,
   });
   const mcpConnectionsEnabled = orgContext?.capabilities.mcpConnections === true;
+  const orgManagedDashboardsEnabled = orgContext?.capabilities.orgManagedDashboards === true;
   const workflowsEnabled = orgContext?.capabilities.workflows === true;
-  // Web access is backed by the existing hosted cloud capability. The org
-  // payload only reports `cloud` after the server rollout helper has verified
-  // the multi-org deployment gate, so the sidebar stays hidden by default until
-  // both config and org context load.
-  const showWeb = runtimeConfigLoaded && orgContext?.capabilities.cloud === true;
+  // Web is a deployment offer rather than an organization rollout flag. Den API
+  // advertises it only when the operator explicitly enables OpenWork Web.
+  const showWeb = runtimeConfigLoaded
+    && orgContext?.capabilities.openworkWeb === true;
 
   // One nav, two audiences. Members see Work only. Admins add Manage
   // (catalog + connectors + models), Observability, and Team. Connections
@@ -439,7 +445,6 @@ export function OrgDashboardShell({ children }: { children: React.ReactNode }) {
           href: activeOrg ? getWebRoute(activeOrg.slug) : "#",
           label: "OpenWork Web",
           icon: Globe,
-          badge: "Alpha",
         }]
       : []),
   ];
@@ -487,6 +492,13 @@ export function OrgDashboardShell({ children }: { children: React.ReactNode }) {
           icon: GitFork,
           badge: "Alpha",
         },
+        ...(orgManagedDashboardsEnabled
+          ? [{
+              href: getManagedDashboardsRoute(activeOrg.slug),
+              label: "Dashboards",
+              icon: LayoutDashboard,
+            }]
+          : []),
         ...(modelsGroup ? [modelsGroup] : []),
       ]
     : [];

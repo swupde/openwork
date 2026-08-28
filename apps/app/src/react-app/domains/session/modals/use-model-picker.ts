@@ -6,6 +6,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { DataContext } from "@openwork/types/work-context";
 import type { Client, ModelOption } from "@/app/types";
+import { getModelBehaviorSummary } from "@/app/lib/model-behavior";
 import { useCheckDesktopRestriction } from "@/react-app/domains/cloud/desktop-config-provider";
 import { isCloudManagedProviderKey } from "@/react-app/domains/connections/provider-auth/cloud-provider-config";
 import { filterEntitledModelOptions } from "@/react-app/domains/connections/provider-auth/provider-policy";
@@ -139,15 +140,17 @@ export function useModelPicker(input: UseModelPickerInput) {
       const isNew = !seenIds.has(provider.id) || recentProviderIds.has(provider.id);
       for (const id of modelIds) {
         const model = provider.models[id];
+        const summary = getModelBehaviorSummary(provider.id, model, null, provider.name);
         next.push({
           providerID: provider.id,
           modelID: id,
           title: colleagueFacingModelLabel(id, model.name || id),
           description: provider.name,
-          behaviorTitle: "Reasoning",
-          behaviorLabel: "Default",
-          behaviorDescription: "",
-          behaviorValue: null,
+          behaviorTitle: summary.title,
+          behaviorLabel: summary.label,
+          behaviorDescription: summary.description,
+          behaviorValue: summary.value,
+          behaviorOptions: summary.options,
           isFree: false,
           isRecommended: isNew,
           source: isCloudManagedProviderKey(provider.id) ? "cloud" : undefined,

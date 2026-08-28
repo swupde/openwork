@@ -10,7 +10,6 @@ import {
   EnginePool,
   enginePoolForConfig,
   isEngineConnectionFailure,
-  managedEnginePoolForConfig,
   setEnginePoolForConfig,
   type EnginePoolConnection,
   type EngineEventProxyLease,
@@ -25,6 +24,7 @@ import { sanitizePortableOpencodeConfig } from "./portable-opencode.js";
 import { addMcp, listMcp, removeMcp, setMcpEnabled } from "./mcp.js";
 import {
   callMcpAppTool,
+  listMcpAppCatalog,
   McpAppHostError,
   resolveConnectMcpAppResource,
   resolveMcpAppResource,
@@ -156,11 +156,14 @@ const OPENWORK_VOICE_TRANSCRIPTION_MODEL = "gpt-4o-transcribe";
 let desktopCloudSyncQueue: Promise<void> = Promise.resolve();
 const agentDiagnosticsLastRunByServer = new WeakMap<ServerConfig, Map<string, number>>();
 const agentDiagnosticsInFlightByServer = new WeakMap<ServerConfig, Set<string>>();
+const commandAdmissionsByServer = new WeakMap<ServerConfig, Map<string, { fingerprint: string; admittedAt: number }>>();
 const AGENT_DIAGNOSTICS_RATE_LIMIT_CAPACITY = 1_000;
 const AGENT_DIAGNOSTICS_MAX_IN_FLIGHT_PER_SERVER = 16;
 const AGENT_DIAGNOSTICS_MAX_REQUEST_BYTES = 256 * 1024;
 const AGENT_DIAGNOSTICS_DEFAULT_BODY_DEADLINE_MS = 2_000;
 const AGENT_DIAGNOSTICS_ERROR_FLUSH_MS = 25;
+const COMMAND_ADMISSION_CAPACITY = 10_000;
+const COMMAND_ADMISSION_TTL_MS = 24 * 60 * 60 * 1_000;
 
 function rethrowMcpAppHostError(error: unknown): never {
   if (!(error instanceof McpAppHostError)) throw error;
@@ -956,6 +959,43 @@ function isSessionCommandProxyRequest(method: string, proxyPath: string) {
   return method === "POST" && /^\/session\/[^/]+\/command$/.test(normalizeOpencodeProxyPath(proxyPath));
 }
 
+function commandAdmissionFromBody(body: ArrayBuffer | undefined): { messageId: string; fingerprint: string } | null {
+  if (!body) return null;
+  const text = new TextDecoder().decode(body);
+  try {
+    const value: unknown = JSON.parse(text);
+    if (!isRecord(value) || typeof value.messageID !== "string" || !value.messageID.trim()) return null;
+    return { messageId: value.messageID.trim(), fingerprint: hashToken(text) };
+  } catch {
+    return null;
+  }
+}
+
+function admitSessionCommand(
+  config: ServerConfig,
+  scope: string,
+  admission: { messageId: string; fingerprint: string },
+): "accepted" | "duplicate" | "conflict" {
+  const now = Date.now();
+  const admissions = commandAdmissionsByServer.get(config) ?? new Map<string, { fingerprint: string; admittedAt: number }>();
+  commandAdmissionsByServer.set(config, admissions);
+  for (const [key, value] of admissions) {
+    if (now - value.admittedAt <= COMMAND_ADMISSION_TTL_MS) break;
+    admissions.delete(key);
+  }
+
+  const key = hashToken(`${scope}\0${admission.messageId}`);
+  const existing = admissions.get(key);
+  if (existing) return existing.fingerprint === admission.fingerprint ? "duplicate" : "conflict";
+
+  if (admissions.size >= COMMAND_ADMISSION_CAPACITY) {
+    const oldest = admissions.keys().next().value;
+    if (oldest) admissions.delete(oldest);
+  }
+  admissions.set(key, { fingerprint: admission.fingerprint, admittedAt: now });
+  return "accepted";
+}
+
 function isPromptAsyncProxyRequest(method: string, proxyPath: string) {
   return method === "POST" && /^\/session\/[^/]+\/prompt_async$/.test(normalizeOpencodeProxyPath(proxyPath));
 }
@@ -991,7 +1031,7 @@ export async function startServer(config: ServerConfig): Promise<ServeResult> {
       engineMcpServerState,
       { forceStandby: true },
     ),
-    engineBusy: () => managedEnginePoolForConfig(config)
+    engineBusy: () => enginePoolForConfig(config)
       ? Promise.resolve(false)
       : engineHasActiveSessions(config, resolveEngineRuntimeWorkspace(config)),
     logger: toManagedProviderAuthLogger(logger),
@@ -1060,7 +1100,7 @@ export async function startServer(config: ServerConfig): Promise<ServeResult> {
         try {
           const actor = await requireClient(request, config, tokens);
           assertOpencodeProxyAllowed(actor, request.method, mount.restPath);
-          const workspace = await resolveWorkspace(config, mount.workspaceId);
+          const workspace = await resolveWorkspaceWithoutBootstrap(config, mount.workspaceId);
           proxyService = "opencode";
           proxyBaseUrl = workspace.baseUrl?.trim() || undefined;
           const response = await proxyOpencodeRequest({ config, request, url, workspace, proxyPath: mount.restPath });
@@ -1392,6 +1432,7 @@ export async function proxyOpencodeRequest(input: {
   }
   if (pool && method === "GET" && engineAggregateKind(proxyPath)) {
     return proxyEngineAggregateRead({
+      pool,
       connections: pool.connections(),
       proxyPath,
       search: input.url.search,
@@ -1402,14 +1443,30 @@ export async function proxyOpencodeRequest(input: {
   const targetUrl = buildOpencodeProxyUrl(baseUrl, proxyPath, input.url.search);
   // Managed OpenCode proxy traffic is loopback/engine I/O; keep streaming on Node fetch.
   if (isSessionCommandProxyRequest(method, proxyPath)) {
+    const commandAdmission = commandAdmissionFromBody(body);
+    if (commandAdmission) {
+      const admissionTarget = workspace ? `workspace\0${workspace.id}` : `engine\0${baseUrl}`;
+      const admission = admitSessionCommand(
+        input.config,
+        `${admissionTarget}\0${normalizeOpencodeProxyPath(proxyPath)}`,
+        commandAdmission,
+      );
+      if (admission === "duplicate") return jsonResponse({ ok: true, accepted: true });
+      if (admission === "conflict") {
+        return jsonResponse({
+          code: "command_admission_conflict",
+          message: "This command message ID was already admitted with different input",
+        }, 409);
+      }
+    }
     void loopbackFetch(targetUrl, {
       method,
       headers,
       body,
     }).then(() => {
-      managedEnginePoolForConfig(input.config)?.reportRequestSuccess(baseUrl);
+      enginePoolForConfig(input.config)?.reportRequestSuccess(baseUrl);
     }).catch((error: unknown) => {
-      if (workspace) managedEnginePoolForConfig(input.config)?.reportRequestFailure(baseUrl, error, workspace);
+      if (workspace) enginePoolForConfig(input.config)?.reportRequestFailure(baseUrl, error, workspace);
       // Command failures are surfaced through the OpenCode event stream.
     });
     return jsonResponse({ ok: true, accepted: true });
@@ -1418,9 +1475,9 @@ export async function proxyOpencodeRequest(input: {
     let response: Response;
     try {
       response = await loopbackFetch(targetUrl, { method, headers, body });
-      managedEnginePoolForConfig(input.config)?.reportRequestSuccess(baseUrl);
+      enginePoolForConfig(input.config)?.reportRequestSuccess(baseUrl);
     } catch (error) {
-      if (workspace) managedEnginePoolForConfig(input.config)?.reportRequestFailure(baseUrl, error, workspace);
+      if (workspace) enginePoolForConfig(input.config)?.reportRequestFailure(baseUrl, error, workspace);
       if (isEngineConnectionFailure(error)) throw opencodeUnreachableError(error, proxyPath);
       throw error;
     }
@@ -1434,7 +1491,7 @@ export async function proxyOpencodeRequest(input: {
           { method, headers: fallbackHeaders, body },
         );
       } catch (error) {
-        if (workspace) managedEnginePoolForConfig(input.config)?.reportRequestFailure(route.fallback.baseUrl, error, workspace);
+        if (workspace) enginePoolForConfig(input.config)?.reportRequestFailure(route.fallback.baseUrl, error, workspace);
         if (isEngineConnectionFailure(error)) throw opencodeUnreachableError(error, proxyPath);
         throw error;
       }
@@ -1490,6 +1547,7 @@ function pendingItemIdentity(value: unknown): string {
 }
 
 async function proxyEngineAggregateRead(input: {
+  pool: EnginePool;
   connections: EnginePoolConnection[];
   proxyPath: string;
   search: string;
@@ -1521,6 +1579,9 @@ async function proxyEngineAggregateRead(input: {
     return jsonResponse(merged);
   }
 
+  for (const result of results) {
+    input.pool.observePendingRequests(result.connection.generationId, result.payload);
+  }
   const seen = new Set<string>();
   const items: unknown[] = [];
   let containerKey: string | null = null;
@@ -1567,13 +1628,24 @@ function mergedEventBody(input: {
     start(controller) {
       let active = readers.length;
       let closed = false;
+      const close = () => {
+        if (closed) return;
+        closed = true;
+        if (pingTimer) clearInterval(pingTimer);
+        input.lease.signal.removeEventListener("abort", abort);
+        input.lease.release();
+        controller.close();
+      };
+      const abort = () => {
+        if (closed || cancelled) return;
+        cancelled = true;
+        for (const entry of readers) void entry.reader.cancel(input.lease.signal.reason).catch(() => undefined);
+        close();
+      };
       const finish = () => {
         active -= 1;
         if (active > 0 || closed || cancelled) return;
-        closed = true;
-        if (pingTimer) clearInterval(pingTimer);
-        input.lease.release();
-        controller.close();
+        close();
       };
       const pump = async (entry: typeof readers[number]) => {
         const decoder = new TextDecoder();
@@ -1605,6 +1677,8 @@ function mergedEventBody(input: {
         if (!closed && !cancelled) controller.enqueue(encoder.encode(": ping\n\n"));
       }, 30_000);
       pingTimer.unref?.();
+      input.lease.signal.addEventListener("abort", abort, { once: true });
+      if (input.lease.signal.aborted) abort();
     },
     async cancel(reason) {
       cancelled = true;
@@ -1773,7 +1847,7 @@ function buildCapabilities(config: ServerConfig): Capabilities {
     mcp: { read: true, write: writeEnabled },
     commands: { read: true, write: writeEnabled },
     config: { read: true, write: writeEnabled },
-    engine: { rollover: config.engineRollover === true },
+    engine: { rollover: enginePoolForConfig(config) !== null },
 
     approvals: { mode: config.approval.mode, timeoutMs: config.approval.timeoutMs },
     sandbox: { enabled: sandboxEnabled, backend: sandboxBackend },
@@ -2074,6 +2148,7 @@ function createRoutes(
     requireClientScope,
     resolveWorkspace,
     resolveWorkspaceWithoutBootstrap,
+    resolveOpencodeDirectory,
     createWorkspaceOpencodeClient,
     unwrapOpencodeResult,
   });
@@ -3049,6 +3124,21 @@ function createRoutes(
   addRoute(routes, "GET", "/mcp-apps/sandbox.css", "none", async () => new Response(MCP_APP_SANDBOX_PROXY_CSS, {
     headers: { "Content-Type": "text/css; charset=utf-8", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" },
   }));
+
+  addRoute(routes, "GET", "/workspace/:id/mcp-apps/list", "client", async (ctx) => {
+    requireClientScope(ctx, "viewer");
+    const workspace = await resolveWorkspace(config, ctx.params.id);
+    try {
+      const servers = await listMcpAppCatalog({
+        serverConfig: config,
+        workspaceId: workspace.id,
+        workspaceRoot: workspace.path,
+      });
+      return jsonResponse({ servers });
+    } catch (error) {
+      rethrowMcpAppHostError(error);
+    }
+  });
 
   addRoute(routes, "POST", "/workspace/:id/mcp-apps/resolve", "client", async (ctx) => {
     requireClientScope(ctx, "viewer");
@@ -4084,10 +4174,10 @@ async function engineHasActiveSessions(config: ServerConfig, workspace: Workspac
 /**
  * Bring the engine onto current config.
  *
- * With engine rollover enabled the pool decides: an idle engine still reloads
- * in place, a busy one rolls over to a standby so live runs are not aborted.
- * Disabled (the default), this is the in-place dispose and callers keep their
- * own defer-while-busy handling.
+ * Managed engines always reload through the rollover pool: an idle engine
+ * still reloads in place, a busy one rolls over to a standby so live runs are
+ * not aborted. Attached engines have no pool, so this falls back to the
+ * in-place dispose and callers keep their own defer-while-busy handling.
  */
 async function reloadOpencodeEngine(
   config: ServerConfig,
@@ -4095,9 +4185,7 @@ async function reloadOpencodeEngine(
   serverState?: EngineMcpServerState,
   options?: { awaitPostRefreshSync?: boolean; forceStandby?: boolean },
 ): Promise<void> {
-  const pool = options?.forceStandby
-    ? managedEnginePoolForConfig(config)
-    : enginePoolForConfig(config);
+  const pool = enginePoolForConfig(config);
   if (pool) {
     await pool.requestRollover({
       reason: "engine_reload",
@@ -4448,7 +4536,7 @@ async function postMcpEntryWithRetry(
         body: JSON.stringify({ name, config: mcpConfig }),
         signal: AbortSignal.timeout(15_000),
       });
-      managedEnginePoolForConfig(config)?.reportRequestSuccess(url.origin);
+      enginePoolForConfig(config)?.reportRequestSuccess(url.origin);
       if (response.ok) {
         // OpenCode's dynamic registration endpoint historically treats every
         // 2xx response as accepted delivery and Cloud readiness verifies the
@@ -4473,7 +4561,7 @@ async function postMcpEntryWithRetry(
       };
       if (response.status < 500) return { name, status: "failed", source: "transport_failure", errorSummary: null, failure };
     } catch (error) {
-      managedEnginePoolForConfig(config)?.reportRequestFailure(url.origin, error, workspace);
+      enginePoolForConfig(config)?.reportRequestFailure(url.origin, error, workspace);
       failure = {
         name,
         registrationStatus: "failed",

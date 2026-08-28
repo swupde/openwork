@@ -279,6 +279,12 @@ async function deleteOrganizationMemberConnectedAccounts(input: {
       eq(schema.ConnectedAccountTable.organizationId, organizationId),
       eq(schema.ConnectedAccountTable.orgMembershipId, orgMembershipId),
     ));
+  await db
+    .delete(schema.LlmProviderMemberCredentialTable)
+    .where(and(
+      eq(schema.LlmProviderMemberCredentialTable.organizationId, organizationId),
+      eq(schema.LlmProviderMemberCredentialTable.orgMembershipId, orgMembershipId),
+    ));
 }
 
 function throwMemberLifecycleError(message: string): never {
@@ -854,6 +860,15 @@ export const auth = betterAuth({
     }),
   },
   advanced: {
+    cookiePrefix: "openwork-den",
+    ...(env.betterAuthCookieDomain
+      ? {
+        crossSubDomainCookies: {
+          enabled: true,
+          domain: env.betterAuthCookieDomain,
+        },
+      }
+      : {}),
     ipAddress: {
       ipAddressHeaders: ["x-forwarded-for", "x-real-ip", "cf-connecting-ip"],
       ipv6Subnet: 64,

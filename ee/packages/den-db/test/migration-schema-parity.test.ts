@@ -11,7 +11,6 @@ import { drizzle } from "drizzle-orm/mysql2"
 import { migrate } from "drizzle-orm/mysql2/migrator"
 import { readMigrationFiles } from "drizzle-orm/migrator"
 import mysql from "mysql2/promise"
-import { ensureFulltextIndexes } from "../src/fulltext.ts"
 import { parseMySqlConnectionConfig } from "../src/mysql-config.ts"
 import { ensureSchemaRepairs, type Executor } from "../src/schema-repairs.ts"
 import { bootstrapDenDb } from "../scripts/bootstrap.ts"
@@ -515,11 +514,9 @@ test("migrations replay to exported schema and config object version inserts", {
 
     const migratedDb = drizzle(migratedConnection)
     await migrate(migratedDb, { migrationsFolder })
-    await ensureFulltextIndexes(executorFor(migratedConnection))
     await ensureSchemaRepairs(executorFor(migratedConnection))
 
     await applyStatements(exportedConnection, exportStatements)
-    await ensureFulltextIndexes(executorFor(exportedConnection))
     await ensureSchemaRepairs(executorFor(exportedConnection))
 
     await assertSchemasMatch(exportedConnection, migratedConnection)

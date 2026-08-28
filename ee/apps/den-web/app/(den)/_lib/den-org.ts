@@ -238,12 +238,15 @@ export type DenOrgEntitlements = {
   analytics: boolean;
 };
 
-/** Per-org feature flags controlled by platform admins; everything defaults to off. */
+/** Server-advertised and per-org capabilities; optional fields default to off. */
 export type DenOrgCapabilities = {
+  orgManagedDashboards: boolean;
   installLinks: boolean;
   mcpConnections: boolean;
+  /** Always on: Workflows/Code Mode shipped for every organization. Older servers may still return false. */
   workflows: boolean;
-  remoteMcpApps: boolean;
+  /** Deployment-wide Web offer; true only when Den explicitly enables OpenWork Web. */
+  openworkWeb: boolean;
   cloud: boolean;
 };
 
@@ -282,7 +285,6 @@ export const DEN_ROLE_PERMISSION_OPTIONS = {
 
 export const PENDING_ORG_INVITATION_STORAGE_KEY = "openwork:web:pending-org-invitation";
 export const PENDING_WORKSPACE_CLAIM_STORAGE_KEY = "openwork:web:pending-workspace-claim";
-export const PENDING_ORG_SELECTION_STORAGE_KEY = "openwork:web:pending-org-selection";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -479,14 +481,6 @@ export function getOrgAccessFlags(roleValue: string, isOwner: boolean, _roleDefi
   };
 }
 
-export function shouldRequireOrgSelection(orgs: readonly DenOrgSummary[]): boolean {
-  return orgs.length > 1 && !orgs.some((org) => org.isActive);
-}
-
-export function shouldOfferOrgSelection(orgs: readonly DenOrgSummary[]): boolean {
-  return orgs.length > 1;
-}
-
 export function formatRoleLabel(role: string): string {
   return role
     .split(/[-_\s]+/)
@@ -553,6 +547,14 @@ export function getWebRoute(orgSlug?: string | null): string {
 
 export function getLlmProvidersRoute(orgSlug?: string | null): string {
   return getCustomLlmProvidersRoute(orgSlug);
+}
+
+export function getManagedDashboardsRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/dashboards`;
+}
+
+export function getManagedDashboardRoute(orgSlug: string | null | undefined, dashboardId: string): string {
+  return `${getManagedDashboardsRoute(orgSlug)}/${encodeURIComponent(dashboardId)}`;
 }
 
 export function getDesktopPoliciesRoute(orgSlug?: string | null): string {
@@ -939,14 +941,17 @@ function parseOrgAuthMethods(value: unknown): DenOrgAuthMethods {
 
 function parseOrgCapabilities(value: unknown): DenOrgCapabilities {
   if (!isRecord(value)) {
-    return { installLinks: false, mcpConnections: false, workflows: false, remoteMcpApps: false, cloud: false };
+    return { orgManagedDashboards: false, installLinks: false, mcpConnections: false, workflows: true, openworkWeb: false, cloud: false };
   }
 
   return {
+    orgManagedDashboards: value.orgManagedDashboards === true,
     installLinks: value.installLinks === true,
     mcpConnections: value.mcpConnections === true,
-    workflows: value.workflows === true,
-    remoteMcpApps: value.remoteMcpApps === true,
+    // Workflows are enabled everywhere on current servers; only an explicit
+    // false from an older server still hides the surface.
+    workflows: value.workflows !== false,
+    openworkWeb: value.openworkWeb === true,
     cloud: value.cloud === true,
   };
 }
