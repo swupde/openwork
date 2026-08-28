@@ -20,6 +20,7 @@ import { createExecutor, type Executor } from "./db-executor.ts"
 const MIGRATIONS_TABLE = "__drizzle_migrations"
 const LEGACY_PRE_OAUTH_BASELINE_TAG = "0055_thick_chamber"
 const FIRST_POST_OAUTH_MIGRATION_TAG = "0057_codemode_scripts"
+const FIRST_FALSE_POST_OAUTH_BASELINE_TAG = "0068_glamorous_virginia_dare"
 const POST_OAUTH_SCHEMA_MARKERS = ["artifact_view_revision", "temp_file", "program_agent_selection", "remote_mcp_app"]
 
 const scriptPath = fileURLToPath(import.meta.url)
@@ -260,6 +261,82 @@ async function reconcilePostOauthBaseline(executor: Executor) {
   )
 }
 
+async function repairFalsePostOauthBaseline(executor: Executor) {
+  const firstFalseBaselineMillis = migrationMillis(FIRST_FALSE_POST_OAUTH_BASELINE_TAG)
+  const rows = await executor.query(`select max(created_at) as latest from \`${MIGRATIONS_TABLE}\``)
+  if (latestMigrationMillis(rows) < firstFalseBaselineMillis) {
+    return
+  }
+
+  // Older bootstrap versions ran the pre-OAuth recovery reconciliation for
+  // every existing database. Once the four recovery marker tables existed,
+  // that path recorded every later migration as applied without executing it.
+  // A healthy 0068+ schema has this first column, so leave it untouched.
+  if (await columnExists(executor, "scim_group_member", "organization_id")) {
+    return
+  }
+
+  const unexpectedPresent: string[] = []
+  for (const table of [
+    "scim_group_role_grant",
+    "scim_group_role",
+    "workflow_run",
+    "dashboard_access_grant",
+    "dashboard",
+    "llm_provider_member_credential",
+    "remote_session_command",
+  ]) {
+    if (await tableExists(executor, table)) unexpectedPresent.push(`table ${table}`)
+  }
+  for (const [table, column] of [
+    ["scim_group_member", "provider_id"],
+    ["scim_group_member", "membership_key"],
+    ["scim_group", "scim_group_id"],
+    ["scim_group", "external_id_key"],
+    ["team_member", "user_id"],
+    ["team_member", "membership_key"],
+    ["team", "member_count"],
+    ["llm_provider", "credential_mode"],
+    ["org_subscriptions", "payment_failed"],
+  ] as const) {
+    if (await columnExists(executor, table, column)) unexpectedPresent.push(`column ${table}.${column}`)
+  }
+  for (const [table, index] of [
+    ["account", "account_account_id_provider_id"],
+    ["oauthRefreshToken", "oauth_refresh_token_token"],
+    ["inference_org_limit_policies", "inference_org_limit_policies_current_bucket_id"],
+    ["worker", "worker_claimable_updated"],
+    ["connector_target", "connector_target_type_created_id"],
+  ] as const) {
+    if (await indexExists(executor, table, index)) unexpectedPresent.push(`index ${table}.${index}`)
+  }
+
+  const missingReplaySources: string[] = []
+  for (const table of [
+    "telegram_chat_binding",
+    "telegram_connection",
+    "telegram_pairing",
+    "telegram_update",
+    "program_agent_selection",
+    "codemode_run",
+    "memory_context",
+    "memory",
+  ]) {
+    if (!(await tableExists(executor, table))) missingReplaySources.push(`table ${table}`)
+  }
+
+  if (unexpectedPresent.length > 0 || missingReplaySources.length > 0) {
+    throw new Error(
+      `[den-db] Refusing to rewind an unrecognized post-OAuth migration state. ` +
+      `Unexpected applied schema: ${unexpectedPresent.join(", ") || "none"}. ` +
+      `Missing replay sources: ${missingReplaySources.join(", ") || "none"}.`,
+    )
+  }
+
+  console.log(`[den-db] falsely baselined post-OAuth schema detected; replaying migrations from ${FIRST_FALSE_POST_OAUTH_BASELINE_TAG}`)
+  await executor.query(`delete from \`${MIGRATIONS_TABLE}\` where created_at >= ?`, [firstFalseBaselineMillis])
+}
+
 async function runCommittedMigrations() {
   const connection = await mysql.createConnection(mysqlConnectionConfigFromEnv())
   try {
@@ -291,8 +368,10 @@ export async function bootstrapDenDb() {
     } else {
       if (!tables.includes("oauthResource")) {
         await repairMissingOauthSchema(executor)
+        await reconcilePostOauthBaseline(executor)
+      } else {
+        await repairFalsePostOauthBaseline(executor)
       }
-      await reconcilePostOauthBaseline(executor)
     }
   } finally {
     await executor.close()
