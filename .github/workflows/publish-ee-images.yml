@@ -21,6 +21,7 @@ on:
   pull_request:
     paths:
       - ".github/workflows/publish-ee-images.yml"
+      - "scripts/ci/select-ee-images.mjs"
       - "packaging/docker/Dockerfile.den"
       - "packaging/docker/Dockerfile.den-gateway"
       - "packaging/docker/Dockerfile.den-web"
@@ -52,6 +53,7 @@ concurrency:
 
 permissions:
   contents: read
+  pull-requests: read
   packages: write
 
 env:
@@ -62,6 +64,55 @@ env:
   RELEASE_PLATFORM: linux/amd64
 
 jobs:
+  classify-ee-images:
+    name: Select EE image builds
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.classify.outputs.matrix }}
+      has_images: ${{ steps.classify.outputs.has_images }}
+      includes_gateway: ${{ steps.classify.outputs.includes_gateway }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Select images affected by this change
+        id: classify
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { selectEeImageMatrix } = await import(
+              `${process.env.GITHUB_WORKSPACE}/scripts/ci/select-ee-images.mjs`,
+            )
+
+            let changedFiles = []
+            if (context.eventName === "pull_request") {
+              const files = await github.paginate(github.rest.pulls.listFiles, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.payload.pull_request.number,
+                per_page: 100,
+              })
+              changedFiles = files.map((file) => file.filename)
+            } else if (context.eventName === "push" && context.payload.before) {
+              const comparison = await github.rest.repos.compareCommits({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                base: context.payload.before,
+                head: context.payload.after,
+                per_page: 100,
+              })
+              const files = comparison.data.files || []
+              changedFiles = files.length >= 300 ? [] : files.map((file) => file.filename)
+            }
+
+            const matrix = selectEeImageMatrix(changedFiles)
+            core.setOutput("matrix", JSON.stringify(matrix))
+            core.setOutput("has_images", String(matrix.include.length > 0))
+            core.setOutput(
+              "includes_gateway",
+              String(matrix.include.some(({ image }) => image === "openwork-den-gateway")),
+            )
+
   artifact-version:
     name: Resolve artifact version
     runs-on: ubuntu-latest
@@ -141,42 +192,11 @@ jobs:
   ee-images:
     name: Build ${{ matrix.image }}
     runs-on: ubuntu-latest
-    needs: artifact-version
+    needs: [artifact-version, classify-ee-images]
+    if: ${{ needs.classify-ee-images.outputs.has_images == 'true' }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - image: openwork-den-api
-            dockerfile: packaging/docker/Dockerfile.den
-            port: 8788
-            health_path: /health
-            smoke_env: >-
-              -e DB_MODE=mysql
-              -e DEN_DB_ENCRYPTION_KEY=ci-den-db-encryption-key-value-123456
-              -e BETTER_AUTH_SECRET=ci-better-auth-secret-value-123456
-              -e BETTER_AUTH_URL=http://127.0.0.1:8788
-          - image: openwork-den-web
-            dockerfile: packaging/docker/Dockerfile.den-web
-            port: 3005
-            health_path: /api/health
-            smoke_env: ""
-          - image: openwork-inference
-            dockerfile: packaging/docker/Dockerfile.inference
-            port: 8791
-            health_path: /health
-            smoke_env: >-
-              -e DB_MODE=mysql
-              -e DATABASE_URL=mysql://smoke:smoke@127.0.0.1:3306/smoke
-              -e DEN_DB_ENCRYPTION_KEY=ci-den-db-encryption-key-value-123456
-          # The gateway's own liveness lives at /__gw/health because /health is
-          # proxied through to the user's instance.
-          - image: openwork-den-gateway
-            dockerfile: packaging/docker/Dockerfile.den-gateway
-            port: 8788
-            health_path: /__gw/health
-            smoke_env: >-
-              -e DEN_API_BASE=http://127.0.0.1:9
-              -e DEN_GATEWAY_KEY=ci-den-gateway-key-value-123456
+      matrix: ${{ fromJSON(needs.classify-ee-images.outputs.matrix) }}
 
     steps:
       - name: Checkout
@@ -431,8 +451,8 @@ jobs:
   # den-api and engine-snapshot dev CD are deliberate follow-ups because they
   # require migration and sandbox recycle handling.
   redeploy-den-gateway:
-    needs: [artifact-version, ee-images]
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+    needs: [artifact-version, classify-ee-images, ee-images]
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' && needs.classify-ee-images.outputs.includes_gateway == 'true' && needs.ee-images.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Redeploy den-gateway on Render
