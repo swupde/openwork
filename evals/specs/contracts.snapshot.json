@@ -74,6 +74,19 @@
       ]
     },
     {
+      "id": "den.documents-native-files",
+      "description": "App-managed execution storage and native Google Docs, Sheets, and Slides lifecycle",
+      "implementation": [
+        "apps/server/src/routes/files.ts",
+        "apps/server/src/runtime-workspace-files.ts",
+        "ee/apps/den-api/src/google-workspace/native-files.ts",
+        "ee/apps/den-api/src/routes/org/google-workspace.ts"
+      ],
+      "specs": [
+        "evals/specs/documents-spreadsheets-lifecycle.e2e.test.ts"
+      ]
+    },
+    {
       "id": "den.dashboard-admin",
       "description": "Den administration navigation, managed dashboards, deployment gates, and tool testing",
       "implementation": [
