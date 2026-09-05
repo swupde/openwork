@@ -11,6 +11,7 @@ import {
   deleteSandboxes,
   execInSandbox,
 } from "@openwork/hosts";
+import { progress, trackResource } from "@openwork/world";
 import type { Server, ServerResponse } from "node:http";
 import { SkipError } from "./needs.ts";
 import type { Place } from "./place.ts";
@@ -32,6 +33,7 @@ const DAYTONA_LOG = "/tmp/openwork-litellm.log";
 const DAYTONA_WITNESS_LOG = "/tmp/openwork-litellm-witness.log";
 const BASE64_CHUNK_LENGTH = 8 * 1_024;
 const MAX_DAYTONA_COMMAND_LENGTH = 12 * 1_024;
+const steps = progress();
 const DEFAULT_MAX_INPUT_TOKENS = 128_000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 16_384;
 
@@ -644,7 +646,9 @@ async function startLocalLiteLlm(
   const postgresPassword = input.database ? randomBytes(32).toString("hex") : "";
   let root = "";
   let witness: Server | null = null;
+  let gatewayStep: ReturnType<typeof steps.step> | undefined;
   try {
+    const witnessStep = steps.step("litellm-witness", "LiteLLM witness");
     const startedWitness = await startWitness(
       input.modelId,
       input.reply,
@@ -652,8 +656,10 @@ async function startLocalLiteLlm(
       tokenId(secrets.controlKey),
       state,
     );
+    await witnessStep.ok(String(startedWitness.port));
     witness = startedWitness.server;
     root = await realpath(await mkdtemp(join(tmpdir(), "openwork-litellm-")));
+    await trackResource({ kind: "tmpdir", id: root, label: "litellm-config" });
     const configPath = join(root, "config.json");
     await writeFile(
       configPath,
@@ -669,6 +675,7 @@ async function startLocalLiteLlm(
     );
     let postgresPort = 0;
     if (input.database) {
+      const postgresStep = steps.step("litellm-postgres", "LiteLLM Postgres");
       await run("docker", [
         "create", "--name", postgresContainer,
         "--env", `POSTGRES_PASSWORD=${postgresPassword}`,
@@ -676,9 +683,11 @@ async function startLocalLiteLlm(
         "--publish", "127.0.0.1::5432",
         POSTGRES_IMAGE,
       ]);
+      await trackResource({ kind: "docker", id: postgresContainer, label: "litellm-postgres" });
       await run("docker", ["start", postgresContainer], 30_000);
       postgresPort = await mappedPostgresPort(postgresContainer);
       await waitForPostgres(postgresContainer);
+      await postgresStep.ok();
     }
     const createArgs = input.database
       ? [
@@ -694,24 +703,28 @@ async function startLocalLiteLlm(
           "--publish", "127.0.0.1::4000",
           IMAGE, "--config", "/app/config.json", "--port", "4000",
         ];
+    gatewayStep = steps.step("litellm", "LiteLLM gateway");
     await run("docker", createArgs);
+    await trackResource({ kind: "docker", id: container, label: "litellm" });
     await run("docker", ["cp", configPath, `${container}:/app/config.json`], 30_000);
     await run("docker", ["start", container], 30_000);
     const port = input.database
       ? await waitForLocalDatabaseProxy(container, secrets.masterKey, input.modelId)
       : await waitForLocalProxy(container, secrets.masterKey, input.modelId);
+    const baseUrl = `http://127.0.0.1:${port}/v1`;
+    await gatewayStep.ok(baseUrl);
     let placementDisposed = false;
     return makeHandle({
       ...secrets,
-      baseUrl: `http://127.0.0.1:${port}/v1`,
+      baseUrl,
       controlUrl: `http://127.0.0.1:${startedWitness.port}`,
       fetchImpl: fetch,
       redactedSecrets: input.database ? [postgresPassword] : undefined,
       async dispose(): Promise<void> {
         if (placementDisposed) return;
-        await run("docker", ["rm", "--force", container], 20_000).catch(() => undefined);
+        await run("docker", ["rm", "--force", "--volumes", container], 20_000).catch(() => undefined);
         if (input.database) {
-          await run("docker", ["rm", "--force", postgresContainer], 20_000).catch(() => undefined);
+          await run("docker", ["rm", "--force", "--volumes", postgresContainer], 20_000).catch(() => undefined);
         }
         await Promise.all([
           rm(root, { recursive: true, force: true }),
@@ -721,13 +734,14 @@ async function startLocalLiteLlm(
       },
     });
   } catch (error) {
+    await gatewayStep?.fail(messageText(error));
     const logs = await run("docker", ["logs", container], 10_000).then((result) => result.stdout + result.stderr, () => "");
     const postgresLogs = input.database
       ? await run("docker", ["logs", postgresContainer], 10_000).then((result) => result.stdout + result.stderr, () => "")
       : "";
-    await run("docker", ["rm", "--force", container], 20_000).catch(() => undefined);
+    await run("docker", ["rm", "--force", "--volumes", container], 20_000).catch(() => undefined);
     if (input.database) {
-      await run("docker", ["rm", "--force", postgresContainer], 20_000).catch(() => undefined);
+      await run("docker", ["rm", "--force", "--volumes", postgresContainer], 20_000).catch(() => undefined);
     }
     if (root) await rm(root, { recursive: true, force: true }).catch(() => undefined);
     if (witness) await closeServer(witness).catch(() => undefined);

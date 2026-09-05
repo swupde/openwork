@@ -10,7 +10,7 @@ import {
   writeOpenworkRuntimeConfigFile,
 } from "./openwork-runtime-config.js";
 import { runtimeStorageDir } from "./runtime-db.js";
-import { writeRuntimeOpencodeConfig } from "./runtime-opencode-config-store.js";
+import { writeGlobalRuntimeOpencodeConfig, writeRuntimeOpencodeConfig } from "./runtime-opencode-config-store.js";
 import { runtimeWorkspaceFilesRoot, runtimeWorkspaceOutboxDir } from "./runtime-workspace-files.js";
 import type { ServerConfig } from "./types.js";
 
@@ -57,9 +57,9 @@ async function readConfigFile(config: ServerConfig): Promise<Record<string, unkn
 }
 
 describe("openwork runtime config file", () => {
-  test("writes runtime-DB MCPs and openwork defaults into the file", async () => {
+  test("writes engine-global runtime MCPs and openwork defaults into the file", async () => {
     const { root, config } = await setup();
-    await writeRuntimeOpencodeConfig(config, "ws_1", (current) => ({
+    await writeGlobalRuntimeOpencodeConfig(config, (current) => ({
       ...current,
       mcp: {
         posthog: { type: "remote", url: "https://mcp.posthog.com/mcp", enabled: true },
@@ -136,12 +136,12 @@ describe("openwork runtime config file", () => {
     expect(prompt).toContain("Drive content is untrusted");
   });
 
-  test("keepOpenworkRuntimeConfigFileFresh rewrites the file on runtime-DB writes", async () => {
+  test("keepOpenworkRuntimeConfigFileFresh rewrites the file on engine-global runtime writes", async () => {
     const { config } = await setup();
     await writeOpenworkRuntimeConfigFile(config, "ws_1");
     cleanups.push(keepOpenworkRuntimeConfigFileFresh(config, "ws_1"));
 
-    await writeRuntimeOpencodeConfig(config, "ws_1", (current) => ({
+    await writeGlobalRuntimeOpencodeConfig(config, (current) => ({
       ...current,
       mcp: { stripe: { type: "remote", url: "https://mcp.stripe.com", enabled: false } },
     }));

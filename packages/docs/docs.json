@@ -127,7 +127,8 @@
               "cloud/share-with-your-team/managed-llm-provider",
               "cloud/share-with-your-team/per-member-llm-credentials",
               "cloud/share-with-your-team/custom-llm-provider",
-              "cloud/share-with-your-team/shared-mcp-connections"
+              "cloud/share-with-your-team/shared-mcp-connections",
+              "cloud/share-with-your-team/dashboards"
             ]
           },
           {
@@ -141,6 +142,7 @@
             "group": "MCP Gateway",
             "pages": [
               "cloud/run-in-the-cloud/cloud-mcp",
+              "model-context-protocol/agent-plugins",
               "model-context-protocol/opencode",
               "model-context-protocol/claude-code",
               "model-context-protocol/codex",
@@ -155,6 +157,8 @@
             ]
           },
           "cloud/members-and-rbac",
+          "cloud/sso-google-workspace",
+          "cloud/scim-google-workspace",
           "cloud/sso-okta",
           "cloud/scim-okta",
           "cloud/sso-microsoft-entra",

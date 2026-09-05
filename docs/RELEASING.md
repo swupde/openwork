@@ -1,5 +1,10 @@
 # Releasing OpenWork
 
+This document describes the upstream desktop/public release process. For
+**swupde/openwork**, use [SWUP fork maintenance](SWUP-FORK.md). The upstream
+GitHub App, protection, Warden, and publishing prerequisites below are not
+claims about SwitchUp's repository settings.
+
 Releases are **pure GitHub Actions + GitHub Releases**: versions live in git
 tags, every committed `package.json` holds the permanent `0.0.0-dev`
 placeholder, and CI stamps the tag-derived version into the workspace at build
