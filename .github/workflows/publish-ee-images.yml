@@ -68,7 +68,9 @@ jobs:
     name: Select EE image builds
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.classify.outputs.matrix }}
+      # GitHub suppresses outputs that resemble secrets, so only image names
+      # cross this job boundary. Each matrix job owns its static smoke settings.
+      images: ${{ steps.classify.outputs.images }}
       has_images: ${{ steps.classify.outputs.has_images }}
       includes_gateway: ${{ steps.classify.outputs.includes_gateway }}
     steps:
@@ -80,7 +82,7 @@ jobs:
         uses: actions/github-script@v8
         with:
           script: |
-            const { selectEeImageMatrix } = await import(
+            const { selectEeImages } = await import(
               `${process.env.GITHUB_WORKSPACE}/scripts/ci/select-ee-images.mjs`,
             )
 
@@ -105,12 +107,12 @@ jobs:
               changedFiles = files.length >= 300 ? [] : files.map((file) => file.filename)
             }
 
-            const matrix = selectEeImageMatrix(changedFiles)
-            core.setOutput("matrix", JSON.stringify(matrix))
-            core.setOutput("has_images", String(matrix.include.length > 0))
+            const images = selectEeImages(changedFiles)
+            core.setOutput("images", JSON.stringify(images))
+            core.setOutput("has_images", String(images.length > 0))
             core.setOutput(
               "includes_gateway",
-              String(matrix.include.some(({ image }) => image === "openwork-den-gateway")),
+              String(images.includes("openwork-den-gateway")),
             )
 
   artifact-version:
@@ -196,7 +198,8 @@ jobs:
     if: ${{ needs.classify-ee-images.outputs.has_images == 'true' }}
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.classify-ee-images.outputs.matrix) }}
+      matrix:
+        image: ${{ fromJSON(needs.classify-ee-images.outputs.images) }}
 
     steps:
       - name: Checkout
@@ -273,7 +276,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ${{ matrix.dockerfile }}
+          file: ${{ matrix.image == 'openwork-den-api' && 'packaging/docker/Dockerfile.den' || matrix.image == 'openwork-den-web' && 'packaging/docker/Dockerfile.den-web' || matrix.image == 'openwork-inference' && 'packaging/docker/Dockerfile.inference' || 'packaging/docker/Dockerfile.den-gateway' }}
           platforms: ${{ env.RELEASE_PLATFORM }}
           load: ${{ github.event_name == 'pull_request' }}
           push: ${{ needs.artifact-version.outputs.publish == 'true' }}
@@ -292,7 +295,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ${{ matrix.dockerfile }}
+          file: ${{ matrix.image == 'openwork-den-api' && 'packaging/docker/Dockerfile.den' || matrix.image == 'openwork-den-web' && 'packaging/docker/Dockerfile.den-web' || matrix.image == 'openwork-inference' && 'packaging/docker/Dockerfile.inference' || 'packaging/docker/Dockerfile.den-gateway' }}
           platforms: ${{ env.RELEASE_PLATFORM }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
@@ -340,6 +343,45 @@ jobs:
           container_name="openwork-smoke-${{ matrix.image }}"
           mysql_container=""
           network_name=""
+
+          case "${{ matrix.image }}" in
+            openwork-den-api)
+              service_port=8788
+              health_path=/health
+              smoke_env=(
+                -e DB_MODE=mysql
+                -e DEN_DB_ENCRYPTION_KEY=ci-den-db-encryption-key-value-123456
+                -e BETTER_AUTH_SECRET=ci-better-auth-secret-value-123456
+                -e BETTER_AUTH_URL=http://127.0.0.1:8788
+              )
+              ;;
+            openwork-den-web)
+              service_port=3005
+              health_path=/api/health
+              smoke_env=()
+              ;;
+            openwork-inference)
+              service_port=8791
+              health_path=/health
+              smoke_env=(
+                -e DB_MODE=mysql
+                -e DATABASE_URL=mysql://smoke:smoke@127.0.0.1:3306/smoke
+                -e DEN_DB_ENCRYPTION_KEY=ci-den-db-encryption-key-value-123456
+              )
+              ;;
+            openwork-den-gateway)
+              service_port=8788
+              health_path=/__gw/health
+              smoke_env=(
+                -e DEN_API_BASE=http://127.0.0.1:9
+                -e DEN_GATEWAY_KEY=ci-den-gateway-key-value-123456
+              )
+              ;;
+            *)
+              echo "Unknown image: ${{ matrix.image }}" >&2
+              exit 1
+              ;;
+          esac
 
           # shellcheck disable=SC2329 # Invoked by the EXIT trap.
           cleanup() {
@@ -415,15 +457,15 @@ jobs:
               --network "$network_name" \
               -P \
               -e DATABASE_URL="$database_url" \
-              ${{ matrix.smoke_env }} \
+              "${smoke_env[@]}" \
               "$image_tag")"
           else
-            container_id="$(docker run -d --name "$container_name" -P ${{ matrix.smoke_env }} "$image_tag")"
+            container_id="$(docker run -d --name "$container_name" -P "${smoke_env[@]}" "$image_tag")"
           fi
 
           host_port=""
           for _ in {1..10}; do
-            host_port="$(docker port "$container_id" "${{ matrix.port }}/tcp" 2>/dev/null | awk -F: 'NR == 1 { print $NF }')"
+            host_port="$(docker port "$container_id" "$service_port/tcp" 2>/dev/null | awk -F: 'NR == 1 { print $NF }')"
             if [ -n "$host_port" ]; then
               break
             fi
@@ -434,7 +476,7 @@ jobs:
             exit 1
           fi
 
-          url="http://127.0.0.1:${host_port}${{ matrix.health_path }}"
+          url="http://127.0.0.1:${host_port}${health_path}"
 
           for _ in {1..30}; do
             if node -e "fetch(process.argv[1]).then((res) => process.exit(res.ok ? 0 : 1)).catch(() => process.exit(1))" "$url"; then

@@ -34,6 +34,8 @@ test("artifact workflow derives its image matrix from changed files", async () =
   )
 
   assert.match(workflow, /classify-ee-images:/)
-  assert.match(workflow, /fromJSON\(needs\.classify-ee-images\.outputs\.matrix\)/)
+  assert.match(workflow, /core\.setOutput\("images", JSON\.stringify\(images\)\)/)
+  assert.match(workflow, /image: \$\{\{ fromJSON\(needs\.classify-ee-images\.outputs\.images\) \}\}/)
   assert.match(workflow, /- "scripts\/ci\/select-ee-images\.mjs"/)
+  assert.doesNotMatch(workflow, /matrix\.(dockerfile|port|health_path|smoke_env)/)
 })

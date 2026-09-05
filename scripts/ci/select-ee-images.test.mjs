@@ -49,18 +49,3 @@ test("selects every image when a changed path is not classified", () => {
     allImages,
   )
 })
-
-test("returns the build metadata required by the GitHub matrix", () => {
-  assert.deepEqual(
-    classifier.selectEeImageMatrix?.(["ee/apps/den-web/app/page.tsx"]),
-    {
-      include: [{
-        image: "openwork-den-web",
-        dockerfile: "packaging/docker/Dockerfile.den-web",
-        port: 3005,
-        health_path: "/api/health",
-        smoke_env: "",
-      }],
-    },
-  )
-})
