@@ -9,6 +9,10 @@ const sharedPrefixes = [
   "packages/types/",
   "ee/packages/utils/",
 ]
+const noImagePrefixes = [
+  "docs/",
+  "packaging/helm/openwork-ee/",
+]
 const directPrefixes = [
   ["ee/apps/den-api/", ["openwork-den-api"]],
   ["ee/apps/den-web/", ["openwork-den-web"]],
@@ -46,7 +50,7 @@ export function selectEeImages(changedFiles) {
   const selected = new Set()
 
   for (const changedFile of changedFiles) {
-    if (changedFile.startsWith("packaging/helm/openwork-ee/")) continue
+    if (noImagePrefixes.some((prefix) => changedFile.startsWith(prefix))) continue
     if (sharedFiles.has(changedFile) || sharedPrefixes.some((prefix) => changedFile.startsWith(prefix))) {
       return allImages
     }

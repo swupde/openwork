@@ -36,6 +36,13 @@ test("does not build an image for a Helm-only change", () => {
   )
 })
 
+test("does not build an image for a documentation-only change", () => {
+  assert.deepEqual(
+    classifier.selectEeImages?.(["docs/RELEASING.md"]),
+    [],
+  )
+})
+
 test("selects only the gateway image when its Dockerfile changes", () => {
   assert.deepEqual(
     classifier.selectEeImages?.(["packaging/docker/Dockerfile.den-gateway"]),
