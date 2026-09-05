@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 
 import type { EnvService } from "./env-file.js";
-import { syncManagedProviderAuth } from "./managed-provider-auth.js";
+import { selectPrimaryCredentialEnvName, syncManagedProviderAuth } from "./managed-provider-auth.js";
 import { writeOpenworkRuntimeConfigFile } from "./openwork-runtime-config.js";
 import {
   hasOpenworkWorkspaceConfig,
@@ -140,6 +140,7 @@ type CloudProviderSyncLogger = {
 
 type CloudProviderSyncRequest = {
   contextKey: string;
+  generation: number;
   session: CloudProviderDenSession;
   reason?: string;
 };
@@ -153,6 +154,11 @@ type CloudProviderSyncTrailingRun = CloudProviderSyncRun & {
   request: CloudProviderSyncRequest;
   resolve: (result: CloudProviderSyncRunResult) => void;
   reject: (error: unknown) => void;
+};
+
+type CloudProviderSyncPendingSession = {
+  contextKey: string;
+  promise: Promise<void>;
 };
 
 export type CloudProviderSyncOptions = {
@@ -467,9 +473,13 @@ function buildProviderConfig(provider: DenProviderConnection): JsonRecord {
   return config;
 }
 
-function prepareMaterialization(providers: DenProviderConnection[]): PreparedMaterialization {
+function prepareMaterialization(
+  providers: DenProviderConnection[],
+  localEnvNames: Iterable<string>,
+): PreparedMaterialization {
   const materialized: MaterializedProvider[] = [];
   const skipped: CloudProviderSyncSkippedProvider[] = [];
+  const availableLocalEnvNames = [...localEnvNames];
   for (const provider of providers) {
     if (provider.memberCredentialState && provider.memberCredentialState !== "active") {
       skipped.push({
@@ -482,11 +492,17 @@ function prepareMaterialization(providers: DenProviderConnection[]): PreparedMat
     }
     const envEntries = providerEnvEntries(provider);
     const envNames = readProviderEnvNames(provider.providerConfig);
-    if (envNames.length > 0 && !envEntries.some((entry) => envNames.includes(entry.key))) {
+    const primaryCredentialName = provider.apiKey?.trim()
+      ? envNames[0] ?? null
+      : selectPrimaryCredentialEnvName(
+          envNames,
+          [...envEntries.map((entry) => entry.key), ...availableLocalEnvNames],
+        );
+    if (envNames.length > 0 && !primaryCredentialName) {
       // The provider declares credential env vars but the connect payload
-      // yielded no value for any of them. Materializing it would produce a
-      // provider whose every request fails with a missing API key, so it is
-      // skipped — loudly, so status readers can see why it never appeared.
+      // and the local Desktop environment yielded no primary credential.
+      // Materializing it would produce a provider whose every request fails
+      // with a missing API key, so it is skipped loudly.
       skipped.push({
         cloudProviderId: provider.id,
         providerId: runtimeProviderId(provider),
@@ -585,6 +601,8 @@ export class CloudProviderSync {
   private importedAtByCloudProviderId = new Map<string, number>();
   private reloadPending = false;
   private queue: Promise<void> = Promise.resolve();
+  private contextGeneration = 0;
+  private pendingSession: CloudProviderSyncPendingSession | null = null;
   private activeRun: CloudProviderSyncRun | null = null;
   private trailingRun: CloudProviderSyncTrailingRun | null = null;
   private interval: ReturnType<typeof setInterval> | null = null;
@@ -602,15 +620,59 @@ export class CloudProviderSync {
     this.reloadRetryMs = configuredReloadRetryMs();
   }
 
-  setSession(session: CloudProviderDenSession): void {
+  setSession(session: CloudProviderDenSession): Promise<void> {
     const contextKey = this.sessionContextKey(session);
-    if (this.session && this.sessionContextKey(this.session) === contextKey) return;
-    this.session = session;
-    this.startInterval();
-    void this.run("den_session_updated");
+    if (this.session && this.sessionContextKey(this.session) === contextKey) return Promise.resolve();
+    if (this.pendingSession?.contextKey === contextKey) return this.pendingSession.promise;
+
+    const hasMaterializedContext = this.session !== null
+      || this.managedProviderIds.size > 0
+      || this.ownedEnvKeys.size > 0;
+    this.contextGeneration += 1;
+
+    if (!hasMaterializedContext) {
+      this.session = session;
+      this.startInterval();
+      void this.run("den_session_updated");
+      return Promise.resolve();
+    }
+
+    const generation = this.contextGeneration;
+    this.session = null;
+    this.stopInterval();
+    this.stopReloadRetry();
+    const trailing = this.trailingRun;
+    this.trailingRun = null;
+    trailing?.resolve({ status: "no_session" });
+    this.lastRun = null;
+    this.providers = [];
+    this.skippedProviders = [];
+
+    const promise = this.enqueue(async () => {
+      if (generation !== this.contextGeneration) return;
+      await this.sweep({ forceReload: true });
+      this.resetMaterializationState();
+      if (generation !== this.contextGeneration) return;
+      this.session = session;
+      this.startInterval();
+      void this.run("den_session_updated");
+    });
+    const pending = { contextKey, promise };
+    this.pendingSession = pending;
+    void promise.then(
+      () => {
+        if (this.pendingSession === pending) this.pendingSession = null;
+      },
+      () => {
+        if (this.pendingSession === pending) this.pendingSession = null;
+      },
+    );
+    return promise;
   }
 
   async clearSession(): Promise<void> {
+    this.contextGeneration += 1;
+    this.pendingSession = null;
     this.session = null;
     this.stopInterval();
     const trailing = this.trailingRun;
@@ -618,19 +680,13 @@ export class CloudProviderSync {
     trailing?.resolve({ status: "no_session" });
     await this.enqueue(async () => {
       try {
-        await this.sweep();
+        await this.sweep({ forceReload: true });
       } catch (error) {
         this.logger?.error("cloud provider sweep failed", {
           message: error instanceof Error ? error.message : "cloud_provider_sweep_failed",
         });
       } finally {
-        this.lastRun = null;
-        this.providers = [];
-        this.skippedProviders = [];
-        this.fingerprint = null;
-        this.ownedEnvKeys.clear();
-        this.managedProviderIds.clear();
-        this.importedAtByCloudProviderId.clear();
+        this.resetMaterializationState();
       }
     });
   }
@@ -640,6 +696,7 @@ export class CloudProviderSync {
     if (!session) return Promise.resolve({ status: "no_session" });
     const request = {
       contextKey: this.sessionContextKey(session),
+      generation: this.contextGeneration,
       session,
       reason,
     };
@@ -694,6 +751,16 @@ export class CloudProviderSync {
 
   private sessionContextKey(session: CloudProviderDenSession): string {
     return `${session.baseUrl}\u0000${session.orgId}\u0000${session.token}`;
+  }
+
+  private resetMaterializationState(): void {
+    this.lastRun = null;
+    this.providers = [];
+    this.skippedProviders = [];
+    this.fingerprint = null;
+    this.ownedEnvKeys.clear();
+    this.managedProviderIds.clear();
+    this.importedAtByCloudProviderId.clear();
   }
 
   private createTrailingRun(request: CloudProviderSyncRequest): Promise<CloudProviderSyncRunResult> {
@@ -817,7 +884,17 @@ export class CloudProviderSync {
   private async runPass(request: CloudProviderSyncRequest): Promise<CloudProviderSyncRunResult> {
     const { reason, session } = request;
     try {
-      const prepared = prepareMaterialization(await fetchProviders(this.fetchImpl, session));
+      const [providers, storedEnv] = await Promise.all([
+        fetchProviders(this.fetchImpl, session),
+        this.env.list(),
+      ]);
+      // Local credentials only satisfy materialization eligibility. Never add
+      // their values to Den's env entries or cloud cleanup ownership.
+      const localEnvNames = storedEnv
+        .filter((entry) => entry.value.trim().length > 0 && !this.ownedEnvKeys.has(entry.key))
+        .map((entry) => entry.key);
+      const prepared = prepareMaterialization(providers, localEnvNames);
+      if (request.generation !== this.contextGeneration) return { status: "no_session" };
       const { changed, detail, reloadError } = await this.apply(prepared);
       // The materialization itself succeeded (config + env writes landed), so
       // record it even when the engine reload failed: hiding the providers
@@ -835,6 +912,7 @@ export class CloudProviderSync {
       this.lastRun = { at: new Date().toISOString(), status, detail };
       return { status };
     } catch (error) {
+      if (request.generation !== this.contextGeneration) return { status: "no_session" };
       const message = error instanceof Error ? error.message : "cloud_provider_sync_failed";
       this.lastRun = { at: new Date().toISOString(), status: "failed", message };
       this.logger?.warn("cloud provider sync failed", { reason, message });
@@ -884,10 +962,22 @@ export class CloudProviderSync {
     const workspaceCleanup = await this.cleanupWorkspaceTakeovers();
     const engineWorkspace = findManagedEngineWorkspace(this.config.workspaces) ?? this.config.workspaces[0];
     const runtimeFileChanged = engineWorkspace
-      ? (await writeOpenworkRuntimeConfigFile(this.config, engineWorkspace.id)).changed
+      ? (await writeOpenworkRuntimeConfigFile(this.config)).changed
       : false;
-    // Credentials reach a live engine through PUT /auth/{providerID} below, so
-    // a key rotation never needs a reload. Provider *config* (models, npm,
+    // Deliver credentials before disposing the current provider instances.
+    // OpenCode constructs and caches SDK clients from config + auth together;
+    // reloading first can cache a client without the just-synced credential,
+    // even though PUT /auth/{providerID} later reports success. Credential
+    // rotation therefore needs the same instance refresh as provider config.
+    const authResult = await syncManagedProviderAuth({
+      config: this.config,
+      env: this.env,
+      fetchImpl: this.fetchImpl,
+      logger: this.logger,
+    });
+    const authChanged = authResult.delivered.length > 0 || authResult.removed.length > 0;
+
+    // Provider *config* (models, npm,
     // options.baseURL) has no live path: the engine reads it from
     // OPENCODE_CONFIG when it builds an instance, and the only write endpoint
     // that accepts it, PATCH /config, performs the same instance dispose as
@@ -898,7 +988,8 @@ export class CloudProviderSync {
     this.reloadPending = this.reloadPending
       || providerStateChanged
       || workspaceCleanup.runtimeChanged
-      || runtimeFileChanged;
+      || runtimeFileChanged
+      || authChanged;
     let reloadError: unknown;
     let reloadDeferred = false;
     if (engineWorkspace && this.reloadPending) {
@@ -918,13 +1009,6 @@ export class CloudProviderSync {
         }
       }
     }
-    await syncManagedProviderAuth({
-      config: this.config,
-      env: this.env,
-      fetchImpl: this.fetchImpl,
-      logger: this.logger,
-    });
-
     this.managedProviderIds = new Set(Object.keys(desiredProviders));
     const detail: CloudProviderSyncRunDetail = {
       fingerprintChanged: this.fingerprint !== prepared.fingerprint,
@@ -1000,7 +1084,7 @@ export class CloudProviderSync {
     });
   }
 
-  private async sweep(): Promise<void> {
+  private async sweep(options: { forceReload?: boolean } = {}): Promise<void> {
     const providerPatch = Object.fromEntries([...this.managedProviderIds].map((providerId) => [providerId, null]));
     let providerChanged = false;
     if (Object.keys(providerPatch).length > 0) {
@@ -1014,11 +1098,20 @@ export class CloudProviderSync {
 
     const engineWorkspace = findManagedEngineWorkspace(this.config.workspaces) ?? this.config.workspaces[0];
     if (engineWorkspace) {
-      const fileResult = await writeOpenworkRuntimeConfigFile(this.config, engineWorkspace.id);
+      const fileResult = await writeOpenworkRuntimeConfigFile(this.config);
       this.reloadPending = this.reloadPending || providerChanged || fileResult.changed;
     }
+    const authResult = await syncManagedProviderAuth({
+      config: this.config,
+      env: this.env,
+      fetchImpl: this.fetchImpl,
+      logger: this.logger,
+    });
+    this.reloadPending = this.reloadPending
+      || authResult.delivered.length > 0
+      || authResult.removed.length > 0;
     let reloadError: unknown;
-    if (this.reloadPending && (await this.reloadDeferredByActivity())) {
+    if (this.reloadPending && !options.forceReload && (await this.reloadDeferredByActivity())) {
       this.scheduleReloadRetry();
     } else if (this.reloadPending) {
       try {
@@ -1030,12 +1123,6 @@ export class CloudProviderSync {
         this.scheduleReloadRetry();
       }
     }
-    await syncManagedProviderAuth({
-      config: this.config,
-      env: this.env,
-      fetchImpl: this.fetchImpl,
-      logger: this.logger,
-    });
     if (reloadError) throw reloadError;
   }
 }

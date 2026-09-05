@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { app, WebContentsView, clipboard, session, shell } from "electron";
+import { runDetachedTask } from "./process-resilience.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BROWSER_SESSION_PARTITION = "persist:openwork-browser";
@@ -152,7 +153,10 @@ export function createBrowserPanel({ getWindow, remoteDebugPort, onDeepLink }) {
       throw new Error(`Browser provider is not available yet: ${requestedProvider}`);
     }
     const url = normalizeBrowserUrl(rawUrl);
-    const tab = createBrowserTab("about:blank", { select: true });
+    // The marker page is loaded right away, so skip the blank initialize load:
+    // a queued about:blank navigation would abort this awaited load with
+    // ERR_ABORTED and fail the agent's request before the page ever opens.
+    const tab = createBrowserTab("about:blank", { select: true, initializeBlank: false });
     await tab.view.webContents.loadURL(browserTargetMarkerUrl(tab.tabId));
     const targetId = await resolveBrowserCdpTargetId(tab.tabId);
     await tab.view.webContents.loadURL(url);
@@ -399,7 +403,9 @@ export function createBrowserPanel({ getWindow, remoteDebugPort, onDeepLink }) {
         if (request.url) clipboard.writeText(request.url);
         break;
       case "open-external":
-        if (request.url && isHttpUrl(request.url)) void shell.openExternal(request.url);
+        if (request.url && isHttpUrl(request.url)) {
+          runDetachedTask("open browser tab externally", () => shell.openExternal(request.url));
+        }
         break;
       case "close-tab":
         if (tab) closeBrowserTab(tab.tabId);
@@ -469,7 +475,7 @@ export function createBrowserPanel({ getWindow, remoteDebugPort, onDeepLink }) {
     callback(browserProxy.username, browserProxy.password);
   });
 
-  function createBrowserTab(url = "about:blank", { select = true } = {}) {
+  function createBrowserTab(url = "about:blank", { select = true, initializeBlank = true } = {}) {
     const tabId = createBrowserTabId();
     const view = new WebContentsView({
       webPreferences: {
@@ -486,9 +492,13 @@ export function createBrowserPanel({ getWindow, remoteDebugPort, onDeepLink }) {
     browserTabOrder.push(tabId);
     // Load about:blank immediately to preempt persistent-session restore.
     // Cookies live on the session object, not the document — they survive this.
-    view.webContents.loadURL("about:blank");
+    // Callers that load their own page synchronously opt out, because this
+    // queued navigation would otherwise abort theirs.
+    if (initializeBlank) {
+      runDetachedTask("initialize browser tab", () => view.webContents.loadURL("about:blank"));
+    }
     view.webContents.setWindowOpenHandler(({ url: targetUrl }) => {
-      void shell.openExternal(targetUrl);
+      runDetachedTask("open browser popup externally", () => shell.openExternal(targetUrl));
       return { action: "deny" };
     });
     view.webContents.on("did-start-navigation", (_event, targetUrl, isInPlace, isMainFrame) => {
@@ -509,7 +519,7 @@ export function createBrowserPanel({ getWindow, remoteDebugPort, onDeepLink }) {
         setTimeout(() => {
           try {
             if (!view.webContents.isDestroyed()) {
-              view.webContents.loadURL("about:blank");
+              runDetachedTask("clear completed browser handoff", () => view.webContents.loadURL("about:blank"));
             }
             hideBrowserView();
           } catch { /* tab already gone */ }
@@ -550,7 +560,7 @@ export function createBrowserPanel({ getWindow, remoteDebugPort, onDeepLink }) {
     }
     const finalUrl = normalizeBrowserUrl(url, "about:blank");
     if (finalUrl !== "about:blank") {
-      view.webContents.loadURL(finalUrl);
+      runDetachedTask("navigate new browser tab", () => view.webContents.loadURL(finalUrl));
     }
     return tab;
   }
@@ -713,7 +723,7 @@ export function createBrowserPanel({ getWindow, remoteDebugPort, onDeepLink }) {
     }
     const url = view?.webContents.getURL();
     if (preloadDefault && (!url || url === "about:blank")) {
-      view?.webContents.loadURL(BROWSER_DEFAULT_URL);
+      runDetachedTask("load browser default page", () => view?.webContents.loadURL(BROWSER_DEFAULT_URL));
     }
     sendBrowserState();
   }
@@ -749,7 +759,7 @@ export function createBrowserPanel({ getWindow, remoteDebugPort, onDeepLink }) {
     ipcMain.handle("openwork:browser:openUrl", (_event, url, provider) => openBrowserUrlForAutomation(url, provider));
     ipcMain.handle("openwork:browser:navigate", (_event, url) => {
       const view = getActiveBrowserView() ?? createBrowserTab("about:blank", { select: true }).view;
-      view.webContents.loadURL(normalizeBrowserUrl(url));
+      runDetachedTask("navigate browser tab", () => view.webContents.loadURL(normalizeBrowserUrl(url)));
     });
     ipcMain.handle("openwork:browser:back", () => {
       const webContents = getActiveWebContents();

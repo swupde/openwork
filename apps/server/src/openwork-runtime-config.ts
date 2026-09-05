@@ -36,6 +36,7 @@ import {
   type RuntimeOpencodeConfig,
 } from "./runtime-opencode-config-store.js";
 import { CONNECT_MCP_SERVER_NAME_PREFIX } from "./connect-mcp-server-catalog.js";
+import { findManagedEngineWorkspace } from "./workspaces.js";
 
 const OPENWORK_AGENT_PROMPT = `You are OpenWork.
 
@@ -219,11 +220,12 @@ const fileWriteQueue = new Map<string, Promise<OpenworkRuntimeConfigWriteResult>
  */
 export async function writeOpenworkRuntimeConfigFile(
   config: ServerConfig,
-  workspaceId: string,
+  workspaceId?: string,
 ): Promise<OpenworkRuntimeConfigWriteResult> {
   const path = openworkRuntimeConfigFilePath(config);
+  const resolvedWorkspaceId = workspaceId ?? findManagedEngineWorkspace(config.workspaces)?.id;
   const job = async () => {
-    const content = await buildOpenworkRuntimeConfig(config, workspaceId);
+    const content = await buildOpenworkRuntimeConfig(config, resolvedWorkspaceId);
     const current = await readFile(path, "utf8").catch(() => undefined);
     if (current === content) return { path, changed: false };
     await mkdir(runtimeStorageDir(config), { recursive: true });
@@ -243,9 +245,11 @@ export async function writeOpenworkRuntimeConfigFile(
  * instance rebuild reads fresh state instead of a spawn-time snapshot.
  * Returns an unsubscribe function.
  */
-export function keepOpenworkRuntimeConfigFileFresh(config: ServerConfig, workspaceId: string): () => void {
+export function keepOpenworkRuntimeConfigFileFresh(config: ServerConfig, workspaceId?: string): () => void {
+  const resolvedWorkspaceId = workspaceId ?? findManagedEngineWorkspace(config.workspaces)?.id;
+  if (!resolvedWorkspaceId) return () => undefined;
   return onRuntimeOpencodeConfigWrite((writeConfig, writtenWorkspaceId) => {
-    if (writtenWorkspaceId !== workspaceId && !isEngineGlobalRuntimeConfigId(writtenWorkspaceId)) return;
-    void writeOpenworkRuntimeConfigFile(writeConfig, workspaceId).catch(() => undefined);
+    if (writtenWorkspaceId !== resolvedWorkspaceId && !isEngineGlobalRuntimeConfigId(writtenWorkspaceId)) return;
+    void writeOpenworkRuntimeConfigFile(writeConfig, resolvedWorkspaceId).catch(() => undefined);
   });
 }

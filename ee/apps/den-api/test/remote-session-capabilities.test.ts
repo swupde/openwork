@@ -110,6 +110,9 @@ test("search finds the capabilities with executable shape metadata", () => {
   expect(create?.invocation).toEqual({ argumentsField: "body" })
   expect(create?.kind).toBe("remote_session")
   expect(create?.argumentsSchema).toBeDefined()
+  expect(create?.argumentsSchema).toMatchObject({
+    properties: { title: { type: "string", maxLength: 120 } },
+  })
 
   expect(searchRemoteSessionCapabilities("", 10)).toEqual([])
   expect(searchRemoteSessionCapabilities("unrelated zebra taxonomy", 10)).toEqual([])
@@ -149,6 +152,15 @@ test("create reports an offline desktop target with an actionable error", async 
   )
   expect(result.isError).toBe(true)
   expect(payload(result).error).toBe("desktop_offline")
+})
+
+test("create rejects titles longer than the desktop assignment limit", async () => {
+  const result = await executeRemoteSessionCapability(
+    executeInput("create", { target: "desktop", title: "x".repeat(121) }),
+    readyDeps({}),
+  )
+  expect(result.isError).toBe(true)
+  expect(payload(result).error).toBe("invalid_capability_arguments")
 })
 
 test("create and send require the write scope; read does not", async () => {
@@ -244,7 +256,7 @@ test("a missing session maps to unknown_session", async () => {
           code: "http_error",
           message: "not found",
           method: "GET",
-          path: "/sessions/ses_gone",
+          path: "/workspace/ws_1/opencode/session/ses_gone",
           status: 404,
         })
       },

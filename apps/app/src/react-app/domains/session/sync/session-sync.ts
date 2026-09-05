@@ -6,6 +6,7 @@ import { getReactQueryClient } from "../../../infra/query-client";
 import { captureAnalyticsEvent, takeTaskRunStart } from "@/app/lib/analytics";
 import { trackTaskCompleted, trackTaskFailed } from "@/app/lib/den-telemetry";
 import { createClient, unwrap } from "@/app/lib/opencode";
+import { perfNow, recordPerfLog } from "@/app/lib/perf-log";
 import { isGeneratedSessionTitle } from "@/app/lib/session-title";
 import { normalizeEvent } from "@/app/utils";
 import { SYNTHETIC_SESSION_ERROR_MESSAGE_PREFIX, type OpencodeEvent, type PendingPermission, type PendingQuestion } from "@/app/types";
@@ -91,6 +92,11 @@ type SyncEntry = {
   deltaFlushBuffer: PendingDelta[];
   deltaFlushLane: DeltaFlushLane | null;
   cancelDeltaFlush: (() => void) | null;
+  liveSessionIds: Set<string>;
+  statusReconcileTimer: ReturnType<typeof setTimeout> | null;
+  statusReconcileAbort: AbortController | null;
+  runActiveObservedAt: Map<string, number>;
+  assistantMessageCompletedAt: Map<string, number>;
   titleRecovery: SessionTitleRecovery | null;
 };
 
@@ -106,6 +112,32 @@ const workspaceSyncDisposeGraceMs = 2_000;
 const retainedSessionTtlMs = 10 * 60_000;
 const idleRetainedSessionTtlMs = 10_000;
 const backgroundDeltaFlushMs = 100;
+// OpenCode's own run client polls the authoritative status level every 250ms
+// because a transport can keep delivering message events after losing a
+// terminal status edge. This is a reconciliation cadence, not a completion
+// timeout: elapsed time never marks a task done.
+const activeSessionStatusReconcileIntervalMs = 250;
+
+type SessionStatusSource = "stream" | "connect-reconcile" | "active-reconcile";
+
+function developerDiagnosticsEnabled() {
+  if (typeof window === "undefined") return false;
+  try {
+    return window.localStorage.getItem("openwork.developerMode") === "1";
+  } catch {
+    return false;
+  }
+}
+
+function recordSessionCompletionMark(
+  event: string,
+  payload: Record<string, unknown>,
+) {
+  recordPerfLog(developerDiagnosticsEnabled(), "session.completion", event, {
+    monotonicMs: Math.round(perfNow() * 100) / 100,
+    ...payload,
+  });
+}
 
 function createListenerRegistry<Listener>(listener?: Listener) {
   const registry: ListenerRegistry<Listener> = new Map();
@@ -206,9 +238,43 @@ function syncKey(input: SyncOptions) {
   return `${input.workspaceId}:${input.baseUrl}`;
 }
 
+/**
+ * Freshness of the `/session/status` reconcile loop for one workspace stream.
+ * While any session is believed live that loop polls continuously, so it is
+ * the strongest liveness signal the renderer has: a run status is only as
+ * trustworthy as its latest successful validation. `lastSuccessAt` freezes at
+ * the moment validation started failing so surfaces can say when the run was
+ * last confirmed.
+ */
+export type WorkspaceSyncReconcileHealth = {
+  consecutiveFailures: number;
+  lastSuccessAt: number | null;
+};
+
+/**
+ * A busy status whose validation keeps failing must stop being presented as
+ * confident progress. Three consecutive failures tolerate a single transient
+ * blip while flagging a refused connection within about a second and a
+ * blackholed one within roughly three request timeouts (~30s).
+ */
+export const reconcileFailureDegradedThreshold = 3;
+
+// Cap the stored counter so an extended outage stops producing store updates
+// (and re-renders) once the degraded threshold is long past.
+const reconcileFailureCountCap = 99;
+
+// Non-reactive success times: healthy reconciles land every 250ms while a
+// run is live, and publishing each one through the store would notify
+// subscribers at that cadence for no visible change. The store is only
+// stamped on health transitions.
+const lastReconcileSuccessAtByKey = new Map<string, number>();
+
 type WorkspaceSyncStreamStore = {
   phasesByKey: Record<string, SyncStreamPhase>;
+  reconcileHealthByKey: Record<string, WorkspaceSyncReconcileHealth>;
   publishPhase: (key: string, phase: SyncStreamPhase) => void;
+  publishReconcileSuccess: (key: string, at: number) => void;
+  publishReconcileFailure: (key: string) => void;
   removePhase: (key: string) => void;
 };
 
@@ -220,21 +286,61 @@ type WorkspaceSyncStreamStore = {
  */
 export const useWorkspaceSyncStreamStore = create<WorkspaceSyncStreamStore>((set) => ({
   phasesByKey: {},
+  reconcileHealthByKey: {},
   publishPhase: (key, phase) => set((state) => ({
     phasesByKey: { ...state.phasesByKey, [key]: phase },
   })),
-  removePhase: (key) => set((state) => {
-    if (!(key in state.phasesByKey)) return state;
-    const next = { ...state.phasesByKey };
-    delete next[key];
-    return { phasesByKey: next };
+  publishReconcileSuccess: (key, at) => {
+    lastReconcileSuccessAtByKey.set(key, at);
+    set((state) => {
+      const current = state.reconcileHealthByKey[key];
+      if (!current || current.consecutiveFailures === 0) return state;
+      return {
+        reconcileHealthByKey: {
+          ...state.reconcileHealthByKey,
+          [key]: { consecutiveFailures: 0, lastSuccessAt: at },
+        },
+      };
+    });
+  },
+  publishReconcileFailure: (key) => set((state) => {
+    const current = state.reconcileHealthByKey[key] ?? { consecutiveFailures: 0, lastSuccessAt: null };
+    if (current.consecutiveFailures >= reconcileFailureCountCap) return state;
+    return {
+      reconcileHealthByKey: {
+        ...state.reconcileHealthByKey,
+        [key]: {
+          consecutiveFailures: current.consecutiveFailures + 1,
+          lastSuccessAt: current.consecutiveFailures === 0
+            ? lastReconcileSuccessAtByKey.get(key) ?? current.lastSuccessAt
+            : current.lastSuccessAt,
+        },
+      },
+    };
   }),
+  removePhase: (key) => {
+    lastReconcileSuccessAtByKey.delete(key);
+    set((state) => {
+      if (!(key in state.phasesByKey) && !(key in state.reconcileHealthByKey)) return state;
+      const nextPhases = { ...state.phasesByKey };
+      delete nextPhases[key];
+      const nextHealth = { ...state.reconcileHealthByKey };
+      delete nextHealth[key];
+      return { phasesByKey: nextPhases, reconcileHealthByKey: nextHealth };
+    });
+  },
 }));
+
+export function workspaceSyncStreamKey(
+  input: Pick<SyncOptions, "workspaceId" | "baseUrl">,
+): string {
+  return `${input.workspaceId}:${input.baseUrl}`;
+}
 
 export function getWorkspaceSessionSyncStreamPhase(
   input: Pick<SyncOptions, "workspaceId" | "baseUrl">,
 ): SyncStreamPhase | null {
-  return useWorkspaceSyncStreamStore.getState().phasesByKey[`${input.workspaceId}:${input.baseUrl}`] ?? null;
+  return useWorkspaceSyncStreamStore.getState().phasesByKey[workspaceSyncStreamKey(input)] ?? null;
 }
 
 function getErrorStatus(error: unknown) {
@@ -399,6 +505,13 @@ function disposeWorkspaceSync(key: string, entry: SyncEntry) {
   entry.cancelDeltaFlush?.();
   entry.deltaFlushLane = null;
   entry.cancelDeltaFlush = null;
+  if (entry.statusReconcileTimer) clearTimeout(entry.statusReconcileTimer);
+  entry.statusReconcileTimer = null;
+  entry.statusReconcileAbort?.abort();
+  entry.statusReconcileAbort = null;
+  entry.liveSessionIds.clear();
+  entry.runActiveObservedAt.clear();
+  entry.assistantMessageCompletedAt.clear();
   entry.titleRecovery?.dispose();
   entry.dispose();
   if (syncs.get(key) === entry) syncs.delete(key);
@@ -475,15 +588,9 @@ export function seedPermissionState(
   permissions: PermissionSeed[],
   options: { snapshotStartedAt?: number } = {},
 ) {
-  useSessionActivityStore.getState().replaceWaitingRequests(
-    workspaceId,
-    sessionId,
-    "permission",
-    permissions.flatMap((permission) => permission.sessionID === sessionId ? [permission.id] : []),
-  );
   const queryClient = getReactQueryClient();
   const now = Date.now();
-  queryClient.setQueryData<PendingPermission[]>(permissionKey(workspaceId, sessionId), (current = []) => {
+  const nextPermissions = queryClient.setQueryData<PendingPermission[]>(permissionKey(workspaceId, sessionId), (current = []) => {
     const receivedAtById = new Map(current.map((permission) => [permission.id, permission.receivedAt]));
     const seeded = permissions.flatMap((permission) =>
       permission.sessionID === sessionId ? [permissionWithReceivedAt(permission, receivedAtById.get(permission.id) ?? now)] : [],
@@ -501,6 +608,12 @@ export function seedPermissionState(
         : [];
     return [...seeded, ...liveAfterSnapshot].sort(sortPermissions);
   });
+  useSessionActivityStore.getState().replaceWaitingRequests(
+    workspaceId,
+    sessionId,
+    "permission",
+    (nextPermissions ?? []).map((permission) => permission.id),
+  );
 }
 
 export function seedQuestionState(
@@ -701,6 +814,7 @@ function applyEvent(entry: SyncEntry, workspaceId: string, event: OpencodeEvent)
     const sessionId = props.sessionID ?? props.info?.id ?? "";
     if (sessionId) entry.titleRecovery?.resolve(sessionId);
     if (sessionId) useSessionActivityStore.getState().removeSession(workspaceId, sessionId);
+    if (sessionId) stopTrackingLiveSession(entry, sessionId);
     if (sessionId) {
       for (const listener of entry.sessionDeletedListeners.keys()) listener(sessionId);
     }
@@ -722,8 +836,15 @@ function applyEvent(entry: SyncEntry, workspaceId: string, event: OpencodeEvent)
       }
       notifyDesktopEvent({ type: "task.failed", sessionId, errorText });
       useSessionActivityStore.getState().setError(workspaceId, sessionId, errorText);
+      stopTrackingLiveSession(entry, sessionId);
       if (isTrackedSession(entry, sessionId)) {
         flushSessionDeltas(entry, workspaceId, sessionId);
+        // The activity store treats session.error as terminal (setError
+        // lowers runActive), but the chat surface derives its thread status
+        // from this react-query cache. An engine that errors without a
+        // following idle event otherwise leaves the transcript's "Working…"
+        // row ticking forever beside the error card. Mirror the idle write.
+        queryClient.setQueryData(statusKey(workspaceId, sessionId), idleStatus);
         queryClient.setQueryData<UIMessage[]>(transcriptKey(workspaceId, sessionId), (current = []) => {
           // Key the error to the latest assistant turn so it lands beside the
           // turn that failed and a later turn's error becomes its own message
@@ -745,6 +866,10 @@ function applyEvent(entry: SyncEntry, workspaceId: string, event: OpencodeEvent)
           exact: true,
         });
       }
+      // An errored run is over: give status listeners (like the queued-send
+      // drainer) the same idle edge session.idle would have delivered, so
+      // queued messages are not wedged behind a run that will never finish.
+      for (const listener of entry.sessionStatusListeners.keys()) listener({ sessionId, status: idleStatus });
     }
     return;
   }
@@ -764,7 +889,7 @@ function applyEvent(entry: SyncEntry, workspaceId: string, event: OpencodeEvent)
   if (event.type === "session.status") {
     const props = (event.properties ?? {}) as { sessionID?: string; status?: SessionStatus };
     if (!props.sessionID || !props.status) return;
-    applySessionRunStatus(entry, workspaceId, props.sessionID, props.status);
+    applySessionRunStatus(entry, workspaceId, props.sessionID, props.status, { source: "stream" });
     return;
   }
 
@@ -785,7 +910,6 @@ function applyEvent(entry: SyncEntry, workspaceId: string, event: OpencodeEvent)
       detail: permissionNotificationDetail(permission),
     });
     useSessionActivityStore.getState().setWaitingRequest(workspaceId, permission.sessionID, "permission", permission.id, true);
-    if (!isTrackedSession(entry, permission.sessionID)) return;
     const receivedAt = Date.now();
     queryClient.setQueryData<PendingPermission[]>(permissionKey(workspaceId, permission.sessionID), (current = []) => {
       const existing = current.find((item) => item.id === permission.id);
@@ -807,7 +931,6 @@ function applyEvent(entry: SyncEntry, workspaceId: string, event: OpencodeEvent)
       detail: permissionNotificationDetail(permission),
     });
     useSessionActivityStore.getState().setWaitingRequest(workspaceId, permission.sessionID, "permission", permission.id, true);
-    if (!isTrackedSession(entry, permission.sessionID)) return;
     const receivedAt = Date.now();
     queryClient.setQueryData<PendingPermission[]>(permissionKey(workspaceId, permission.sessionID), (current = []) => {
       const existing = current.find((item) => item.id === permission.id);
@@ -824,7 +947,6 @@ function applyEvent(entry: SyncEntry, workspaceId: string, event: OpencodeEvent)
     const props = (event.properties ?? {}) as { sessionID?: string; requestID?: string };
     if (!props.sessionID || !props.requestID) return;
     useSessionActivityStore.getState().setWaitingRequest(workspaceId, props.sessionID, "permission", props.requestID, false);
-    if (!isTrackedSession(entry, props.sessionID)) return;
     queryClient.setQueryData<PendingPermission[]>(permissionKey(workspaceId, props.sessionID), (current = []) =>
       current.filter((permission) => permission.id !== props.requestID),
     );
@@ -873,6 +995,17 @@ function applyEvent(entry: SyncEntry, workspaceId: string, event: OpencodeEvent)
       return;
     }
     useSessionActivityStore.getState().markMessageRole(workspaceId, info.sessionID, info.id, info.role);
+    if (info.role === "assistant" && typeof info.time?.completed === "number") {
+      const observedAt = perfNow();
+      entry.assistantMessageCompletedAt.set(info.sessionID, observedAt);
+      const runActiveAt = entry.runActiveObservedAt.get(info.sessionID);
+      recordSessionCompletionMark("assistant-message-completed", {
+        sessionID: info.sessionID,
+        ...(runActiveAt === undefined
+          ? {}
+          : { sinceRunActiveMs: Math.round((observedAt - runActiveAt) * 100) / 100 }),
+      });
+    }
     if (!isTrackedSession(entry, info.sessionID)) return;
     const created = info.time?.created;
     const completed = info.time?.completed;
@@ -1001,36 +1134,10 @@ function applyEvent(entry: SyncEntry, workspaceId: string, event: OpencodeEvent)
   if (event.type === "session.idle") {
     const props = (event.properties ?? {}) as { sessionID?: string };
     if (!props.sessionID) return;
-    // Only emits for runs this client instrumented (markTaskRunStart in the
-    // send path); also dedupes idle events from multiple workspace syncs.
-    const runStartedAt = takeTaskRunStart(props.sessionID);
-    if (runStartedAt !== null) {
-      captureAnalyticsEvent("task_run_completed", {
-        duration_ms: Date.now() - runStartedAt,
-      });
-      trackTaskCompleted(props.sessionID, Date.now() - runStartedAt);
-      notifyDesktopEvent({ type: "task.completed", sessionId: props.sessionID });
-      entry.titleRecovery?.observe(props.sessionID);
-    }
-    useSessionActivityStore.getState().setRunStatus(workspaceId, props.sessionID, idleStatus);
-    const tracked = isTrackedSession(entry, props.sessionID);
-    if (tracked) {
-      // Background deltas normally trade token-level freshness for lower
-      // notification frequency. A terminal event is the convergence point:
-      // commit its remaining text before the durable snapshot is refreshed.
-      flushSessionDeltas(entry, workspaceId, props.sessionID);
-      queryClient.setQueryData(statusKey(workspaceId, props.sessionID), idleStatus);
-      // A fast tool can complete and persist before its final part.updated SSE
-      // reaches the renderer. Reconcile successful turns from the durable
-      // snapshot just as failed turns do, so standard MCP App results mount
-      // without requiring an artificial provider delay or a page reload.
-      void queryClient.invalidateQueries({
-        queryKey: snapshotKey(workspaceId, props.sessionID),
-        exact: true,
-      });
-    }
-    for (const listener of entry.sessionStatusListeners.keys()) listener({ sessionId: props.sessionID, status: idleStatus });
-    if (input && tracked) releaseRetainedSessionSoon(input, entry, props.sessionID);
+    applySessionRunStatus(entry, workspaceId, props.sessionID, idleStatus, {
+      source: "stream",
+      terminalEvent: true,
+    });
   }
 }
 
@@ -1127,7 +1234,7 @@ function startSync(input: SyncOptions, entry: SyncEntry) {
     // cached idle: the server may have started or finished work while the
     // stream was down.
     onConnected: (signal) => {
-      void reconcileSessionRunStatuses(entry, input, signal);
+      void reconcileSessionRunStatuses(entry, input, signal, "connect-reconcile");
     },
     onPhaseChange: (phase) => {
       useWorkspaceSyncStreamStore.getState().publishPhase(streamKey, phase);
@@ -1155,32 +1262,110 @@ function applySessionRunStatus(
   workspaceId: string,
   sessionId: string,
   status: SessionStatus,
-  options: { snapshotStartedAt?: number } = {},
+  options: {
+    snapshotStartedAt?: number;
+    source?: SessionStatusSource;
+    terminalEvent?: boolean;
+  } = {},
 ) {
   const snapshotStartedAt = options.snapshotStartedAt;
   const store = useSessionActivityStore.getState();
+  const previousRecord = store.recordsByWorkspaceId[workspaceId]?.[sessionId];
+  const wasTrackedLive = entry.liveSessionIds.has(sessionId);
+  const wasLive = wasTrackedLive || previousRecord?.runActive === true;
   if (typeof snapshotStartedAt === "number") {
-    const record = store.recordsByWorkspaceId[workspaceId]?.[sessionId];
-    if (snapshotStartedAt < (record?.runStatusAt ?? 0)) return;
+    if (snapshotStartedAt < (previousRecord?.runStatusAt ?? 0)) return;
     store.seedSessionRun(workspaceId, sessionId, status, undefined, { snapshotStartedAt });
   } else {
     store.setRunStatus(workspaceId, sessionId, status);
   }
+
+  const live = isLiveStatus(status);
+  const observedAt = perfNow();
+  if (live) {
+    entry.liveSessionIds.add(sessionId);
+    if (!wasTrackedLive) {
+      entry.runActiveObservedAt.set(sessionId, observedAt);
+      recordSessionCompletionMark("run-active", {
+        sessionID: sessionId,
+        source: options.source ?? "stream",
+        status: status.type,
+      });
+    }
+    scheduleActiveSessionStatusReconciliation(entry);
+  } else {
+    entry.liveSessionIds.delete(sessionId);
+    clearActiveSessionStatusReconcileTimer(entry);
+  }
+
   const tracked = isTrackedSession(entry, sessionId);
   if (tracked) getReactQueryClient().setQueryData(statusKey(workspaceId, sessionId), status);
   for (const listener of entry.sessionStatusListeners.keys()) listener({ sessionId, status });
-  if (entry.input && tracked && !isLiveStatus(status)) releaseRetainedSessionSoon(entry.input, entry, sessionId);
+  if (!live) {
+    // A level-triggered idle response is as authoritative as the SSE edge.
+    // Converge through the same terminal path so a missed status event also
+    // flushes final deltas and refreshes any final persisted message parts.
+    const runStartedAt = takeTaskRunStart(sessionId);
+    if (runStartedAt !== null) {
+      captureAnalyticsEvent("task_run_completed", {
+        duration_ms: Date.now() - runStartedAt,
+      });
+      trackTaskCompleted(sessionId, Date.now() - runStartedAt);
+      notifyDesktopEvent({ type: "task.completed", sessionId });
+      entry.titleRecovery?.observe(sessionId);
+    }
+    const shouldRecordTerminal = wasLive || runStartedAt !== null;
+    const shouldConvergeTerminal = shouldRecordTerminal || options.terminalEvent === true;
+    if (tracked && shouldConvergeTerminal) {
+      flushSessionDeltas(entry, workspaceId, sessionId);
+      void getReactQueryClient().invalidateQueries({
+        queryKey: snapshotKey(workspaceId, sessionId),
+        exact: true,
+      });
+    }
+    if (shouldRecordTerminal) {
+      const assistantCompletedAt = entry.assistantMessageCompletedAt.get(sessionId);
+      const runActiveAt = entry.runActiveObservedAt.get(sessionId);
+      recordSessionCompletionMark("run-terminal", {
+        sessionID: sessionId,
+        source: options.source ?? "stream",
+        ...(assistantCompletedAt === undefined
+          ? {}
+          : { sinceAssistantMessageCompletedMs: Math.round((observedAt - assistantCompletedAt) * 100) / 100 }),
+        ...(runActiveAt === undefined
+          ? {}
+          : { sinceRunActiveMs: Math.round((observedAt - runActiveAt) * 100) / 100 }),
+      });
+    }
+    entry.runActiveObservedAt.delete(sessionId);
+    entry.assistantMessageCompletedAt.delete(sessionId);
+    if (entry.input && tracked) releaseRetainedSessionSoon(entry.input, entry, sessionId);
+  }
 }
 
-async function reconcileSessionRunStatuses(entry: SyncEntry, input: SyncOptions, signal: AbortSignal) {
+async function reconcileSessionRunStatuses(
+  entry: SyncEntry,
+  input: SyncOptions,
+  signal: AbortSignal,
+  source: Exclude<SessionStatusSource, "stream">,
+) {
   const startedAt = Date.now();
   let statuses: Record<string, SessionStatus>;
   try {
     statuses = await sessionStatusFetcher(input.baseUrl, entry.openworkToken, signal);
   } catch {
+    // The run state itself is deliberately left untouched: a failed fetch is
+    // not evidence that work stopped. It is evidence that the busy state can
+    // no longer be validated, so record it where surfaces can stop
+    // presenting a confident ticking "Working" row. Aborted fetches are
+    // lifecycle noise (dispose, generation rotation), not failures.
+    if (!signal.aborted) {
+      useWorkspaceSyncStreamStore.getState().publishReconcileFailure(syncKey(input));
+    }
     return;
   }
   if (signal.aborted) return;
+  useWorkspaceSyncStreamStore.getState().publishReconcileSuccess(syncKey(input), startedAt);
 
   // Level-triggered convergence on every SSE (re)connect: sessions the fetch
   // reports live are seeded busy (heals a subscriber that missed the busy
@@ -1188,12 +1373,82 @@ async function reconcileSessionRunStatuses(entry: SyncEntry, input: SyncOptions,
   // (heals a missed idle edge). Both flow through the same path a
   // session.status event uses so the status cache and listeners converge too.
   const records = useSessionActivityStore.getState().recordsByWorkspaceId[input.workspaceId] ?? {};
-  const sessionIds = new Set([...Object.keys(statuses), ...Object.keys(records)]);
+  const sessionIds = new Set([
+    ...Object.keys(statuses),
+    ...Object.keys(records),
+    ...entry.liveSessionIds,
+  ]);
   for (const sessionId of sessionIds) {
     applySessionRunStatus(entry, input.workspaceId, sessionId, statuses[sessionId] ?? idleStatus, {
       snapshotStartedAt: startedAt,
+      source,
     });
   }
+}
+
+function clearActiveSessionStatusReconcileTimer(entry: SyncEntry) {
+  if (entry.liveSessionIds.size > 0 || !entry.statusReconcileTimer) return;
+  clearTimeout(entry.statusReconcileTimer);
+  entry.statusReconcileTimer = null;
+}
+
+function stopTrackingLiveSession(entry: SyncEntry, sessionId: string) {
+  entry.liveSessionIds.delete(sessionId);
+  entry.runActiveObservedAt.delete(sessionId);
+  entry.assistantMessageCompletedAt.delete(sessionId);
+  clearActiveSessionStatusReconcileTimer(entry);
+}
+
+function scheduleActiveSessionStatusReconciliation(entry: SyncEntry) {
+  if (
+    entry.liveSessionIds.size === 0
+    || entry.statusReconcileTimer
+    || entry.statusReconcileAbort
+  ) return;
+
+  entry.statusReconcileTimer = setTimeout(() => {
+    entry.statusReconcileTimer = null;
+    if (entry.liveSessionIds.size === 0) return;
+
+    const controller = new AbortController();
+    entry.statusReconcileAbort = controller;
+    void reconcileSessionRunStatuses(
+      entry,
+      entry.input,
+      controller.signal,
+      "active-reconcile",
+    ).finally(() => {
+      if (entry.statusReconcileAbort === controller) entry.statusReconcileAbort = null;
+      scheduleActiveSessionStatusReconciliation(entry);
+    });
+  }, activeSessionStatusReconcileIntervalMs);
+}
+
+/**
+ * A restored network (or a wake that brings it back) should not wait out
+ * retry backoff or the next watchdog tick: reconnect any parked stream with
+ * fresh backoff and revalidate run statuses immediately, so a run that ended
+ * or kept working while the machine was offline settles within one fetch.
+ */
+function revalidateWorkspaceSyncs() {
+  for (const entry of syncs.values()) {
+    entry.notifyStreamGenerationChanged?.();
+    const controller = new AbortController();
+    void reconcileSessionRunStatuses(entry, entry.input, controller.signal, "connect-reconcile");
+  }
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("online", revalidateWorkspaceSyncs);
+}
+
+export function __revalidateWorkspaceSyncsForTest() {
+  revalidateWorkspaceSyncs();
+}
+
+export function __resetWorkspaceSyncReconcileHealthForTest() {
+  lastReconcileSuccessAtByKey.clear();
+  useWorkspaceSyncStreamStore.setState({ reconcileHealthByKey: {} });
 }
 
 export function ensureWorkspaceSessionSync(input: SyncOptions) {
@@ -1238,6 +1493,11 @@ export function ensureWorkspaceSessionSync(input: SyncOptions) {
     deltaFlushBuffer: [],
     deltaFlushLane: null,
     cancelDeltaFlush: null,
+    liveSessionIds: new Set(),
+    statusReconcileTimer: null,
+    statusReconcileAbort: null,
+    runActiveObservedAt: new Map(),
+    assistantMessageCompletedAt: new Map(),
     titleRecovery: null,
   };
   created.titleRecovery = createSessionTitleRecovery({
@@ -1433,12 +1693,19 @@ export function __createWorkspaceSessionSyncForTest(input: SyncOptions) {
     deltaFlushBuffer: [],
     deltaFlushLane: null,
     cancelDeltaFlush: null,
+    liveSessionIds: new Set(),
+    statusReconcileTimer: null,
+    statusReconcileAbort: null,
+    runActiveObservedAt: new Map(),
+    assistantMessageCompletedAt: new Map(),
     titleRecovery: null,
   });
   return () => {
     const entry = syncs.get(key);
     if (entry) {
       for (const timer of entry.retainedSessionTimers.values()) clearTimeout(timer);
+      if (entry.statusReconcileTimer) clearTimeout(entry.statusReconcileTimer);
+      entry.statusReconcileAbort?.abort();
     }
     syncs.delete(key);
   };

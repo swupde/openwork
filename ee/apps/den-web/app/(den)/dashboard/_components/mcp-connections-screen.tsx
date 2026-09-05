@@ -161,7 +161,7 @@ async function copyTextToClipboard(text: string): Promise<boolean> {
   }
 }
 
-type GithubPluginImportSkippedReason = "missing_url" | "local_unsupported" | "invalid_url" | "unsupported_auth";
+type GithubPluginImportSkippedReason = "headers_unsupported" | "invalid_config" | "invalid_url" | "local_unsupported" | "missing_url" | "unsupported_auth";
 
 type GithubPluginImportServer = {
   name: string;
@@ -195,7 +195,7 @@ function asString(value: unknown): string | null {
 }
 
 function parseSkippedReason(value: unknown): GithubPluginImportSkippedReason | null {
-  if (value === "missing_url" || value === "local_unsupported" || value === "invalid_url" || value === "unsupported_auth") {
+  if (value === "headers_unsupported" || value === "invalid_config" || value === "invalid_url" || value === "local_unsupported" || value === "missing_url" || value === "unsupported_auth") {
     return value;
   }
   return null;
@@ -244,6 +244,9 @@ function parseGithubPluginImportPreview(payload: unknown): GithubPluginImportPre
 function importServerStatus(server: GithubPluginImportServer): string {
   if (server.supported) return "ready";
   if (server.skippedReason === "missing_url") return "missing URL";
+  if (server.skippedReason === "local_unsupported") return "desktop-only";
+  if (server.skippedReason === "headers_unsupported") return "static headers unsupported";
+  if (server.skippedReason === "invalid_config") return "invalid config";
   return "unsupported";
 }
 
@@ -2120,6 +2123,28 @@ const ACCESS_MODE_OPTIONS: SegmentedControlOption<AddConnectionAccessMode>[] = [
   { value: "people", label: "Specific people" },
 ];
 
+function ExposeDirectlyField({ checked, onChange }: { checked: boolean; onChange: (value: boolean) => void }) {
+  return (
+    <div>
+      <label className="flex items-start gap-2 text-[12px] text-gray-700">
+        <input
+          type="checkbox"
+          className="mt-0.5"
+          checked={checked}
+          onChange={(event) => onChange(event.target.checked)}
+        />
+        <span>
+          <span className="font-medium">Expose directly as an MCP server</span>
+          <span className="mt-0.5 block text-[11px] leading-5 text-gray-500">
+            The agent sees this server&apos;s own tools instead of going through search and execute.
+            Access grants and the tool policy still apply.
+          </span>
+        </span>
+      </label>
+    </div>
+  );
+}
+
 function EditConnectionDialog({
   connection,
   configureOAuthClient,
@@ -2140,6 +2165,7 @@ function EditConnectionDialog({
   const [url, setUrl] = useState("");
   const [authType, setAuthType] = useState<ExternalMcpAuthType>("oauth");
   const [credentialMode, setCredentialMode] = useState<ExternalMcpCredentialMode>("shared");
+  const [exposeDirectly, setExposeDirectly] = useState(false);
   const [apiKey, setApiKey] = useState("");
   const [showOAuthClient, setShowOAuthClient] = useState(false);
   const [oauthClientId, setOAuthClientId] = useState("");
@@ -2156,6 +2182,7 @@ function EditConnectionDialog({
     setUrl(connection.url);
     setAuthType(connection.authType);
     setCredentialMode(connection.credentialMode);
+    setExposeDirectly(connection.exposeDirectly);
     setApiKey("");
     setShowOAuthClient(configureOAuthClient || Boolean(connection.oauthClientId));
     setOAuthClientId(connection.oauthClientId ?? "");
@@ -2218,6 +2245,7 @@ function EditConnectionDialog({
       url: url.trim(),
       authType,
       credentialMode: proposedCredentialMode,
+      exposeDirectly,
       ...(!marketplaceManaged && authType === "apikey" && trimmedApiKey ? { apiKey: trimmedApiKey } : {}),
       ...(authType === "oauth" && showOAuthClient && trimmedClientId
         ? {
@@ -2404,6 +2432,8 @@ function EditConnectionDialog({
             ) : null}
           </div>
 
+          <ExposeDirectlyField checked={exposeDirectly} onChange={setExposeDirectly} />
+
           <div>
             <label className="mb-1.5 block text-[12px] font-medium text-gray-700">Who can use this?</label>
             <SegmentedControl
@@ -2529,6 +2559,7 @@ function AddConnectionDialog({
   const [url, setUrl] = useState(preset?.url ?? "");
   const [authType, setAuthType] = useState<ExternalMcpAuthType>(preset?.authType ?? "oauth");
   const [credentialMode, setCredentialMode] = useState<ExternalMcpCredentialMode>("per_member");
+  const [exposeDirectly, setExposeDirectly] = useState(false);
   const [apiKey, setApiKey] = useState("");
   const [showOAuthClient, setShowOAuthClient] = useState(Boolean(preset?.requiresOAuthClient));
   const [oauthClientId, setOAuthClientId] = useState("");
@@ -2557,6 +2588,7 @@ function AddConnectionDialog({
     setUrl(preset?.url ?? initialUrl ?? "");
     setAuthType(preset?.authType ?? "oauth");
     setCredentialMode("per_member");
+    setExposeDirectly(false);
     setApiKey("");
     setShowOAuthClient(Boolean(preset?.requiresOAuthClient));
     setOAuthClientId("");
@@ -2754,6 +2786,7 @@ function AddConnectionDialog({
       url: url.trim(),
       authType,
       credentialMode: authType === "oauth" ? credentialMode : "shared",
+      exposeDirectly,
       apiKey: authType === "apikey" ? apiKey.trim() : undefined,
       oauthClient: showOAuthClientFields && trimmedClientId
         ? {
@@ -3128,6 +3161,8 @@ function AddConnectionDialog({
               </p>
             </div>
           ) : null}
+
+          <ExposeDirectlyField checked={exposeDirectly} onChange={setExposeDirectly} />
 
           <div>
             <label className="mb-1.5 block text-[12px] font-medium text-gray-700">Who can use this?</label>

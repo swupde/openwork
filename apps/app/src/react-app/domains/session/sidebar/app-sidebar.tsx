@@ -1446,12 +1446,12 @@ function WorkspaceReorderItem({
   );
 }
 
-type WorkspaceHeaderProps = React.ComponentProps<typeof SidebarMenuButton> & {
+type WorkspaceHeaderProps = {
   workspace: WorkspaceInfo;
   statusLabel: string;
   isError: boolean;
   isLoading: boolean;
-  onTitlePointerDown: React.PointerEventHandler<HTMLDivElement>;
+  onTitlePointerDown: React.PointerEventHandler<HTMLButtonElement>;
 };
 
 function WorkspaceHeader({
@@ -1460,11 +1460,14 @@ function WorkspaceHeader({
   isError,
   isLoading,
   onTitlePointerDown,
-  onClick,
-  ...props
 }: WorkspaceHeaderProps) {
   const ctx = useSidebarContext();
   const label = workspaceLabel(workspace);
+  // Same reveal pattern as task rows: the name fades only where text is
+  // hidden and scrolls into view on mouse hover or keyboard focus.
+  const [isTitleHovered, setIsTitleHovered] = React.useState(false);
+  const [isTitleFocused, setIsTitleFocused] = React.useState(false);
+  const titleIntent = isTitleFocused ? "focus" : isTitleHovered ? "hover" : null;
 
   const handleSelectWorkspace = () => {
     void Promise.resolve(ctx.onSelectWorkspace(workspace.id));
@@ -1472,15 +1475,11 @@ function WorkspaceHeader({
 
   return (
     <SidebarMenuButton
-      {...props}
+      render={<div />}
       className={cn(
         "gap-2 group-hover/workspace-header:bg-sidebar-accent group-hover/workspace-header:text-sidebar-accent-foreground mac:group-hover/workspace-header:bg-black/5 dark:mac:group-hover/workspace-header:bg-white/10",
         statusLabel && "h-10",
       )}
-      onClick={(event) => {
-        onClick?.(event);
-        handleSelectWorkspace();
-      }}
     >
       <SidebarGlyphSlot>
         {isLoading ? (
@@ -1489,18 +1488,33 @@ function WorkspaceHeader({
           <WorkspaceAvatarPicker workspaceId={workspace.id} label={label} />
         )}
       </SidebarGlyphSlot>
-      <div
+      <button
+        type="button"
         data-sidebar-workspace-drag-handle
-        className="min-w-0 flex-1 cursor-grab touch-none active:cursor-grabbing pr-8 group-hover/workspace-header:pr-20 group-has-[[data-workspace-actions]:focus-within]/workspace-header:pr-20 group-has-data-popup-open/workspace-header:pr-20"
+        data-sidebar-workspace-title
+        // `items-stretch` (not `items-start`) so the title viewport spans the
+        // row up to the reserved action padding instead of shrinking to its
+        // text, which put the fade on the last letters of every name.
+        className="min-w-0 flex h-full flex-1 cursor-grab touch-none flex-col items-stretch justify-center border-0 bg-transparent p-0 text-left text-inherit active:cursor-grabbing pr-8 group-hover/workspace-header:pr-20 group-has-[[data-workspace-actions]:focus-within]/workspace-header:pr-20 group-has-data-popup-open/workspace-header:pr-20"
+        aria-label={statusLabel ? `${label}, ${statusLabel}` : label}
         onPointerDown={onTitlePointerDown}
+        onPointerEnter={(event) => {
+          if (event.pointerType === "mouse") setIsTitleHovered(true);
+        }}
+        onPointerLeave={() => setIsTitleHovered(false)}
+        onFocus={() => setIsTitleFocused(true)}
+        onBlur={() => setIsTitleFocused(false)}
+        onClick={handleSelectWorkspace}
       >
-        <span className="block ow-fade-truncate">{label}</span>
+        <span className="flex min-w-0 items-center">
+          <SessionTitle intent={titleIntent} title={label} tooltip={label} />
+        </span>
         {statusLabel ? (
           <span className={cn("block text-xs", isError ? "text-destructive" : "text-muted-foreground")}>
             {statusLabel}
           </span>
         ) : null}
-      </div>
+      </button>
     </SidebarMenuButton>
   );
 }
@@ -1510,7 +1524,7 @@ type WorkspaceSidebarGroupProps = {
   group: WorkspaceSessionGroup;
   previewCount: number;
   showMoreSessions: (workspaceId: string, totalRoots: number) => void;
-  onWorkspaceTitlePointerDown: React.PointerEventHandler<HTMLDivElement>;
+  onWorkspaceTitlePointerDown: React.PointerEventHandler<HTMLButtonElement>;
 };
 
 function WorkspaceSidebarGroup({

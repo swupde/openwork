@@ -9,6 +9,7 @@ import { toast } from "@/components/ui/sonner";
 import { captureAnalyticsEvent } from "@/app/lib/analytics";
 import { createClient, unwrap } from "@/app/lib/opencode";
 import { abortSessionSafe } from "@/app/lib/opencode-session";
+import { composeNativeSessionSnapshot } from "@/app/lib/opencode-session-native";
 import { setThemeMode } from "@/app/theme";
 import { t } from "@/i18n";
 import type { ComposerSettingsSection } from "@/react-app/domains/settings/library";
@@ -37,6 +38,7 @@ import {
   recordInspectorEvent,
 } from "@/app/lib/app-inspector";
 import { useControlAction, type OpenworkControlAction } from "@/react-app/shell/control/control-provider";
+import { isConnectDirectMcpServerName } from "@/react-app/domains/connections/cloud-mcp-user-state";
 import { attemptSilentMcpReauth } from "@/react-app/domains/connections/mcp-silent-reauth";
 import type {
   CloudMcpSubmissionGateState,
@@ -75,6 +77,7 @@ import { interruptedTaskRecoveryPrompt } from "@/react-app/domains/session/sync/
 import { useLocal } from "@/react-app/kernel/local-provider";
 import { resolveAttachmentFileMetadata } from "@/react-app/domains/session/sync/attachment-file-part";
 import { deriveSessionRenderModel } from "@/react-app/domains/session/sync/transition-controller";
+import { setQueuedSendContext } from "@/react-app/domains/session/sync/queued-send-context";
 import { useSessionScrollController } from "./scroll-controller";
 import { SessionScrollOverlay } from "./scroll-overlay";
 import { SessionFindBar } from "./find-bar";
@@ -87,10 +90,13 @@ import { deriveOpenTargets, sameOpenTargets, selectAutoOpenTarget, type OpenTarg
 import { usePanelTabStore } from "@/react-app/domains/session/panel/panel-tab-store";
 import {
   markSessionSnapshotFetchStart,
+  reconcileFailureDegradedThreshold,
   seedSessionState,
   snapshotKey as reactSnapshotKey,
   statusKey as reactStatusKey,
   transcriptKey as reactTranscriptKey,
+  useWorkspaceSyncStreamStore,
+  workspaceSyncStreamKey,
 } from "@/react-app/domains/session/sync/session-sync";
 import { resolveForkBoundaryId } from "@/react-app/domains/session/sync/transcript-reconcile";
 import {
@@ -401,7 +407,57 @@ function createSessionLifecycleEvalMessages(sessionId: string): UIMessage[] {
   ];
 }
 
-function createSubagentActivityEvalMessages(sessionId: string): UIMessage[] {
+const TOOL_DETAILS_EVAL_COMMAND =
+  "pnpm world up dev-headless --detach -- --replace --keep-tokens && OPENWORK_EVAL_E2E_TESTS=1 pnpm vitest run evals/specs/chat-loading-shimmer.e2e.test.ts --reporter=verbose";
+const TOOL_DETAILS_EVAL_PATTERN =
+  "seed_unfinished_tools|git status --short --branch|createSessionLifecycleEvalMessages|useControlAction";
+const TOOL_DETAILS_EVAL_ERROR =
+  "Process exited with code 2\nerror: pathspec 'release/2026.09' did not match any file(s) known to git\nhint: use 'git fetch origin release/2026.09' first";
+
+function createToolDetailsEvalMessages(sessionId: string): UIMessage[] {
+  const now = Date.now();
+  return [
+    {
+      id: `${sessionId}:eval-tool-details-user`,
+      role: "user",
+      parts: [{ type: "text", text: "Run the headless proof and find the seed hook." }],
+      metadata: { opencode: { created: now } },
+    },
+    {
+      id: `${sessionId}:eval-tool-details-assistant`,
+      role: "assistant",
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolName: "bash",
+          toolCallId: "eval-tool-details-bash",
+          state: "output-available",
+          input: { command: TOOL_DETAILS_EVAL_COMMAND, description: "Run the headless proof" },
+          output: "ok",
+        },
+        {
+          type: "dynamic-tool",
+          toolName: "grep",
+          toolCallId: "eval-tool-details-grep",
+          state: "output-available",
+          input: { pattern: TOOL_DETAILS_EVAL_PATTERN, path: "apps/app/src", include: "*.tsx" },
+          output: "2 matches",
+        },
+        {
+          type: "dynamic-tool",
+          toolName: "bash",
+          toolCallId: "eval-tool-details-failed",
+          state: "output-error",
+          input: { command: "git checkout release/2026.09", description: "Switch to the release branch" },
+          errorText: TOOL_DETAILS_EVAL_ERROR,
+        },
+      ],
+      metadata: { opencode: { created: now + 1, completed: now + 4_000 } },
+    },
+  ];
+}
+
+function createSubagentActivityEvalMessages(sessionId: string, childSessionId?: string): UIMessage[] {
   const now = Date.now();
   return [
     {
@@ -424,6 +480,7 @@ function createSubagentActivityEvalMessages(sessionId: string): UIMessage[] {
             prompt: "Reproduce the Azure failure in isolation.",
             subagent_type: "executor-deep",
           },
+          ...(childSessionId ? { callProviderMetadata: { openwork: { childSessionId } } } : {}),
         },
       ],
       metadata: { opencode: { created: now + 1 } },
@@ -438,6 +495,50 @@ function createChatLoadingEvalMessages(sessionId: string): UIMessage[] {
     parts: [{ type: "text", text: "Confirm the loading treatment." }],
     metadata: { opencode: { created: Date.now() } },
   }];
+}
+
+function createImageLightboxEvalImageUrl(width: number, height: number, label: string) {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><rect width="100%" height="100%" fill="#dbeafe"/><text x="50%" y="50%" font-family="sans-serif" font-size="${Math.round(Math.min(width, height) / 8)}" text-anchor="middle" dominant-baseline="middle" fill="#1e3a8a">${label}</text></svg>`;
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+}
+
+function createImageLightboxEvalMessages(sessionId: string): UIMessage[] {
+  const now = Date.now();
+  return [
+    {
+      id: `${sessionId}:eval-image-lightbox-user`,
+      role: "user",
+      parts: [
+        {
+          type: "file",
+          mediaType: "image/svg+xml",
+          filename: "landscape-screenshot.svg",
+          url: createImageLightboxEvalImageUrl(2000, 1112, "landscape 2000x1112"),
+        },
+        {
+          type: "file",
+          mediaType: "image/svg+xml",
+          filename: "small-icon.svg",
+          url: createImageLightboxEvalImageUrl(180, 180, "icon"),
+        },
+        { type: "text", text: "Inspect these images." },
+      ],
+      metadata: { opencode: { created: now } },
+    },
+    {
+      id: `${sessionId}:eval-image-lightbox-assistant`,
+      role: "assistant",
+      parts: [
+        {
+          type: "file",
+          mediaType: "image/svg+xml",
+          filename: "portrait-screenshot.svg",
+          url: createImageLightboxEvalImageUrl(1112, 2000, "portrait 1112x2000"),
+        },
+      ],
+      metadata: { opencode: { created: now + 1, completed: now + 2_000 } },
+    },
+  ];
 }
 
 export type SessionSurfaceProps = {
@@ -495,6 +596,7 @@ export type SessionSurfaceProps = {
   isSandboxWorkspace: boolean;
   todos?: TodoItem[];
   activePermission?: PendingPermission | null;
+  activePermissionSourceTitle?: string | null;
   permissionReplyBusy?: boolean;
   respondPermission?: (requestID: string, reply: "once" | "always" | "reject") => void;
   activeQuestion?: PendingQuestion | null;
@@ -860,6 +962,7 @@ export function SessionSurface(props: SessionSurfaceProps) {
   const pasteParts = useComposerStateStore((state) => getComposerPasteParts(state, props.sessionId));
   const setComposerDraft = useComposerStateStore((state) => state.setDraft);
   const replaceComposerDraft = useComposerStateStore((state) => state.replaceDraft);
+  const hydrateComposerDraft = useComposerStateStore((state) => state.hydrateDraft);
   const clearComposerRevertTarget = useComposerStateStore((state) => state.clearRevertTarget);
   const setComposerAttachments = useComposerStateStore((state) => state.setAttachments);
   const setComposerMentions = useComposerStateStore((state) => state.setMentions);
@@ -874,6 +977,7 @@ export function SessionSurface(props: SessionSurfaceProps) {
     scopeKey: string;
     snapshot: typeof persistedDraftSnapshot;
   } | null>(null);
+  const [hydratedDraftScopeKey, setHydratedDraftScopeKey] = useState<string | null>(null);
 
   // Layout timing is intentional: an account/org boundary must replace the
   // previous scope's in-memory Zustand draft before the browser can paint it.
@@ -891,19 +995,21 @@ export function SessionSurface(props: SessionSurfaceProps) {
     const currentState = useComposerStateStore.getState();
     const currentDraft = getComposerDraft(currentState, props.sessionId);
     const nextDraft = persistedDraftSnapshot?.text ?? "";
-    if (!composerDraftNeedsHydration({
+    const needsHydration = composerDraftNeedsHydration({
       claimedScopeKey,
       nextScopeKey: persistedDraftKey,
       currentText: currentDraft,
       storedText: nextDraft,
-    })) return;
+    });
 
-    for (const attachment of getComposerAttachments(currentState, props.sessionId)) {
-      revokeAttachmentPreview(attachment);
+    if (needsHydration) {
+      for (const attachment of getComposerAttachments(currentState, props.sessionId)) {
+        revokeAttachmentPreview(attachment);
+      }
+      hydrateComposerDraft(props.sessionId, nextDraft);
     }
-    clearComposerSession(props.sessionId);
-    if (nextDraft) replaceComposerDraft(props.sessionId, nextDraft);
-  }, [clearComposerSession, persistedDraftKey, persistedDraftSnapshot, props.sessionId, replaceComposerDraft]);
+    setHydratedDraftScopeKey(persistedDraftKey);
+  }, [hydrateComposerDraft, persistedDraftKey, persistedDraftSnapshot, props.sessionId]);
   const inputHistory = useComposerStateStore((state) => getComposerHistory(state, props.sessionId));
   const appendComposerHistory = useComposerStateStore((state) => state.appendHistory);
   // Queued follow-up drafts live in the shared composer store keyed by session
@@ -911,6 +1017,32 @@ export function SessionSurface(props: SessionSurfaceProps) {
   // session B when the route swaps the same surface component to another
   // session.
   const queuedItems = useComposerStateStore((state) => getComposerQueuedDrafts(state, props.sessionId));
+  useEffect(() => {
+    if (queuedItems.length === 0) return;
+    setQueuedSendContext(props.sessionId, {
+      workspaceId: props.workspaceId,
+      workspaceRoot: props.workspaceRoot,
+      opencodeBaseUrl: props.opencodeBaseUrl,
+      openworkToken: props.openworkToken,
+      client: props.client,
+      agent: props.selectedAgent,
+      variant: props.modelVariant,
+      model: props.selectedModel,
+      environmentRuntimeKey: props.environmentRuntimeKey ?? null,
+    });
+  }, [
+    props.client,
+    props.environmentRuntimeKey,
+    props.modelVariant,
+    props.opencodeBaseUrl,
+    props.openworkToken,
+    props.selectedAgent,
+    props.selectedModel,
+    props.sessionId,
+    props.workspaceId,
+    props.workspaceRoot,
+    queuedItems.length,
+  ]);
   const appendQueuedDraft = useComposerStateStore((state) => state.appendQueuedDraft);
   const removeQueuedDraftFromStore = useComposerStateStore((state) => state.removeQueuedDraft);
   const updateQueuedDraftInStore = useComposerStateStore((state) => state.updateQueuedDraft);
@@ -1019,9 +1151,13 @@ export function SessionSurface(props: SessionSurfaceProps) {
   );
   const snapshotQuery = useQuery<OpenworkSessionSnapshot>({
     queryKey: snapshotQueryKey,
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       const startedAt = Date.now();
-      const item = (await props.client.getSessionSnapshot(props.workspaceId, props.sessionId, { limit: 140 })).item;
+      const item = await composeNativeSessionSnapshot(
+        { opencodeBaseUrl: props.opencodeBaseUrl, token: props.openworkToken },
+        props.sessionId,
+        { limit: 140, signal },
+      );
       markSessionSnapshotFetchStart(item, startedAt);
       return item;
     },
@@ -1142,6 +1278,18 @@ export function SessionSurface(props: SessionSurfaceProps) {
   const preparingCloudTools = props.cloudMcpSubmissionState.status === "checking" ||
     props.cloudMcpSubmissionState.status === "repairing";
   const chatStreaming = sending || liveStatus.type === "busy" || liveStatus.type === "retry";
+  // A busy status is a claim that decays: the sync layer revalidates it
+  // continuously against /session/status, and once that validation keeps
+  // failing (network drop, sleep, dead engine) the transcript must present
+  // "reconnecting" instead of a confidently ticking Working row.
+  const syncStreamKey = workspaceSyncStreamKey({ workspaceId: props.workspaceId, baseUrl: props.opencodeBaseUrl });
+  const syncReconcileHealth = useWorkspaceSyncStreamStore(
+    (state) => state.reconcileHealthByKey[syncStreamKey],
+  );
+  const runSyncHealth = useMemo(() => ({
+    degraded: (syncReconcileHealth?.consecutiveFailures ?? 0) >= reconcileFailureDegradedThreshold,
+    lastConfirmedAt: syncReconcileHealth?.lastSuccessAt ?? null,
+  }), [syncReconcileHealth]);
 
   useEffect(() => {
     if (!chatStreaming) setSteering(false);
@@ -1278,6 +1426,22 @@ export function SessionSurface(props: SessionSurfaceProps) {
     };
   }, [props.sessionId]);
   useControlAction(props.isControlTarget ? seedConnectorToolCallControlAction : null);
+  const seedToolDetailsControlAction = useMemo<OpenworkControlAction | null>(() => {
+    if (!import.meta.env.DEV) return null;
+
+    return {
+      id: "eval.tool_details.seed",
+      label: "Seed a settled tool group with long details",
+      description: "Dev-only eval hook that renders a long command, a long search pattern, and a multi-line failure in one aggregate group.",
+      sideEffect: "mutation",
+      disabled: !props.sessionId,
+      execute: () => {
+        setEvalMarkdownMessages(createToolDetailsEvalMessages(props.sessionId));
+        return { ok: true };
+      },
+    };
+  }, [props.sessionId]);
+  useControlAction(props.isControlTarget ? seedToolDetailsControlAction : null);
   const seedSessionLifecycleControlAction = useMemo<OpenworkControlAction | null>(() => {
     if (!import.meta.env.DEV) return null;
 
@@ -1358,14 +1522,19 @@ export function SessionSurface(props: SessionSurfaceProps) {
       description: "Dev-only eval hook that renders a deterministic running delegated-task row.",
       sideEffect: "mutation",
       disabled: !props.sessionId,
-      execute: () => {
-        setEvalMarkdownMessages(createSubagentActivityEvalMessages(props.sessionId));
+      args: [{ name: "childSessionId", type: "string", description: "Optional child session represented by the task row." }],
+      execute: (args) => {
+        const rawChildSessionId = args && typeof args === "object" ? Reflect.get(args, "childSessionId") : undefined;
+        const childSessionId = typeof rawChildSessionId === "string" && rawChildSessionId.trim()
+          ? rawChildSessionId.trim()
+          : undefined;
+        setEvalMarkdownMessages(createSubagentActivityEvalMessages(props.sessionId, childSessionId));
         useSessionActivityStore.getState().setRunStatus(
           props.workspaceId,
           props.sessionId,
           { type: "busy" },
         );
-        return { ok: true };
+        return { ok: true, childSessionId: childSessionId ?? null };
       },
     };
   }, [props.sessionId, props.workspaceId]);
@@ -1392,6 +1561,23 @@ export function SessionSurface(props: SessionSurfaceProps) {
     };
   }, [props.sessionId, props.workspaceId]);
   useControlAction(props.isControlTarget ? seedChatLoadingControlAction : null);
+  const seedImageLightboxControlAction = useMemo<OpenworkControlAction | null>(() => {
+    if (!import.meta.env.DEV) return null;
+
+    return {
+      id: "eval.image_lightbox.seed",
+      label: "Seed image lightbox proof",
+      description: "Dev-only eval hook that renders user and assistant image parts with known pixel sizes.",
+      sideEffect: "mutation",
+      disabled: !props.sessionId,
+      execute: () => {
+        const seeded = createImageLightboxEvalMessages(props.sessionId);
+        setEvalMarkdownMessages(seeded);
+        return { ok: true, messageCount: seeded.length };
+      },
+    };
+  }, [props.sessionId]);
+  useControlAction(props.isControlTarget ? seedImageLightboxControlAction : null);
   const openTargets = useMemo(() => deriveOpenTargets(renderedMessages), [renderedMessages]);
   const openTargetsFingerprint = useMemo(
     () => openTargets.map((target) => `${target.kind}:${target.value}:${target.confidence}`).join("|"),
@@ -1889,10 +2075,12 @@ export function SessionSurface(props: SessionSurfaceProps) {
   }, [props.cloudMcpSubmissionState.status, props.sessionId]);
 
   useEffect(() => {
+    if (hydratedDraftScopeKey !== persistedDraftKey) return;
     const nextDraft = buildDraft(draft, attachments);
-    persistDraft({ text: persistableComposerDraftText(nextDraft.text), mode: nextDraft.mode });
+    const persistableText = persistableComposerDraftText(nextDraft.text);
+    persistDraft({ text: persistableText, mode: nextDraft.mode });
     props.onDraftChange(nextDraft);
-  }, [attachments, buildDraft, draft, persistDraft, props.onDraftChange]);
+  }, [attachments, buildDraft, draft, hydratedDraftScopeKey, persistDraft, persistedDraftKey, props.onDraftChange]);
 
   const handleAttachFiles = useCallback((files: File[]) => {
     if (!props.attachmentsEnabled) {
@@ -2116,12 +2304,16 @@ export function SessionSurface(props: SessionSurfaceProps) {
       })()
       : Promise.resolve({});
     const [response, localStatuses] = await Promise.all([localMcpPromise, localStatusesPromise]);
-    const localServers = (response.items ?? []).map((entry) => ({
-      name: entry.name,
-      config: entry.config as McpServerEntry["config"],
-      source: entry.source,
-      origin: entry.name === "openwork-cloud" ? "openwork-connect" : "local",
-    } satisfies McpServerEntry));
+    // Directly exposed org connections are already listed through their org
+    // connection entry; their projected runtime rows must not appear twice.
+    const localServers = (response.items ?? [])
+      .filter((entry) => !isConnectDirectMcpServerName(entry.name))
+      .map((entry) => ({
+        name: entry.name,
+        config: entry.config as McpServerEntry["config"],
+        source: entry.source,
+        origin: entry.name === "openwork-cloud" ? "openwork-connect" : "local",
+      } satisfies McpServerEntry));
 
     void connectPromise.then((connect) => {
       if (mcpConnectPushRef.current !== pushId) return;
@@ -2614,6 +2806,7 @@ export function SessionSurface(props: SessionSurfaceProps) {
                       displaySuggestions={shellConfig.starterCards}
                       providerConnectedCount={props.providerConnectedCount ?? 0}
                       connectorIdentities={connectorIdentities}
+                      syncDegraded={runSyncHealth.degraded}
                       dispatchAction={handleMessageListDispatchAction}
                       setPrompt={handleMessageListSetPrompt}
                       onRevertToUserMessage={handleRevertToUserMessage}
@@ -2630,6 +2823,7 @@ export function SessionSurface(props: SessionSurfaceProps) {
                         status={status}
                         activityStatus={effectiveActivityStatus}
                         retryStatus={liveStatus.type === "retry" ? liveStatus : null}
+                        syncHealth={runSyncHealth}
                       />
                     </MessageListProvider>
                   </EnvironmentVariableProvider>
@@ -2780,6 +2974,7 @@ export function SessionSurface(props: SessionSurfaceProps) {
                 {props.activePermission ? (
                   <PermissionApprovalPanel
                     permission={props.activePermission}
+                    sourceTitle={props.activePermissionSourceTitle ?? undefined}
                     busy={props.permissionReplyBusy}
                     respondPermission={props.respondPermission}
                     safeStringify={props.safeStringify}

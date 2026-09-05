@@ -124,7 +124,6 @@ type PendingConversationHistoryNavigation = {
 
 /** Live status the route feeds into the sidebar footer account menu. */
 type StatusBarOverrides = {
-  loading: boolean;
   showSettingsButton: boolean;
   reloadBusy: boolean;
   reloadError: string | null;
@@ -242,6 +241,7 @@ export type SessionPageProps = {
   shareWorkspaceModal?: ShareWorkspaceModalProps | null;
   providerAuthModal?: ProviderAuthModalProps | null;
   activePermission?: PendingPermission | null;
+  activePermissionSourceTitle?: string | null;
   permissionReplyBusy?: boolean;
   respondPermission?: (requestID: string, reply: "once" | "always" | "reject") => void;
   safeStringify?: (value: unknown) => string;
@@ -903,7 +903,7 @@ export function SessionPage(props: SessionPageProps) {
 
   const selectedSessionTitle = useMemo(
     () => sessionTitleForId(props.sidebar.workspaceSessionGroups, props.selectedSessionId, props.selectedWorkspaceId),
-    [props.selectedSessionId, props.sidebar.workspaceSessionGroups],
+    [props.selectedSessionId, props.selectedWorkspaceId, props.sidebar.workspaceSessionGroups],
   );
   const workspaceName =
     props.selectedWorkspaceDisplay.displayName?.trim() ||
@@ -1313,8 +1313,9 @@ export function SessionPage(props: SessionPageProps) {
   ) : activeSidePanel === "voice" ? (
     <VoicePanel
       client={props.openworkServerClient}
-      workspaceId={props.runtimeWorkspaceId}
       sessionId={props.selectedSessionId}
+      opencodeBaseUrl={reactSessionBaseUrl}
+      openworkToken={reactSessionToken}
       onClose={closeRightPane}
     />
   ) : activeSidePanel === "panel" ? (
@@ -1402,7 +1403,6 @@ export function SessionPage(props: SessionPageProps) {
             showConnectionStatus: Boolean(props.selectedWorkspaceId),
             providerConnectedIds: props.providerConnectedIds,
             mcpConnectedCount: props.mcpConnectedCount,
-            loading: props.statusBar?.loading ?? false,
             showSettingsButton: props.statusBar?.showSettingsButton,
             reloadBusy: props.statusBar?.reloadBusy,
             reloadError: props.statusBar?.reloadError,
@@ -1410,7 +1410,12 @@ export function SessionPage(props: SessionPageProps) {
             onSendFeedback: props.onSendFeedback,
           }}
         />
-        <SidebarInset className="min-h-0 overflow-hidden bg-sidebar mac:bg-transparent mac:[&_header]:transition-[padding-left] mac:[&_header]:duration-200 mac:[&_header]:ease-linear mac:peer-data-[state=collapsed]:[&_header]:pl-34 mac:max-md:[&_header]:pl-34">
+        <SidebarInset
+          className={cn(
+            "min-h-0 overflow-hidden bg-sidebar mac:bg-transparent mac:[&_header]:transition-[padding-left] mac:[&_header]:duration-200 mac:[&_header]:ease-linear mac:peer-data-[state=collapsed]:[&_header]:pl-34 mac:max-md:[&_header]:pl-34",
+            !shellConfig.sidebar && "mac:[&_header]:pl-34",
+          )}
+        >
           <div className="flex min-h-0 flex-1 max-lg:p-0 lg:py-2 lg:pl-2">
           <ResizablePanelGroup
             orientation="horizontal"
@@ -1453,6 +1458,17 @@ export function SessionPage(props: SessionPageProps) {
                   ? t("session.create_or_connect_workspace")
                   : selectedSessionTitle || t("session.default_title")}
               </h1>
+              {!props.primaryTitle && !props.mainContentTitle && !showWorkspaceSetupEmptyState ? (
+                // Pinned and archived sessions are listed across workspaces, so
+                // the header names the workspace the open session belongs to.
+                <span
+                  className="flex min-w-0 shrink-0 items-center gap-1.5 text-[12px] text-dls-secondary"
+                  data-session-header-workspace={workspaceName}
+                >
+                  <span aria-hidden="true">·</span>
+                  <span className="max-w-40 truncate">{workspaceName}</span>
+                </span>
+              ) : null}
               {props.developerMode ? (
                 <span className="hidden text-[12px] text-dls-secondary lg:inline">
                   {props.headerStatus}
@@ -1729,6 +1745,7 @@ export function SessionPage(props: SessionPageProps) {
                             openworkToken={reactSessionToken}
                             todos={props.todos}
                             activePermission={props.activePermission}
+                            activePermissionSourceTitle={props.activePermissionSourceTitle}
                             permissionReplyBusy={props.permissionReplyBusy}
                             respondPermission={props.respondPermission}
                             activeQuestion={props.activeQuestion}
@@ -1982,7 +1999,7 @@ export function SessionPage(props: SessionPageProps) {
           </aside>
           </div>
         </SidebarInset>
-        {shellConfig.sidebar ? <SidebarTrigger className="hidden mac:absolute mac:left-[88px] top-[3px] z-50 mac:flex titlebar-no-drag" /> : null}
+        {shellConfig.sidebar ? <SidebarTrigger className="hidden mac:absolute mac:left-[88px] mac:size-8! top-[3px] z-50 mac:flex titlebar-no-drag" /> : null}
       </SidebarProvider>
 
       {props.providerAuthModal ? <ProviderAuthModal {...props.providerAuthModal} /> : null}

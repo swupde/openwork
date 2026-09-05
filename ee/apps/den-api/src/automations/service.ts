@@ -342,6 +342,7 @@ export class AutomationService {
       runnerId: registration.runnerId,
       protocolVersion: registration.protocolVersion,
       supportedExecutionTargets: registration.supportedExecutionTargets,
+      capabilities: registration.capabilities,
       appVersion: registration.appVersion,
       platform: registration.platform,
       concurrency: registration.concurrency,
@@ -425,6 +426,7 @@ export class AutomationService {
       timeoutMs: claimed.revision.maximumRuntimeMs,
       leaseExpiresAt: claimed.run.leaseExpiresAt,
       attempt: claimed.run.attemptCount,
+      workspaceId: claimed.revision.workspaceId ?? null,
     }
   }
 
@@ -682,6 +684,7 @@ export class AutomationService {
         action,
         maximumRuntimeMs: claimed.revision.maximumRuntimeMs,
         previousReceipt: state?.receipt ?? null,
+        workspaceId: claimed.revision.workspaceId ?? null,
         signal: controller.signal,
         onAdmitted: async (receipt) => automationRepository.setCloudExecution({
           runId: claimed.run.id,
