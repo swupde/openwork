@@ -1,5 +1,17 @@
 # AGENTS.md
 
+## SwitchUp fork operations
+
+For work in `swupde/openwork`, read [docs/SWUP-FORK.md](docs/SWUP-FORK.md)
+before changing CI, importing upstream releases, or publishing artifacts.
+Target this fork's `dev` branch for maintenance PRs. The upstream product
+instructions below do not authorize adopting upstream infrastructure:
+Warden, Blacksmith, Daytona, and public desktop publishing are not required
+for SwitchUp's normal deployment. Recheck GitHub workflow enablement after
+each upstream merge; new workflow files can become active on registration.
+Production configuration and deployment belong to `swup-ai-workspace` and
+Dokploy. Verify runtime state separately from successful CI or publication.
+
 OpenWork is a free, open-source desktop app (macOS, Windows, Linux) for doing
 work with AI agents on your own files — an open-source alternative to Claude
 Cowork and Codex, built on OpenCode, running any model from 50+ providers.

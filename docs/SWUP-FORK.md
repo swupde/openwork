@@ -30,6 +30,12 @@ separately. A green image build does not prove a production deployment.
 
 ## CI policy
 
+Warden is an optional AI code reviewer. Blacksmith is a third-party provider
+of CI runner computers. Both appeared here through upstream workflow imports;
+neither is part of the running Den service. This fork does not require a
+Warden model credential or a Blacksmith account. GitHub Actions runs the
+retained tests and builds, and Dokploy operates the resulting deployment.
+
 Enable only these workflows in this fork's GitHub Actions settings:
 
 | Workflow file | Purpose |
@@ -59,8 +65,11 @@ Pushes to `dev` publish affected images. Reviewed release tags or explicit
 manual publication produce release artifacts. Do not use upstream desktop
 release commands to publish SwitchUp's container images.
 
-Workflow enablement is repository state, not a setting copied by git. After
-every upstream import, inspect both source and GitHub's workflow inventory:
+Workflow enablement is repository state, not a setting copied by git. Inspect
+new workflow files during review and inspect GitHub's workflow inventory again
+after every upstream merge. GitHub can register additional active workflows
+when their files first reach the default branch, so a pre-merge inventory
+alone is insufficient:
 
 ```sh
 gh api repos/swupde/openwork/actions/workflows --paginate \
@@ -91,6 +100,23 @@ external destinations, permissions, and any dependent workflows first.
    repository's migration and backup procedure.
 
 ## Repository settings evidence
+
+Verified 2026-09-05 after [PR #19](https://github.com/swupde/openwork/pull/19)
+merged as `7f5ba855aa6acb7745a6d596749487ade0feee12`:
+
+- Seven workflows are active, exactly as listed above; 21 are
+  `disabled_manually`.
+- The post-merge inventory exposed three newly registered workflows:
+  `daytona-e2e-singles.yml`, `nightly-flake-report.yml`, and
+  `opencode-agents.yml`. These were disabled as part of reconciliation.
+- All retained pre-merge checks passed, including Linux/macOS tests, MySQL
+  migration checks, MCP contracts, and all four container build/smoke tests.
+- The merge commit's OpenWork Tests, Enterprise MCP Mock, i18n Audit, and
+  Publish EE Artifacts workflows also completed successfully. Publication
+  is verified; this evidence does not establish a Dokploy deployment.
+
+These counts and results are dated evidence. The enabled-workflow table is
+the ongoing policy; recheck GitHub after subsequent imports.
 
 Checked 2026-09-05: `dev` had no branch protection and its effective rules API
 returned no rules. Upstream documentation claiming mandatory approvals or
