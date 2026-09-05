@@ -1,5 +1,10 @@
 # Releasing OpenWork
 
+This document describes the upstream desktop/public release process. For
+**swupde/openwork**, use [SWUP fork maintenance](SWUP-FORK.md). The upstream
+GitHub App, protection, Warden, and publishing prerequisites below are not
+claims about SwitchUp's repository settings.
+
 Releases are **pure GitHub Actions + GitHub Releases**: versions live in git
 tags, every committed `package.json` holds the permanent `0.0.0-dev`
 placeholder, and CI stamps the tag-derived version into the workspace at build
@@ -47,12 +52,6 @@ pnpm release:review         # sanity: placeholders intact, opencode pin present
   environment) to create the tag ref via REST. The built-in GitHub Actions app cannot be a bypass actor —
   GitHub rejects it. Without the app token the run falls back to
   GITHUB_TOKEN and fails with instructions.
-- **Pull-request security review**: configure `WARDEN_OPENAI_API_KEY` as a
-  repository secret for the provider selected by `warden.toml` (currently
-  OpenAI). `WARDEN_MODEL` is optional when the committed default is correct.
-  A missing provider key makes `warden: diff-security-review` fail before it
-  can analyze a diff; do not treat a companion zero-token “No issues” report
-  as security clearance.
 - Manual tag pushes (expedited path below) additionally require repo/org
   admin, as before.
 
@@ -188,7 +187,6 @@ fallback snapshot only; refresh it occasionally with
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | Run fails pushing the tag | diff-warden app missing from the `v*` ruleset bypass list, or its secrets unset | re-add the app (Settings → Rules) / restore `WARDEN_APP_ID`+`WARDEN_PRIVATE_KEY`, or push the tag manually as an admin and rerun |
-| `warden: diff-security-review` says no API key found | the repository has no `WARDEN_OPENAI_API_KEY` for Warden's configured provider | add the provider key as a repository secret, then rerun the failed check; a zero-token “No issues” Warden report is not clearance |
 | `Tag vX.Y.Z already exists` on a fresh cut | version already released | rerun with `-f tag=vX.Y.Z` (recovery) or pick a higher version |
 | `verify-release` fails monotonicity | manual tag lower than an existing release | choose a version above the current highest stable tag |
 | `release:review` fails placeholder check | someone committed a real version into package.json | restore `0.0.0-dev` — CI stamps versions from the tag |

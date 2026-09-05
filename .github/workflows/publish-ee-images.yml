@@ -494,7 +494,8 @@ jobs:
   # require migration and sandbox recycle handling.
   redeploy-den-gateway:
     needs: [artifact-version, classify-ee-images, ee-images]
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' && needs.classify-ee-images.outputs.includes_gateway == 'true' && needs.ee-images.result == 'success' }}
+    # SwitchUp deploys through Dokploy; retain the upstream job for mergeability.
+    if: ${{ github.repository == 'different-ai/openwork' && github.event_name == 'push' && github.ref == 'refs/heads/dev' && needs.classify-ee-images.outputs.includes_gateway == 'true' && needs.ee-images.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Redeploy den-gateway on Render

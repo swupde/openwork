@@ -1,5 +1,10 @@
 # OpenWork
 
+This is SwitchUp's deployment fork, **swupde/openwork**. Start with
+[the fork maintenance guide](docs/SWUP-FORK.md) for our CI, update, and Dokploy
+release process. Product documentation below is retained from upstream;
+its hosted services and release automation are not SwitchUp infrastructure.
+
 OpenWork is a free, open-source desktop app made for sharing AI workflows. It is an open-source alternative to Claude Cowork and Codex for macOS, Windows, and Linux.
 
 Add one OpenWork MCP to Codex, Claude Code, Cursor, or another compatible agent and reuse the same skills, MCPs, and connected services across your tools, teammates, and machines. Create something once, share it with coworkers or friends, or keep it for yourself.
