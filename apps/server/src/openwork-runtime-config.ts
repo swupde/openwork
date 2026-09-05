@@ -28,7 +28,7 @@ import { runtimeWorkspaceFilesRoot, runtimeWorkspaceOutboxDir } from "./runtime-
 import {
   onRuntimeOpencodeConfigWrite,
   isEngineGlobalRuntimeConfigId,
-  readEffectiveRuntimeOpencodeConfig,
+  readGlobalRuntimeOpencodeConfig,
   runtimeDisabledProviderList,
   runtimeMcpMap,
   runtimeProviderMap,
@@ -99,7 +99,10 @@ export async function buildOpenworkRuntimeConfigObject(
   config?: ServerConfig,
   workspaceId?: string,
 ): Promise<Record<string, unknown>> {
-  const runtimeConfig = config && workspaceId ? await readEffectiveRuntimeOpencodeConfig(config, workspaceId) : {};
+  // OPENCODE_CONFIG is shared by the managed engine. Workspace MCPs are
+  // delivered by the dynamic engine push, so this file may contain only the
+  // engine-global runtime layer.
+  const runtimeConfig = config ? await readGlobalRuntimeOpencodeConfig(config) : {};
   const result = buildOpenworkRuntimeConfigObjectFromSnapshot(runtimeConfig);
   const workspace = config && workspaceId
     ? config.workspaces.find((entry) => entry.id === workspaceId && entry.workspaceType !== "remote" && entry.path.trim())
@@ -212,6 +215,17 @@ export interface OpenworkRuntimeConfigWriteResult {
 }
 
 const fileWriteQueue = new Map<string, Promise<OpenworkRuntimeConfigWriteResult>>();
+const managedRuntimeWorkspaceIds = new WeakMap<ServerConfig, string>();
+
+function managedRuntimeWorkspaceId(config: ServerConfig): string | undefined {
+  const cached = managedRuntimeWorkspaceIds.get(config);
+  if (cached && config.workspaces.some((workspace) => workspace.id === cached && workspace.workspaceType !== "remote" && workspace.path.trim())) {
+    return cached;
+  }
+  const workspaceId = findManagedEngineWorkspace(config.workspaces)?.id;
+  if (workspaceId) managedRuntimeWorkspaceIds.set(config, workspaceId);
+  return workspaceId;
+}
 
 /**
  * Rebuild the engine-visible runtime config file from the runtime DB.
@@ -223,7 +237,9 @@ export async function writeOpenworkRuntimeConfigFile(
   workspaceId?: string,
 ): Promise<OpenworkRuntimeConfigWriteResult> {
   const path = openworkRuntimeConfigFilePath(config);
-  const resolvedWorkspaceId = workspaceId ?? findManagedEngineWorkspace(config.workspaces)?.id;
+  // Activation reorders `config.workspaces`, but the already-running engine
+  // must retain the same app-managed execution directory until it restarts.
+  const resolvedWorkspaceId = workspaceId ?? managedRuntimeWorkspaceId(config);
   const job = async () => {
     const content = await buildOpenworkRuntimeConfig(config, resolvedWorkspaceId);
     const current = await readFile(path, "utf8").catch(() => undefined);
@@ -246,10 +262,10 @@ export async function writeOpenworkRuntimeConfigFile(
  * Returns an unsubscribe function.
  */
 export function keepOpenworkRuntimeConfigFileFresh(config: ServerConfig, workspaceId?: string): () => void {
-  const resolvedWorkspaceId = workspaceId ?? findManagedEngineWorkspace(config.workspaces)?.id;
+  const resolvedWorkspaceId = workspaceId ?? managedRuntimeWorkspaceId(config);
   if (!resolvedWorkspaceId) return () => undefined;
-  return onRuntimeOpencodeConfigWrite((writeConfig, writtenWorkspaceId) => {
-    if (writtenWorkspaceId !== resolvedWorkspaceId && !isEngineGlobalRuntimeConfigId(writtenWorkspaceId)) return;
-    void writeOpenworkRuntimeConfigFile(writeConfig, resolvedWorkspaceId).catch(() => undefined);
+  return onRuntimeOpencodeConfigWrite((_writeConfig, writtenWorkspaceId) => {
+    if (!isEngineGlobalRuntimeConfigId(writtenWorkspaceId)) return;
+    void writeOpenworkRuntimeConfigFile(config, resolvedWorkspaceId).catch(() => undefined);
   });
 }

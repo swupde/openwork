@@ -7,10 +7,10 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { startEmbeddedServer, type EmbeddedServerHandle, type EmbeddedServerOptions } from "./embedded.js";
 import { readEngineRegistry } from "./engine-registry.js";
 import * as managedOpencodeModule from "./managed-opencode.js";
-import { writeOpenworkRuntimeConfigFile } from "./openwork-runtime-config.js";
+import { openworkRuntimeConfigFilePath, writeOpenworkRuntimeConfigFile } from "./openwork-runtime-config.js";
 import { runtimeStorageDir } from "./runtime-db.js";
 import { OPENWORK_RUNTIME_STORAGE_ENV } from "./runtime-workspace-files.js";
-import { writeRuntimeOpencodeConfig } from "./runtime-opencode-config-store.js";
+import { writeGlobalRuntimeOpencodeConfig, writeRuntimeOpencodeConfig } from "./runtime-opencode-config-store.js";
 import * as serverModule from "./server.js";
 import type { ServerConfig } from "./types.js";
 
@@ -163,8 +163,15 @@ function workspaceId(config: ServerConfig): string {
   return id;
 }
 
-async function mutateWorkspace(config: ServerConfig, id: string, label: string): Promise<void> {
+async function mutateWorkspaceMcp(config: ServerConfig, id: string, label: string): Promise<void> {
   await writeRuntimeOpencodeConfig(config, id, (current) => ({
+    ...current,
+    mcp: { [label]: { type: "remote", url: `https://${label}.example.test/mcp` } },
+  }));
+}
+
+async function mutateEngineGlobalRuntime(config: ServerConfig, label: string): Promise<void> {
+  await writeGlobalRuntimeOpencodeConfig(config, (current) => ({
     ...current,
     mcp: { [label]: { type: "remote", url: `https://${label}.example.test/mcp` } },
   }));
@@ -279,7 +286,7 @@ describe("embedded server lifecycle", () => {
       const id = workspaceId(serverA.config);
       await serverA.stop();
 
-      await mutateWorkspace(serverA.config, id, "stopped-server");
+      await mutateEngineGlobalRuntime(serverA.config, "stopped-server");
       const barrier = await writeOpenworkRuntimeConfigFile(serverA.config, id);
 
       // The explicit barrier is the first writer only when the stopped
@@ -299,11 +306,22 @@ describe("embedded server lifecycle", () => {
       const serverB = await startManaged(fixture, "server-b");
       const serverBWorkspace = workspaceId(serverB.config);
 
-      await mutateWorkspace(serverA.config, serverAWorkspace, "stale-server");
+      await mutateEngineGlobalRuntime(serverA.config, "stale-server");
+      let replacementAppliedWrite = false;
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        const content = await readFile(openworkRuntimeConfigFilePath(serverB.config), "utf8").catch(() => "");
+        const parsed = JSON.parse(content || "{}") as { mcp?: Record<string, unknown> };
+        if (parsed.mcp?.["stale-server"]) {
+          replacementAppliedWrite = true;
+          break;
+        }
+        await Bun.sleep(20);
+      }
+      expect(replacementAppliedWrite).toBe(true);
       const afterStoppedServerMutation = await writeOpenworkRuntimeConfigFile(serverB.config, serverBWorkspace);
       expect(afterStoppedServerMutation.changed).toBe(false);
 
-      await mutateWorkspace(serverB.config, serverBWorkspace, "active-server");
+      await mutateEngineGlobalRuntime(serverB.config, "active-server");
       const afterActiveServerMutation = await writeOpenworkRuntimeConfigFile(serverB.config, serverBWorkspace);
       expect(afterActiveServerMutation.changed).toBe(false);
     } finally {
@@ -324,7 +342,7 @@ describe("embedded server lifecycle", () => {
       const fileAfterFirstPatch = await readFile(join(fixture.root, "runtime-opencode-config.json"));
       const disposalsAfterFirstPatch = (await logLines(fixture.logPath)).filter((line) => line === "/instance/dispose").length;
 
-      await mutateWorkspace(serverA.config, serverAWorkspace, "stale-server");
+      await mutateWorkspaceMcp(serverA.config, serverAWorkspace, "stale-server");
       const second = await patchProviders(serverB);
 
       expect(second).toMatchObject({ changed: false, reload: "skipped" });
@@ -425,7 +443,7 @@ describe("embedded server lifecycle", () => {
 
       const config = failedConfig;
       const id = workspaceId(config);
-      await mutateWorkspace(config, id, "after-spawn-failure");
+      await mutateEngineGlobalRuntime(config, "after-spawn-failure");
       const barrier = await writeOpenworkRuntimeConfigFile(config, id);
 
       expect(barrier.changed).toBe(true);
@@ -489,7 +507,7 @@ describe("embedded server lifecycle", () => {
       if (!(observed instanceof AggregateError)) throw new Error("Expected aggregate shutdown failure");
       expect(observed.errors).toEqual([managedError, httpError]);
 
-      await mutateWorkspace(handle.config, id, "after-shutdown-failure");
+      await mutateEngineGlobalRuntime(handle.config, "after-shutdown-failure");
       const barrier = await writeOpenworkRuntimeConfigFile(handle.config, id);
       expect(barrier.changed).toBe(true);
       expect(managedCloseCalls).toBe(1);
