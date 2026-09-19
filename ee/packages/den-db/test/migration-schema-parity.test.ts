@@ -616,6 +616,47 @@ test("OAuth scope widening preserves legacy rows and accepts long Drizzle insert
   }
 })
 
+test("connected account pending migration preserves timestamps and ciphertext on old and repaired schemas", { skip: !mysqlUrl, timeout: 120_000 }, async () => {
+  if (!mysqlUrl) return
+  const root = await mysql.createConnection(mysqlUrl)
+  const database = scratchDatabaseName()
+  let connection: mysql.Connection | undefined
+  try {
+    await root.query(`CREATE DATABASE ${quoteIdentifier(database)}`)
+    connection = await mysql.createConnection(databaseUrlFor(mysqlUrl, database))
+    const exported = splitSqlStatements(await exportCurrentSchemaSql())
+    const table = exported.find((statement) => createTableName(statement) === "connected_account")
+    assert.ok(table)
+    await connection.query(table)
+    const columnContract = async () => queryRecords(connection!,
+      "SELECT COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'connected_account' AND column_name = 'connected_at'")
+    const fresh = await columnContract()
+    assert.deepEqual(fresh, [{ COLUMN_TYPE: "timestamp(3)", IS_NULLABLE: "YES", COLUMN_DEFAULT: null, EXTRA: "" }])
+    const migration = await readFile(join(migrationsFolder, "0102_connected_account_pending.sql"), "utf8")
+    for (const legacyNullable of [false, true]) {
+      await connection.query("TRUNCATE TABLE connected_account")
+      await connection.query(`ALTER TABLE connected_account MODIFY COLUMN connected_at timestamp(3) ${legacyNullable ? "NULL DEFAULT NULL" : "NOT NULL DEFAULT CURRENT_TIMESTAMP(3)"}`)
+      await connection.query("INSERT INTO connected_account (id, organization_id, org_membership_id, provider_id, connected_at, access_token, refresh_token, pending_code_verifier) VALUES ('dated', 'org_test', 'mem_test', 'dated', '2026-08-11 12:34:56.789', 'encrypted-access', 'encrypted-refresh', 'encrypted-verifier')")
+      await connection.query("INSERT INTO connected_account (id, organization_id, org_membership_id, provider_id, connected_at) VALUES ('historical', 'org_test', 'mem_test', 'historical', '2026-08-10 01:02:03.456')")
+      if (legacyNullable) {
+        await connection.query("INSERT INTO connected_account (id, organization_id, org_membership_id, provider_id, connected_at) VALUES ('pending', 'org_test', 'mem_test', 'pending', NULL)")
+      }
+      const before = await queryRecords(connection, "SELECT * FROM connected_account ORDER BY id")
+      await connection.query(migration)
+      await connection.query(migration)
+      assert.deepEqual(await queryRecords(connection, "SELECT * FROM connected_account ORDER BY id"), before)
+      assert.deepEqual(await columnContract(), fresh)
+      await connection.query("INSERT INTO connected_account (id, organization_id, org_membership_id, provider_id) VALUES ('omitted', 'org_test', 'mem_test', 'omitted')")
+      await connection.query("INSERT INTO connected_account (id, organization_id, org_membership_id, provider_id, connected_at) VALUES ('explicit', 'org_test', 'mem_test', 'explicit', NULL)")
+      assert.deepEqual(await queryRecords(connection, "SELECT connected_at FROM connected_account WHERE id IN ('omitted', 'explicit')"), [{ connected_at: null }, { connected_at: null }])
+    }
+  } finally {
+    await connection?.end().catch(() => {})
+    await root.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(database)}`).catch(() => {})
+    await root.end()
+  }
+})
+
 test("migrations replay to exported schema and config object version inserts", { skip: !mysqlUrl, timeout: 300_000 }, async () => {
   if (!mysqlUrl) return
 

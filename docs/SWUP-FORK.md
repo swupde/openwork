@@ -114,6 +114,13 @@ source rename while retaining the existing image repository name. Newly
 imported API-contract, SDK, and evidence-review jobs are restricted to the
 upstream repository; they are outside our retained workflow list.
 
+The pending OAuth credential contract requires `connected_account.connected_at`
+to remain nullable with no automatic timestamp. Migration `0102_connected_account_pending`
+restores that contract without rewriting any historical row. Successful authorization
+sets the timestamp; refresh preserves it and credential invalidation clears it.
+Fresh-schema and historical migration tests must check both pending nulls and
+completed timestamps when reconciling this fork patch.
+
 A production upgrade must rehearse pending migrations and the built image's
 bootstrap against an isolated snapshot, preserve the database volume and
 credential encryption key, and update the deployment pin separately.
