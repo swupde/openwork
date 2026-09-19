@@ -28,7 +28,7 @@ const failure = (detail) => ({
 });
 
 test('bootstrap is first, fixed to Jammy, inline, and only elevates bounded OS APT', async () => {
-  assert.match(job, /runs-on: blacksmith-16vcpu-ubuntu-2204\n/);
+  assert.match(job, /runs-on: ubuntu-22.04\n/);
   assert.match(job, /^    steps:\n(?:      #[^\n]*\n)*      - name: Prepare virtual display\n/m);
   assert.equal(job.match(/^      - name: (.+)$/m)?.[1], 'Prepare virtual display');
   assert.ok(job.indexOf(step) < job.indexOf('uses: actions/checkout@'));
