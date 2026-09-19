@@ -15,7 +15,7 @@ members and groups automatically.
 You need:
 
 - An OpenWork organization with the Enterprise SSO entitlement.
-- Owner or admin access in that OpenWork organization.
+- Owner or super-admin access in that OpenWork organization.
 - Admin access to a Microsoft Entra enterprise application.
 - The final OpenWork auth origin, for example `https://app.openworklabs.com`.
 
@@ -125,6 +125,26 @@ After the Entra assignment and domain verification are complete:
 SSO is not offered to organization members until you explicitly enable it after
 the successful test. If you edit the SSO configuration after a successful test,
 test it again before enabling. Test links expire after five minutes.
+
+## Just-in-time provisioning and password signup
+
+After Entra SAML SSO is enabled for a verified domain, OpenWork's standard
+sign-in flow routes users with that email domain to the organization SSO flow.
+When a user completes SAML sign-in successfully, OpenWork can create their
+organization membership just in time with the default `Member` role.
+
+JIT provisioning happens only after successful SAML authentication. Creating an
+email/password account with the same email domain does not add the user to the
+organization or create a SCIM-managed identity. If that user later completes
+SSO, OpenWork can link the matching account and provision the organization
+membership through SSO.
+
+OpenWork does not convert SAML attributes such as `role`, `groups`, or `admin`
+into elevated organization roles. Owners and super-admins assign roles in
+OpenWork; ownership changes require ownership transfer. For group-based Admin,
+first configure [Entra SCIM provisioning](/cloud/scim-microsoft-entra), then
+explicitly approve the synchronized team using
+[Team Admin access](/cloud/members-and-rbac#team-admin-access).
 
 ## Troubleshooting
 

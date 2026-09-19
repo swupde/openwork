@@ -1,4 +1,4 @@
-import { getJsonRequestBodySchema, getParameters, hasJsonRequestBody, pathParameterNamesFromTemplate, type McpToolOperation } from "./catalog.js"
+import { getJsonRequestBodySchema, getParameters, getQueryParameterSchema, hasJsonRequestBody, pathParameterNamesFromTemplate, type McpToolOperation } from "./catalog.js"
 
 /**
  * `search_capabilities` is the "search" half of a search+execute facade laid
@@ -30,12 +30,13 @@ export type CapabilityMatch = {
   pathParams: string[]
   /** Query parameter names this tool documents, if any. */
   queryParams: string[]
-  /** OpenAPI constraints for the query object accepted by execute_capability. */
-  querySchema?: unknown
   /** Whether calling this tool requires a JSON `body`. */
   hasBody: boolean
   /** Exact OpenAPI JSON schema for `body`, present only for JSON mutations. */
   bodySchema?: unknown
+  /** Exact OpenAPI JSON schema for the query string parameters, present only when the operation documents any. */
+  querySchema?: unknown
+  outputSchema?: Record<string, unknown>
   /** Exact MCP arguments schema returned by a live MCP tool list. */
   argumentsSchema?: unknown
   /** Tells generic execute callers where MCP arguments must be supplied. */
@@ -120,22 +121,6 @@ function scoreOperation(operation: McpToolOperation, queryTokens: string[]): num
   return scoreText(nameTokens, summaryTokens, queryTokens, pathTokens)
 }
 
-export function querySchemaFor(parameters: ReturnType<typeof getParameters>): unknown {
-  const properties = Object.fromEntries(
-    parameters.map((parameter) => [String(parameter.name), parameter.schema ?? {}]),
-  )
-  const required = parameters
-    .filter((parameter) => parameter.required === true)
-    .map((parameter) => String(parameter.name))
-
-  return {
-    type: "object",
-    properties,
-    additionalProperties: false,
-    ...(required.length === 0 ? {} : { required }),
-  }
-}
-
 export function searchCapabilities(
   catalog: McpToolOperation[],
   query: string,
@@ -146,8 +131,8 @@ export function searchCapabilities(
 
   return catalog
     .map((operation) => {
-      const queryParameters = getParameters(operation.operation, "query")
       const bodySchema = getJsonRequestBodySchema(operation.operation)
+      const querySchema = getQueryParameterSchema(operation.operation)
       return {
         name: operation.name,
         method: operation.method,
@@ -155,10 +140,11 @@ export function searchCapabilities(
         score: scoreOperation(operation, queryTokens),
         summary: summaryFor(operation),
         pathParams: pathParameterNamesFromTemplate(operation.path),
-        queryParams: queryParameters.map((parameter) => parameter.name as string),
-        ...(queryParameters.length === 0 ? {} : { querySchema: querySchemaFor(queryParameters) }),
+        queryParams: getParameters(operation.operation, "query").map((parameter) => parameter.name as string),
         hasBody: hasJsonRequestBody(operation.operation),
         ...(bodySchema === undefined ? {} : { bodySchema }),
+        ...(querySchema === undefined ? {} : { querySchema }),
+        ...(operation.outputSchema === undefined ? {} : { outputSchema: operation.outputSchema }),
       }
     })
     .filter((match) => match.score > 0)

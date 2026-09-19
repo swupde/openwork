@@ -2,6 +2,9 @@ import { describe, expect, test } from "bun:test";
 
 import {
   classifyRouteSessionReadError,
+  createRouteSession,
+  createRouteSessionOnEngine,
+  deleteRouteSession,
   mergeRouteWorkspaces,
   readRouteSessionsWithRetry,
   refreshRouteWorkspaceListState,
@@ -16,10 +19,78 @@ import {
   preserveWorkspaceRouteSession,
   removeWorkspaceRouteSession,
   sessionIdForLegacyWorkspaceInference,
+  settingsNavigationFromPathname,
   globalExtensionsRoute,
   workspaceExtensionsRoute,
   workspaceSettingsRoute,
 } from "../src/react-app/shell/workspace-routes";
+import { resolveWorkspaceEndpoint } from "../src/app/lib/workspace-endpoint";
+
+describe("workspace session mutations", () => {
+  for (const engine of ["v1", "v2", "legacy"]) {
+    test(`creates and deletes through the owning server's ${engine} engine`, async () => {
+      const originalFetch = globalThis.fetch;
+      const requests: string[] = [];
+      globalThis.fetch = async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        const path = new URL(request.url).pathname;
+        requests.push(`${request.method} ${path}`);
+        if (path === "/experimental/engine-v2-preview/status") {
+          return Response.json({
+            enabled: engine === "v2", running: engine === "v2", chatRouting: engine === "v2",
+            mirroredProviderIds: [], skippedProviderIds: [], catalogModelIds: [],
+          }, {
+            status: engine === "legacy" ? 404 : 200,
+          });
+        }
+        expect(request.headers.get("Authorization")).toBe("Bearer fixture-token");
+        if (request.method === "DELETE") return Response.json(true);
+        if (engine === "v2") expect(await request.json()).toMatchObject({ location: { directory: "/existing" } });
+        return Response.json({ id: "ses_created", title: "New session", time: { created: 1, updated: 1 } });
+      };
+      try {
+        const endpoint = resolveWorkspaceEndpoint({ id: "ws_existing", workspaceType: "local" }, {
+          baseUrl: "http://owner.test", token: "fixture-token",
+        });
+        if (!endpoint) throw new Error("Workspace endpoint missing");
+        const created = await createRouteSessionOnEngine(endpoint, "/existing");
+        expect(created.session.id).toBe("ses_created");
+        expect(created.endpoint.opencodeBaseUrl).toBe(`http://owner.test/workspace/ws_existing/${engine === "v2" ? "opencode2" : "opencode"}`);
+        expect(endpoint.opencodeBaseUrl).toBe("http://owner.test/workspace/ws_existing/opencode");
+        expect(await deleteRouteSession(endpoint, "ses_created")).toBe(true);
+        expect(requests).toEqual([
+          "GET /experimental/engine-v2-preview/status",
+          `POST /workspace/ws_existing/${engine === "v2" ? "opencode2/api/session" : "opencode/session"}`,
+          "GET /experimental/engine-v2-preview/status",
+          `DELETE /workspace/ws_existing/${engine === "v2" ? "opencode2/api/session" : "opencode/session"}/ses_created`,
+        ]);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+  }
+
+  test("a failed routing read cannot silently mutate a v1 session", async () => {
+    const originalFetch = globalThis.fetch;
+    const methods: string[] = [];
+    globalThis.fetch = async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      methods.push(request.method);
+      return Response.json({ message: "Routing unavailable" }, { status: 503 });
+    };
+    try {
+      const endpoint = resolveWorkspaceEndpoint({ id: "ws_existing", workspaceType: "local" }, {
+        baseUrl: "http://owner.test", token: "fixture-token",
+      });
+      if (!endpoint) throw new Error("Workspace endpoint missing");
+      await expect(createRouteSession(endpoint, "/existing")).rejects.toThrow();
+      await expect(deleteRouteSession(endpoint, "ses_created")).rejects.toThrow();
+      expect(methods).toEqual(["GET", "GET"]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
 
 describe("workspace surface routes", () => {
   test("keeps Extensions outside Settings and preserves deep links", () => {
@@ -33,6 +104,33 @@ describe("workspace surface routes", () => {
       "/workspace/workspace%2Fa/extensions/skills",
     );
     expect(globalExtensionsRoute("mcps")).toBe("/extensions/mcps");
+  });
+
+  test("menu/agent settings entry keeps the workspace and remembers the open session", () => {
+    // Native menu "Settings…" and agent settings.panel.open only know the URL.
+    // They must enter Settings the same way the in-app button does, so
+    // settingsReturnRoute can bring the user back to the same session.
+    const fromSession = settingsNavigationFromPathname(
+      "/workspace/workspace%2Fa/session/session_1",
+      "general",
+    );
+    expect(fromSession).toEqual({
+      to: "/workspace/workspace%2Fa/settings/general",
+      state: { workspaceId: "workspace/a", sessionId: "session_1" },
+    });
+
+    expect(settingsNavigationFromPathname("/workspace/workspace_1/session", "updates")).toEqual({
+      to: "/workspace/workspace_1/settings/updates",
+      state: { workspaceId: "workspace_1", sessionId: null },
+    });
+    expect(settingsNavigationFromPathname("/workspace/workspace_1/extensions/skills", "ai")).toEqual({
+      to: "/workspace/workspace_1/settings/ai",
+      state: { workspaceId: "workspace_1", sessionId: null },
+    });
+    expect(settingsNavigationFromPathname("/automations", "general")).toEqual({
+      to: "/settings/general",
+      state: { workspaceId: "", sessionId: null },
+    });
   });
 });
 
@@ -167,16 +265,16 @@ describe("workspace route session load budget", () => {
     const starts: string[] = [];
     let releaseWorkspaceA: (() => void) | undefined;
 
-    const firstWorkspaceA = coalescer.run("workspace-a", async () => {
+    const firstWorkspaceA = coalescer.run("workspace-a", "v1", async () => {
       starts.push("workspace-a");
       await new Promise<void>((resolve) => {
         releaseWorkspaceA = resolve;
       });
     });
-    const duplicateWorkspaceA = coalescer.run("workspace-a", async () => {
+    const duplicateWorkspaceA = coalescer.run("workspace-a", "v1", async () => {
       starts.push("workspace-a-duplicate");
     });
-    const workspaceB = coalescer.run("workspace-b", async () => {
+    const workspaceB = coalescer.run("workspace-b", "v1", async () => {
       starts.push("workspace-b");
     });
 
@@ -189,7 +287,7 @@ describe("workspace route session load budget", () => {
     await Promise.all([firstWorkspaceA, duplicateWorkspaceA, workspaceB]);
     expect(coalescer.isInFlight("workspace-a")).toBe(false);
 
-    await coalescer.run("workspace-a", async () => {
+    await coalescer.run("workspace-a", "v1", async () => {
       starts.push("workspace-a-after-settle");
     });
     expect(starts).toEqual(["workspace-a", "workspace-b", "workspace-a-after-settle"]);

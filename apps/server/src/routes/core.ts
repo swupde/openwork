@@ -10,7 +10,7 @@ import type { CloudMcpLiveStatusObserver } from "../cloud-mcp-health.js";
 import { readOpenWorkConnectSkillCatalog, renderOpenWorkConnectSkillInstruction } from "../connect-skill-catalog.js";
 import { readOpenWorkAutomationCatalog, renderOpenWorkAutomationInstruction } from "../connect-automation-catalog.js";
 import { EnvStoreReadError, InvalidEnvKeyError, isValidEnvKey, type EnvService } from "../env-file.js";
-import { syncManagedProviderAuth } from "../managed-provider-auth.js";
+import { syncManagedProviderAuth, type ManagedProviderAuthResult } from "../managed-provider-auth.js";
 import { ApiError } from "../errors.js";
 import { callExperimentalExtensionAction, listExperimentalExtensionActions } from "../extensions/index.js";
 import type { TokenService } from "../tokens.js";
@@ -43,7 +43,7 @@ interface RegisterCoreRoutesOptions {
   refreshRegistrationFromLiveStatus?: CloudMcpLiveStatusObserver;
   serializeWorkspace: (workspace: ServerConfig["workspaces"][number]) => unknown;
   resolveDevLogPath: () => string | null;
-  createOpenAiRealtimeVoiceSession: (env: EnvService, input: unknown) => Promise<unknown>;
+  onManagedProviderAuthChanged?: (result: ManagedProviderAuthResult) => Promise<void>;
   managedProviderAuthLogger?: {
     warn: (message: string, attributes?: Record<string, unknown>) => void;
     error: (message: string, attributes?: Record<string, unknown>) => void;
@@ -104,7 +104,7 @@ export function registerCoreRoutes(options: RegisterCoreRoutesOptions): void {
     refreshRegistrationFromLiveStatus,
     serializeWorkspace,
     resolveDevLogPath,
-    createOpenAiRealtimeVoiceSession,
+    onManagedProviderAuthChanged,
     managedProviderAuthLogger,
   } = options;
   const envPendingChangesByRuntime = new Map<string, boolean>();
@@ -307,11 +307,10 @@ export function registerCoreRoutes(options: RegisterCoreRoutesOptions): void {
 
   addRoute(routes, "GET", "/experimental/extensions/actions", "client", async (ctx) => {
     const extensionId = ctx.url.searchParams.get("extensionId") ?? "";
-    const connectSnapshot = await getConnectSnapshot(config, { ...connectSnapshotBaseOptions, ...connectSnapshotOptionsFromQuery(ctx.url) });
     return jsonResponse({
       ok: true,
       schemaVersion: 1,
-      actions: listExperimentalExtensionActions(extensionId, connectSnapshot),
+      actions: listExperimentalExtensionActions(extensionId),
     });
   });
 
@@ -320,7 +319,7 @@ export function registerCoreRoutes(options: RegisterCoreRoutesOptions): void {
       throw new ApiError(403, "forbidden", "Viewer tokens cannot call extension actions");
     }
     const body = await readJsonBody(ctx.request);
-    return jsonResponse(await callExperimentalExtensionAction(config, env, body, await getConnectSnapshot(config, { ...connectSnapshotBaseOptions, ...connectSnapshotOptionsFromBody(body) })));
+    return jsonResponse(await callExperimentalExtensionAction(config, env, body, await getConnectSnapshot(config, { ...connectSnapshotBaseOptions, ...connectSnapshotOptionsFromBody(body) }), ctx.request.signal));
   });
 
   addRoute(routes, "GET", "/workspaces", "client", async () => {
@@ -472,7 +471,10 @@ export function registerCoreRoutes(options: RegisterCoreRoutesOptions): void {
     }
     // A stored credential is useless until the engine holds it: deliver it now
     // rather than waiting for the next engine start.
-    await syncManagedProviderAuth({ config, env, logger: managedProviderAuthLogger }).catch(() => undefined);
+    const authResult = await syncManagedProviderAuth({ config, env, logger: managedProviderAuthLogger }).catch(() => undefined);
+    if (authResult && (authResult.delivered.length > 0 || authResult.removed.length > 0)) {
+      await onManagedProviderAuthChanged?.(authResult).catch(() => undefined);
+    }
     return jsonResponse({ ok: true, count: entries.length });
   });
 
@@ -489,8 +491,4 @@ export function registerCoreRoutes(options: RegisterCoreRoutesOptions): void {
     return jsonResponse({ ok: true });
   });
 
-  addRoute(routes, "POST", "/voice/realtime/session", "host", async (ctx) => {
-    const body = await readJsonBody(ctx.request);
-    return jsonResponse(await createOpenAiRealtimeVoiceSession(env, body));
-  });
 }

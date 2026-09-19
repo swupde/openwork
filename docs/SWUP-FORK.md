@@ -45,7 +45,6 @@ Enable only these workflows in this fork's GitHub Actions settings:
 | `den-db-check.yml` | Database schema and migration checks |
 | `ci-i18n.yml` | Translation audit |
 | `ci-no-new-eval-flows.yml` | Guard against obsolete test flows |
-| `spec-impact.yml` | Report which test contracts a change affects |
 | `publish-ee-images.yml` | Build images, validate Helm, and smoke-test containers |
 
 Linux validation uses standard GitHub-hosted Ubuntu runners; macOS validation
@@ -77,7 +76,7 @@ gh api repos/swupde/openwork/actions/workflows --paginate \
 ```
 
 Compare against the table above. Disable newly imported workflows unless they
-have an identified SwitchUp consumer; retain the seven listed workflows.
+have an identified SwitchUp consumer; retain the six listed workflows.
 Use `gh workflow disable <filename> --repo swupde/openwork` or the Actions UI.
 Re-enabling an optional workflow requires checking its runners, credentials,
 external destinations, permissions, and any dependent workflows first.
@@ -99,12 +98,32 @@ external destinations, permissions, and any dependent workflows first.
    connection. Preserve the database volume and follow the deployment
    repository's migration and backup procedure.
 
+Upstream v0.18.48 removed `spec-impact.yml` and its contract registry. The fork follows that removal; the retained application and migration suites provide the relevant checks.
+
+## v0.18.48 reconciliation (2026-09-19)
+
+The upstream release is `c67ba51eda99ae6cfba1ff75b31e84f915c47be5`.
+This import preserves runtime API path prefixes, organisation skill guidance,
+managed attachment storage, Google native file compatibility routes, and the
+false-baseline database repair. Google compatibility routes now honor the
+upstream Connect policy denial before using credentials or calling Google.
+
+The upstream query-schema extractor and policy-aware desktop updater replace
+fork duplicates. The image selector follows the upstream inference-to-gateway
+source rename while retaining the existing image repository name. Newly
+imported API-contract, SDK, and evidence-review jobs are restricted to the
+upstream repository; they are outside our retained workflow list.
+
+A production upgrade must rehearse pending migrations and the built image's
+bootstrap against an isolated snapshot, preserve the database volume and
+credential encryption key, and update the deployment pin separately.
+
 ## Repository settings evidence
 
 Verified 2026-09-05 after [PR #19](https://github.com/swupde/openwork/pull/19)
 merged as `7f5ba855aa6acb7745a6d596749487ade0feee12`:
 
-- Seven workflows are active, exactly as listed above; 21 are
+- Seven workflows were active (the six above plus the since-removed `spec-impact.yml`); 21 were
   `disabled_manually`.
 - The post-merge inventory exposed three newly registered workflows:
   `daytona-e2e-singles.yml`, `nightly-flake-report.yml`, and

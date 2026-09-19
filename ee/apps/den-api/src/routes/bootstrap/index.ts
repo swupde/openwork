@@ -1,4 +1,6 @@
 import { and, eq, gt, isNotNull, isNull } from "@openwork-ee/den-db/drizzle"
+import { readOrganizationMetadata } from "@openwork/types/den/managed-models-policy"
+import { ensureMemberGatewayKey } from "../../gateway-keys.js"
 import {
   ConfigObjectAccessGrantTable,
   ConfigObjectTable,
@@ -68,7 +70,7 @@ const claimLinkSchema = z.object({
   role: z.string(),
   token: z.string(),
   url: z.string(),
-  expiresAt: z.string(),
+  expiresAt: z.string().datetime(),
 })
 
 const bootstrapWorkspaceResponseSchema = z.object({
@@ -81,7 +83,7 @@ const bootstrapWorkspaceResponseSchema = z.object({
   }),
   setup: z.object({
     id: denTypeIdSchema("workspaceBootstrap"),
-    expiresAt: z.string(),
+    expiresAt: z.string().datetime(),
   }),
   skill: z.object({
     id: denTypeIdSchema("configObject"),
@@ -174,6 +176,7 @@ export function registerBootstrapRoutes<T extends { Variables: AuthContextVariab
     "/v1/bootstrap/workspace",
     describeRoute({
       tags: ["Bootstrap"],
+      security: [],
       summary: "Create a provisional workspace for agent-first setup",
       description: "Creates a provisional workspace, setup member, starter skill, and short-lived claim links without requiring an email account first.",
       responses: {
@@ -403,6 +406,7 @@ export function registerBootstrapRoutes<T extends { Variables: AuthContextVariab
     "/v1/bootstrap/claims/accept",
     describeRoute({
       tags: ["Bootstrap"],
+      security: [{ bearerAuth: [] }],
       summary: "Claim a provisional workspace",
       description: "Lets a signed-in human claim ownership or membership of a provisional agent-created workspace.",
       responses: {
@@ -489,14 +493,24 @@ export function registerBootstrapRoutes<T extends { Variables: AuthContextVariab
         await tx.update(MemberTable).set({ removedAt: now }).where(eq(MemberTable.id, claim.setupMemberId))
         await tx.update(WorkspaceClaimTable).set({ status: "claimed", claimedByUserId: normalizedUserId, claimedAt: now }).where(eq(WorkspaceClaimTable.id, claim.id))
         await tx.update(WorkspaceBootstrapTable).set({ status: "claimed", claimedAt: now }).where(eq(WorkspaceBootstrapTable.id, claim.bootstrapId))
+        const metadata = readOrganizationMetadata(claim.organization.metadata)
         await tx.update(OrganizationTable).set({
           metadata: {
-            ...(claim.organization.metadata ?? {}),
-            bootstrap: { provisional: false, claimedAt: now.toISOString(), claimedByUserId: normalizedUserId },
+            ...metadata,
+            bootstrap: {
+              ...readOrganizationMetadata(metadata.bootstrap),
+              provisional: false,
+              claimedAt: now.toISOString(),
+              // Preserve existing claim attribution: this is the authenticated
+              // account's internal ID stored at runtime, not a customer identity
+              // embedded in public source or fixtures.
+              claimedByUserId: normalizedUserId,
+            },
           },
         }).where(eq(OrganizationTable.id, claim.organizationId))
 
         return {
+          memberId,
           organization: {
             id: claim.organization.id,
             name: claim.organization.name,
@@ -519,8 +533,8 @@ export function registerBootstrapRoutes<T extends { Variables: AuthContextVariab
       if (session?.id) {
         await setSessionActiveOrganization(normalizeDenTypeId("session", session.id), result.organization.id)
       }
-
-      return c.json({ ok: true, ...result })
+      await ensureMemberGatewayKey({ organizationId: result.organization.id, memberId: result.memberId })
+      return c.json({ ok: true, organization: result.organization })
     },
   )
 }

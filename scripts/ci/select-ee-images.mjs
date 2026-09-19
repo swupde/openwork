@@ -16,7 +16,7 @@ const noImagePrefixes = [
 const directPrefixes = [
   ["ee/apps/den-api/", ["openwork-den-api"]],
   ["ee/apps/den-web/", ["openwork-den-web"]],
-  ["ee/apps/inference/", ["openwork-inference"]],
+  ["ee/apps/gateway/", ["openwork-inference"]],
   ["ee/apps/den-gateway/", ["openwork-den-gateway"]],
   ["apps/app/", ["openwork-den-gateway"]],
   ["packages/ui/", ["openwork-den-web", "openwork-den-gateway"]],
@@ -34,7 +34,7 @@ const directPrefixes = [
   ["ee/packages/telemetry/", ["openwork-den-api"]],
   ["packaging/docker/Dockerfile.den", ["openwork-den-api"], true],
   ["packaging/docker/Dockerfile.den-web", ["openwork-den-web"], true],
-  ["packaging/docker/Dockerfile.inference", ["openwork-inference"], true],
+  ["packaging/docker/Dockerfile.gateway", ["openwork-inference"], true],
   ["packaging/docker/Dockerfile.den-gateway", ["openwork-den-gateway"], true],
 ]
 const sharedFiles = new Set([

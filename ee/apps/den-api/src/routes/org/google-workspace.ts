@@ -10,14 +10,15 @@ import { env } from "../../env.js"
 import { cloudTransportRoute, jsonValidator, orgMemberRoute, paramValidator, queryValidator } from "../../middleware/index.js"
 import { invalidRequestSchema, jsonResponse, unauthorizedSchema } from "../../openapi.js"
 import { decodeFileContent } from "../../capability-sources/binary-content.js"
-import { buildGmailDraftRaw, gmailDraftUrl, gmailThreadUrl, readGmailDraftIds } from "../../capability-sources/gmail.js"
-import type { GmailDraftAttachment } from "../../capability-sources/gmail.js"
+import { buildGmailDraftRaw, gmailDraftUrl, gmailThreadUrl, normalizeGmailHeaderValue, readGmailDraftIds } from "../../capability-sources/gmail.js"
+import type { GmailDraftAttachment, GmailDraftQuote } from "../../capability-sources/gmail.js"
+import { gmailFileInputPreflight, gmailFileInputPreflightSchema } from "../../capability-sources/gmail-file-input.js"
 import { getValidAccessToken } from "../../capability-sources/generic-oauth.js"
-import { listNativeProviderUsableEntries, resolveDefaultNativeProviderCredentialId } from "../../capability-sources/native-provider-connections.js"
+import { listNativeProviderUsableEntries, nativeProviderConnectionPolicyError, resolveDefaultNativeProviderCredentialId, type NativeProviderPolicyError } from "../../capability-sources/native-provider-connections.js"
 import {
   buildDriveMultipartUpload,
   buildDriveSearchQuery,
-  buildGmailQuoteBlock,
+  buildGmailQuote,
   extractCalendarEvents,
   extractDriveFiles,
   extractDrivePermission,
@@ -29,8 +30,10 @@ import {
   gmailBodyHasQuotedHistory,
   truncateText,
 } from "../../capability-sources/google-workspace-api.js"
-import type { ConnectedAccountRow } from "../../capability-sources/oauth-credentials.js"
-import { getNativeOAuthProvider } from "../../capability-sources/provider-registry.js"
+import { getOrgOAuthClient, type ConnectedAccountRow } from "../../capability-sources/oauth-credentials.js"
+import { clientSelectedFeatures, getNativeOAuthProvider, providerScopesSatisfy, resolveProviderScopes } from "../../capability-sources/provider-registry.js"
+import { registerGmailManagementRoutes } from "./gmail-management.js"
+import { registerGoogleProductivityManagementRoutes } from "./google-productivity-management.js"
 import {
   createNativeGoogleFile,
   NativeGoogleFileApiError,
@@ -56,23 +59,33 @@ const DIRECT_UPLOAD_MAX_FILES = 10
 const GMAIL_REPLY_SUBJECT_RE = /^\s*(re|fwd?)\s*:/i
 const GMAIL_METADATA_CONCURRENCY = 4
 
-const CONNECT_GOOGLE_ACCOUNT_MESSAGE = "Connect your Google account first: open Settings > Connect and use Connect your account on the Google Workspace row, or connect from the OpenWork Cloud dashboard."
+const CONNECT_GOOGLE_ACCOUNT_MESSAGE = "Connect your Google account first: open Settings > Library > Connections and connect the Google Workspace connection, or use OpenWork Cloud > Your Connections."
 
-const createDraftBodySchema = z.object({
-  to: z.string().trim().min(3).max(320).describe("Recipient email address."),
-  cc: z.string().trim().min(3).max(1_000).optional().describe("Optional comma-separated Cc email addresses."),
-  bcc: z.string().trim().min(3).max(1_000).optional().describe("Optional comma-separated Bcc email addresses."),
-  subject: z.string().trim().min(1).max(500).describe("Draft subject line. For replies or forwards, include threadId; subjects starting with Re: or Fwd: are rejected without threadId so the draft stays on the existing conversation."),
+const draftHeaderSchema = z.string().overwrite(normalizeGmailHeaderValue)
+
+const draftMetadataSchema = z.object({
+  to: draftHeaderSchema.min(3).max(320).describe("Recipient email address."),
+  cc: draftHeaderSchema.min(3).max(1_000).optional().describe("Optional comma-separated Cc email addresses."),
+  bcc: draftHeaderSchema.min(3).max(1_000).optional().describe("Optional comma-separated Bcc email addresses."),
+  subject: draftHeaderSchema.min(1).max(500).describe("Draft subject line. For replies or forwards, include threadId; subjects starting with Re: or Fwd: are rejected without threadId so the draft stays on the existing conversation."),
   body: z.string().min(1).max(50_000).describe("Plain-text draft body. Write plain prose with no markdown syntax, separate paragraphs with blank lines, and do not hard-wrap prose. For threaded drafts, the server appends the quoted conversation automatically; do not include quoted history."),
   threadId: z.string().trim().min(1).max(512).optional().describe("Gmail thread id to reply on. Required for replies and forwards; get it from the gmail-messages capability. When set, the draft is attached to that thread as a reply — keep the thread's subject (e.g. 'Re: …')."),
 }).strict()
+
+const createDraftBodySchema = draftMetadataSchema.extend({
+  attachments: z.array(z.string().trim().min(1)).min(1).max(DIRECT_UPLOAD_MAX_FILES).optional().describe("Optional workspace file paths, 1 to 10 files totaling at most 4 MiB. File bytes stay outside model context. Requires a direct execute_capability call from a supporting OpenWork host; Code Mode and other MCP hosts are unsupported and create no draft. Do not retry without attachments."),
+})
+
+const directDraftPayloadSchema = draftMetadataSchema.extend({
+  connectionId: z.string().trim().min(1).optional().describe("Selected native Google Workspace connection ID, or google-workspace for the legacy credential. An unavailable selection never falls back to another account."),
+})
 
 const createDraftResponseSchema = z.object({
   ok: z.literal(true),
   draftId: z.string(),
   messageId: z.string().nullable(),
   draftUrl: z.string().nullable().describe("Gmail URL for the ready-to-send draft. Always share draftUrl with the user so they can open the draft in Gmail for review and send."),
-  threadUrl: z.string().nullable().describe("Gmail URL for the conversation thread when this draft is a threaded reply."),
+  threadUrl: z.string().nullable().describe("Gmail URL for the conversation thread returned by Gmail for this draft."),
   to: z.string(),
   subject: z.string(),
   threadId: z.string().nullable(),
@@ -102,6 +115,7 @@ const upstreamErrorSchema = z.object({
 const gmailMessagesQuerySchema = z.object({
   q: z.string().trim().min(1).max(1_000).optional().describe("Optional Gmail search query, using Gmail's search syntax."),
   maxResults: z.coerce.number().int().min(1).max(25).default(10).describe("Maximum messages to return, capped at 25."),
+  pageToken: z.string().min(1).max(2048).optional().describe("nextPageToken from a previous page of the same Gmail search."),
 })
 
 const gmailMessageParamSchema = z.object({
@@ -134,6 +148,7 @@ const gmailMessageSchema = gmailMessageSummarySchema.extend({
 const gmailMessagesResponseSchema = z.object({
   ok: z.literal(true),
   messages: z.array(gmailMessageSummarySchema),
+  nextPageToken: z.string().optional(),
 }).meta({ ref: "GoogleWorkspaceGmailMessagesResponse" })
 
 const gmailMessageResponseSchema = z.object({
@@ -155,8 +170,8 @@ const gmailAttachmentResponseSchema = z.object({
 }).meta({ ref: "GoogleWorkspaceGmailAttachmentResponse" })
 
 const calendarEventsQuerySchema = z.object({
-  timeMin: z.string().datetime().describe("Inclusive lower bound for event start time."),
-  timeMax: z.string().datetime().describe("Exclusive upper bound for event start time."),
+  timeMin: z.string().datetime({ offset: true }).describe("Inclusive lower bound for event start time. RFC 3339 date-time with a UTC offset or Z, e.g. 2026-09-03T00:00:00+02:00 or 2026-09-02T22:00:00Z."),
+  timeMax: z.string().datetime({ offset: true }).describe("Exclusive upper bound for event start time. RFC 3339 date-time with a UTC offset or Z, e.g. 2026-09-04T00:00:00+02:00 or 2026-09-03T22:00:00Z."),
   maxResults: z.coerce.number().int().min(1).max(100).default(25).describe("Maximum events to return, capped at 100."),
 })
 
@@ -204,8 +219,8 @@ const createCalendarEventBodySchema = z.object({
   summary: z.string().trim().min(1).max(1_000).describe("Event title."),
   description: z.string().max(20_000).optional().describe("Optional event description."),
   location: z.string().max(1_000).optional().describe("Optional event location."),
-  start: z.string().datetime().describe("Event start date-time."),
-  end: z.string().datetime().describe("Event end date-time."),
+  start: z.string().datetime({ offset: true }).describe("Event start date-time. RFC 3339 date-time with a UTC offset or Z, e.g. 2026-09-03T17:00:00+02:00 or 2026-09-03T15:00:00Z."),
+  end: z.string().datetime({ offset: true }).describe("Event end date-time. RFC 3339 date-time with a UTC offset or Z, e.g. 2026-09-03T17:30:00+02:00 or 2026-09-03T15:30:00Z."),
   timeZone: z.string().trim().min(1).max(128).optional().describe("Optional IANA time zone for start and end."),
   attendees: z.array(z.string().email()).max(100).optional().describe("Optional attendee email addresses."),
   createMeetLink: z.boolean().optional().describe("Set true to create a Google Meet conferencing link for this event; the response returns meetLink when Google creates it."),
@@ -236,8 +251,11 @@ const updateCalendarEventResponseSchema = z.object({
 }).meta({ ref: "GoogleWorkspaceUpdateCalendarEventResponse" })
 
 const driveFilesQuerySchema = z.object({
-  query: z.string().trim().min(1).max(500).describe("Text to search in Drive file names and full text."),
+  query: z.string().trim().min(1).max(500).optional().describe("Optional text to search in Drive file names and full text. Omit to list files."),
   maxResults: z.coerce.number().int().min(1).max(25).default(10).describe("Maximum files to return, capped at 25."),
+  pageToken: z.string().min(1).max(2048).optional(),
+  modifiedAfter: z.string().datetime({ offset: true }).optional().describe("Only files modified after this RFC3339 timestamp; follow nextPageToken to enumerate all matching files."),
+  folderId: z.string().min(1).max(512).regex(/^[A-Za-z0-9_-]+$/).optional().describe("Limit to direct children of this folder."),
 })
 
 const driveFileParamSchema = z.object({
@@ -279,6 +297,8 @@ const driveFileSummarySchema = z.object({
 const driveFilesResponseSchema = z.object({
   ok: z.literal(true),
   files: z.array(driveFileSummarySchema),
+  nextPageToken: z.string().optional(),
+  incompleteSearch: z.boolean().optional().describe("Google reports some drives were not searched; do not claim these are all matching files."),
 }).meta({ ref: "GoogleWorkspaceDriveFilesResponse" })
 
 const uploadDriveFileResponseSchema = z.object({
@@ -361,7 +381,7 @@ const driveFileResponseSchema = z.object({
   ok: z.literal(true),
   file: driveFileSummarySchema.extend({
     content: z.string().nullable(),
-    contentBase64: z.string().nullable().describe("Standard base64-encoded file bytes for binary files; decode locally. Same encoding as the gmail-attachment capability's dataBase64 — it can be passed directly to the Drive upload capability's dataBase64 field."),
+    contentBase64: z.string().nullable().describe("Standard base64-encoded file bytes for binary files; decode to a workspace file. To upload, use the host's Google Workspace upload action with the workspace file path, if that action is available in the current client. There is no dataBase64 Drive upload capability."),
     encoding: z.enum(["text", "base64", "none"]),
     truncated: z.boolean(),
     contentUnavailableReason: z.enum(["file_too_large"]).nullable(),
@@ -376,10 +396,11 @@ const shareDriveFileResponseSchema = z.object({
   role: z.string(),
 }).meta({ ref: "GoogleWorkspaceShareDriveFileResponse" })
 
-type GoogleWorkspaceAccessToken =
-  | { kind: "ok"; accessToken: string; account: ConnectedAccountRow }
+export type GoogleWorkspaceAccessToken =
+  | { kind: "ok"; accessToken: string; account: ConnectedAccountRow; enabledScopes: string[]; enabledFeatures?: string[] }
   | { kind: "needs_connection"; message: string }
   | { kind: "google_api_error"; message: string }
+  | NativeProviderPolicyError
 
 type CalendarConferenceData = {
   createRequest: {
@@ -436,11 +457,12 @@ export function missingScope(account: ConnectedAccountRow, anyOf: string[]): boo
     // general Drive retrieval uses the stricter, fail-closed check below.
     return false
   }
-  return !anyOf.some((scope) => scopes.includes(scope))
+  const provider = getNativeOAuthProvider("google-workspace")
+  return !anyOf.some((scope) => scopes.includes(scope) || (provider && providerScopesSatisfy(provider, scopes, scope)))
 }
 
 function missingPermissionMessage(label: string): string {
-  return `Your connected Google account is missing the ${label} permission. An admin can enable it on the Google Workspace connector in OpenWork Cloud -> Connectors; then reconnect your account in Settings -> Extensions.`
+  return `Your connected Google account is missing the ${label} permission. An admin can enable it on the Google Workspace connector in OpenWork Cloud -> Connectors; then reconnect that Google Workspace connection in OpenWork Cloud -> Your Connections.`
 }
 
 function driveReadPermissionMessage(account: ConnectedAccountRow): string | null {
@@ -465,6 +487,7 @@ function isDeclaredTextFile(mimeType: string): boolean {
 async function googleWorkspaceToken(input: {
   organizationId: DenTypeId<"organization">
   orgMembershipId: DenTypeId<"member">
+  connectionId?: string | null
 }): Promise<GoogleWorkspaceAccessToken> {
   const provider = getNativeOAuthProvider("google-workspace")
   if (!provider) {
@@ -475,9 +498,14 @@ async function googleWorkspaceToken(input: {
     memberId: input.orgMembershipId,
   })
   const teamIds = memberTeams.map((team) => team.id)
-  const requestedConnectorId = readInternalCapabilityConnectorId(getContext().req.raw.headers)
+  // Gmail multipart hosts select via payload, never via Den's signed internal headers.
+  const requestedConnectorId = input.connectionId === undefined
+    ? readInternalCapabilityConnectorId(getContext().req.raw.headers)
+    : input.connectionId
   let credentialProviderId: string | null
   if (requestedConnectorId) {
+    // This exact lookup also handles the synthetic google-workspace legacy
+    // entry. An explicit selection must never use the default resolver.
     const entries = await listNativeProviderUsableEntries({
       organizationId: input.organizationId,
       orgMembershipId: input.orgMembershipId,
@@ -494,7 +522,8 @@ async function googleWorkspaceToken(input: {
     })
   }
   if (!credentialProviderId) {
-    return { kind: "needs_connection", message: CONNECT_GOOGLE_ACCOUNT_MESSAGE }
+    return await nativeProviderConnectionPolicyError(input.organizationId)
+      ?? { kind: "needs_connection", message: CONNECT_GOOGLE_ACCOUNT_MESSAGE }
   }
 
   const token = await getValidAccessToken({
@@ -507,7 +536,10 @@ async function googleWorkspaceToken(input: {
     return { kind: "needs_connection", message: CONNECT_GOOGLE_ACCOUNT_MESSAGE }
   }
 
-  return { kind: "ok", accessToken: token.accessToken, account: token.account }
+  const client = await getOrgOAuthClient(input.organizationId, credentialProviderId)
+  const enabledFeatures = client ? clientSelectedFeatures(provider, client.extra) : []
+  const enabledScopes = client ? resolveProviderScopes(provider, enabledFeatures) : []
+  return { kind: "ok", accessToken: token.accessToken, account: token.account, enabledScopes, enabledFeatures }
 }
 
 async function googleApiError(operation: string, response: Response) {
@@ -771,7 +803,8 @@ async function executeGmailDraft(
   input: z.infer<typeof createDraftBodySchema>,
   payload: OrganizationContext,
   attachments: GmailDraftAttachment[],
-): Promise<{ status: 200 | 400 | 409 | 502; body: Record<string, unknown> }> {
+  connectionId?: string | null,
+): Promise<{ status: 200 | 400 | 403 | 409 | 422 | 502; body: Record<string, unknown> }> {
   const { to, cc, bcc, subject, body, threadId } = input
   if (!threadId && GMAIL_REPLY_SUBJECT_RE.test(subject)) {
     return {
@@ -786,22 +819,26 @@ async function executeGmailDraft(
   const token = await googleWorkspaceToken({
     organizationId: payload.organization.id,
     orgMembershipId: payload.currentMember.id,
+    connectionId,
   })
   if (token.kind === "google_api_error") {
     return { status: 502, body: { error: "google_api_error", message: token.message } }
   }
-  if (token.kind === "needs_connection") {
-    return { status: 409, body: { error: "needs_connection", message: token.message } }
+  if (token.kind === "needs_connection" || token.kind === "policy_blocked") {
+    return { status: token.kind === "policy_blocked" ? 403 : 409, body: { error: token.kind, message: token.message } }
+  }
+
+  if (threadId && missingScope(token.account, [GMAIL_READ_SCOPE])) {
+    return { status: 409, body: { error: "needs_connection", message: missingPermissionMessage("Gmail read") } }
+  }
+  if (input.attachments) {
+    return { status: 422, body: gmailFileInputPreflight }
   }
 
   const headers: { name: string; value: string }[] = []
-  let draftBody = body
+  let draftQuote: GmailDraftQuote | undefined
   let quotedHistoryIncluded = false
   if (threadId) {
-    if (missingScope(token.account, [GMAIL_READ_SCOPE])) {
-      return { status: 409, body: { error: "needs_connection", message: missingPermissionMessage("Gmail read") } }
-    }
-
     const threadUrl = new URL(`${gmailApiBase()}/gmail/v1/users/me/threads/${encodeURIComponent(threadId)}`)
     threadUrl.searchParams.set("format", "full")
     const threadResponse = await googleWorkspaceApiFetch(threadUrl, {
@@ -826,14 +863,14 @@ async function executeGmailDraft(
     } else {
       const quote = extractGmailThreadQuoteInput(thread)
       if (quote) {
-        draftBody = `${body}\n\n${buildGmailQuoteBlock(quote)}`
+        draftQuote = buildGmailQuote(quote)
         quotedHistoryIncluded = true
       }
     }
   }
 
   const message: { raw: string; threadId?: string } = {
-    raw: buildGmailDraftRaw({ to, cc, bcc, subject, body: draftBody, headers, attachments }),
+    raw: buildGmailDraftRaw({ to, cc, bcc, subject, body, quote: draftQuote, headers, attachments }),
   }
   if (threadId) message.threadId = threadId
   const response = await googleWorkspaceApiFetch(`${gmailApiBase()}/gmail/v1/users/me/drafts`, {
@@ -852,7 +889,7 @@ async function executeGmailDraft(
     }
   }
 
-  const { draftId, messageId } = readGmailDraftIds(responseText)
+  const { draftId, messageId, threadId: returnedThreadId } = readGmailDraftIds(responseText)
   if (!draftId) {
     return { status: 502, body: { error: "google_api_error", message: "Gmail returned no draft id." } }
   }
@@ -861,10 +898,10 @@ async function executeGmailDraft(
     draftId,
     messageId,
     draftUrl: gmailDraftUrl(messageId, token.account.externalAccountId ?? undefined),
-    threadUrl: gmailThreadUrl(threadId, token.account.externalAccountId ?? undefined),
+    threadUrl: gmailThreadUrl(returnedThreadId, token.account.externalAccountId ?? undefined),
     to,
     subject,
-    threadId: threadId ?? null,
+    threadId: returnedThreadId,
     quotedHistoryIncluded,
   }
   if (attachments.length > 0) {
@@ -886,11 +923,15 @@ async function executeGmailDraft(
 export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVariables }>(app: Hono<T>) {
   app.use("/v1/capabilities/google-workspace/*", contextStorage())
   app.use("/v1/direct-uploads/google-workspace/*", contextStorage())
+  const actionDependencies = { token: googleWorkspaceToken, fetch: googleWorkspaceApiFetch }
+  registerGmailManagementRoutes(app, actionDependencies)
+  registerGoogleProductivityManagementRoutes(app, actionDependencies)
 
   app.post(
     "/v1/direct-uploads/google-workspace/drive-files",
     describeRoute({
       tags: ["Direct uploads"],
+      security: [{ mcpAccessToken: [] }],
       summary: "Upload one multipart workspace file directly to Google Drive",
       description: "Authenticated host transport for openwork-cloud-uploads. The route immediately forwards the file to Google and does not persist it or expose its bytes to the model.",
       responses: {
@@ -920,8 +961,8 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
       if (token.kind === "google_api_error") {
         return c.json({ error: "google_api_error", message: token.message }, 502)
       }
-      if (token.kind === "needs_connection") {
-        return c.json({ error: "needs_connection", message: token.message }, 409)
+      if (token.kind === "needs_connection" || token.kind === "policy_blocked") {
+        return c.json({ error: token.kind, message: token.message }, token.kind === "policy_blocked" ? 403 : 409)
       }
       if (missingScope(token.account, [DRIVE_FILE_SCOPE, DRIVE_FULL_SCOPE])) {
         return c.json({ error: "needs_connection", message: missingPermissionMessage("Google Drive write") }, 409)
@@ -970,6 +1011,7 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
     "/v1/direct-uploads/google-workspace/gmail-drafts",
     describeRoute({
       tags: ["Direct uploads"],
+      security: [{ mcpAccessToken: [] }],
       summary: "Create a Gmail draft with direct multipart workspace attachments",
       description: "Authenticated host transport for openwork-cloud-uploads. The route immediately creates the draft and does not persist attachment bytes or expose them to the model.",
       responses: {
@@ -1001,7 +1043,7 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
       } catch {
         return c.json({ error: "invalid_request", message: "Draft payload must be valid JSON." }, 400)
       }
-      const parsed = createDraftBodySchema.safeParse(payloadJson)
+      const parsed = directDraftPayloadSchema.safeParse(payloadJson)
       if (!parsed.success) {
         return c.json({ error: "invalid_request", details: parsed.error.flatten() }, 400)
       }
@@ -1009,7 +1051,7 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
       if (attachments.some((attachment) => !attachment.filename)) {
         return c.json({ error: "invalid_request", message: "Every attachment requires a filename." }, 400)
       }
-      const result = await executeGmailDraft(parsed.data, c.get("organizationContext"), attachments)
+      const result = await executeGmailDraft(parsed.data, c.get("organizationContext"), attachments, parsed.data.connectionId ?? null)
       return c.json(result.body, result.status)
     },
   )
@@ -1038,8 +1080,8 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
       if (token.kind === "google_api_error") {
         return c.json({ error: "google_api_error", message: token.message }, 502)
       }
-      if (token.kind === "needs_connection") {
-        return c.json({ error: "needs_connection", message: token.message }, 409)
+      if (token.kind === "needs_connection" || token.kind === "policy_blocked") {
+        return c.json({ error: token.kind, message: token.message }, token.kind === "policy_blocked" ? 403 : 409)
       }
       if (missingScope(token.account, [GMAIL_READ_SCOPE])) {
         return c.json({ error: "needs_connection", message: missingPermissionMessage("Gmail read") }, 409)
@@ -1049,6 +1091,7 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
       const listUrl = new URL(`${gmailApiBase()}/gmail/v1/users/me/messages`)
       if (query.q) listUrl.searchParams.set("q", query.q)
       listUrl.searchParams.set("maxResults", String(query.maxResults))
+      if (query.pageToken) listUrl.searchParams.set("pageToken", query.pageToken)
 
       const listResponse = await googleWorkspaceApiFetch(listUrl, {
         headers: { authorization: `Bearer ${token.accessToken}` },
@@ -1057,7 +1100,8 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
         return c.json(await googleApiError("Gmail messages list", listResponse), 502)
       }
 
-      const ids = extractGmailMessageIds(await readJson(listResponse), 25)
+      const listed = await readJson(listResponse)
+      const ids = extractGmailMessageIds(listed, 25)
       const metadata = await fetchGmailMetadata(ids, token.accessToken, c.req.raw.signal)
       if (!metadata.ok) {
         return c.json(metadata.error, 502)
@@ -1076,7 +1120,7 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
         }
       })
 
-      return c.json({ ok: true, messages })
+      return c.json({ ok: true, messages, ...(isRecordValue(listed) && typeof listed.nextPageToken === "string" ? { nextPageToken: listed.nextPageToken } : {}) })
     },
   )
 
@@ -1105,8 +1149,8 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
       if (token.kind === "google_api_error") {
         return c.json({ error: "google_api_error", message: token.message }, 502)
       }
-      if (token.kind === "needs_connection") {
-        return c.json({ error: "needs_connection", message: token.message }, 409)
+      if (token.kind === "needs_connection" || token.kind === "policy_blocked") {
+        return c.json({ error: token.kind, message: token.message }, token.kind === "policy_blocked" ? 403 : 409)
       }
       if (missingScope(token.account, [GMAIL_READ_SCOPE])) {
         return c.json({ error: "needs_connection", message: missingPermissionMessage("Gmail read") }, 409)
@@ -1150,8 +1194,8 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
       if (token.kind === "google_api_error") {
         return c.json({ error: "google_api_error", message: token.message }, 502)
       }
-      if (token.kind === "needs_connection") {
-        return c.json({ error: "needs_connection", message: token.message }, 409)
+      if (token.kind === "needs_connection" || token.kind === "policy_blocked") {
+        return c.json({ error: token.kind, message: token.message }, token.kind === "policy_blocked" ? 403 : 409)
       }
       if (missingScope(token.account, [GMAIL_READ_SCOPE])) {
         return c.json({ error: "needs_connection", message: missingPermissionMessage("Gmail read") }, 409)
@@ -1200,8 +1244,8 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
       if (token.kind === "google_api_error") {
         return c.json({ error: "google_api_error", message: token.message }, 502)
       }
-      if (token.kind === "needs_connection") {
-        return c.json({ error: "needs_connection", message: token.message }, 409)
+      if (token.kind === "needs_connection" || token.kind === "policy_blocked") {
+        return c.json({ error: token.kind, message: token.message }, token.kind === "policy_blocked" ? 403 : 409)
       }
       if (missingScope(token.account, [CALENDAR_READ_SCOPE, CALENDAR_EVENTS_SCOPE])) {
         return c.json({ error: "needs_connection", message: missingPermissionMessage("Google Calendar read") }, 409)
@@ -1264,8 +1308,8 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
       if (token.kind === "google_api_error") {
         return c.json({ error: "google_api_error", message: token.message }, 502)
       }
-      if (token.kind === "needs_connection") {
-        return c.json({ error: "needs_connection", message: token.message }, 409)
+      if (token.kind === "needs_connection" || token.kind === "policy_blocked") {
+        return c.json({ error: token.kind, message: token.message }, token.kind === "policy_blocked" ? 403 : 409)
       }
       if (missingScope(token.account, [CALENDAR_READ_SCOPE, CALENDAR_EVENTS_SCOPE])) {
         return c.json({ error: "needs_connection", message: missingPermissionMessage("Google Calendar read") }, 409)
@@ -1307,8 +1351,8 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
       if (token.kind === "google_api_error") {
         return c.json({ error: "google_api_error", message: token.message }, 502)
       }
-      if (token.kind === "needs_connection") {
-        return c.json({ error: "needs_connection", message: token.message }, 409)
+      if (token.kind === "needs_connection" || token.kind === "policy_blocked") {
+        return c.json({ error: token.kind, message: token.message }, token.kind === "policy_blocked" ? 403 : 409)
       }
       if (missingScope(token.account, [CALENDAR_EVENTS_SCOPE])) {
         return c.json({ error: "needs_connection", message: missingPermissionMessage("Google Calendar write") }, 409)
@@ -1376,8 +1420,8 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
       if (token.kind === "google_api_error") {
         return c.json({ error: "google_api_error", message: token.message }, 502)
       }
-      if (token.kind === "needs_connection") {
-        return c.json({ error: "needs_connection", message: token.message }, 409)
+      if (token.kind === "needs_connection" || token.kind === "policy_blocked") {
+        return c.json({ error: token.kind, message: token.message }, token.kind === "policy_blocked" ? 403 : 409)
       }
       if (missingScope(token.account, [CALENDAR_EVENTS_SCOPE])) {
         return c.json({ error: "needs_connection", message: missingPermissionMessage("Google Calendar write") }, 409)
@@ -1438,7 +1482,7 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
         orgMembershipId: payload.currentMember.id,
       })
       if (token.kind === "google_api_error") return c.json({ error: "google_api_error", message: token.message }, 502)
-      if (token.kind === "needs_connection") return c.json({ error: "needs_connection", message: token.message }, 409)
+      if (token.kind === "needs_connection" || token.kind === "policy_blocked") return c.json({ error: token.kind, message: token.message }, token.kind === "policy_blocked" ? 403 : 409)
       if (missingScope(token.account, [DRIVE_FILE_SCOPE, DRIVE_FULL_SCOPE])) {
         return c.json({ error: "needs_connection", message: missingPermissionMessage("Google Drive write") }, 409)
       }
@@ -1482,7 +1526,7 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
         orgMembershipId: payload.currentMember.id,
       })
       if (token.kind === "google_api_error") return c.json({ error: "google_api_error", message: token.message }, 502)
-      if (token.kind === "needs_connection") return c.json({ error: "needs_connection", message: token.message }, 409)
+      if (token.kind === "needs_connection" || token.kind === "policy_blocked") return c.json({ error: token.kind, message: token.message }, token.kind === "policy_blocked" ? 403 : 409)
       if (missingScope(token.account, [DRIVE_FILE_SCOPE, DRIVE_FULL_SCOPE])) {
         return c.json({ error: "needs_connection", message: missingPermissionMessage("Google Drive write") }, 409)
       }
@@ -1508,7 +1552,7 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
     describeRoute({
       tags: ["Capability Sources"],
       summary: "Search Google Drive files as the calling member",
-      description: "Searches the calling member's Google Drive files by name and full text, using their connected Google Workspace account.",
+      description: "Lists or searches Drive files, including an optional modifiedAfter date and direct-parent folder filter. Follow nextPageToken until absent, and honor incompleteSearch before claiming complete coverage.",
       responses: {
         200: jsonResponse("Google Drive files returned.", driveFilesResponseSchema),
         401: jsonResponse("The caller must be signed in.", unauthorizedSchema),
@@ -1527,8 +1571,8 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
       if (token.kind === "google_api_error") {
         return c.json({ error: "google_api_error", message: token.message }, 502)
       }
-      if (token.kind === "needs_connection") {
-        return c.json({ error: "needs_connection", message: token.message }, 409)
+      if (token.kind === "needs_connection" || token.kind === "policy_blocked") {
+        return c.json({ error: token.kind, message: token.message }, token.kind === "policy_blocked" ? 403 : 409)
       }
       const permissionMessage = driveReadPermissionMessage(token.account)
       if (permissionMessage) {
@@ -1537,13 +1581,17 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
 
       const query = c.req.valid("query")
       const url = new URL(`${driveApiBase()}/drive/v3/files`)
-      url.searchParams.set("q", buildDriveSearchQuery(query.query))
+      const filters = [query.query ? buildDriveSearchQuery(query.query) : "trashed = false"]
+      if (query.modifiedAfter) filters.push(`modifiedTime > '${query.modifiedAfter}'`)
+      if (query.folderId) filters.push(`'${query.folderId}' in parents`)
+      url.searchParams.set("q", filters.join(" and "))
+      if (query.pageToken) url.searchParams.set("pageToken", query.pageToken)
       url.searchParams.set("pageSize", String(query.maxResults))
       url.searchParams.set("corpora", "allDrives")
       url.searchParams.set("spaces", "drive")
       url.searchParams.set("supportsAllDrives", "true")
       url.searchParams.set("includeItemsFromAllDrives", "true")
-      url.searchParams.set("fields", "files(id,name,mimeType,modifiedTime,webViewLink,size)")
+      url.searchParams.set("fields", "files(id,name,mimeType,modifiedTime,webViewLink,size),nextPageToken,incompleteSearch")
 
       const response = await googleWorkspaceApiFetch(url, {
         headers: { authorization: `Bearer ${token.accessToken}` },
@@ -1553,7 +1601,11 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
         return error.status === 409 ? c.json(error.body, 409) : c.json(error.body, 502)
       }
 
-      return c.json({ ok: true, files: extractDriveFiles(await readJson(response)) })
+      const listed = await readJson(response)
+      return c.json({ ok: true, files: extractDriveFiles(listed),
+        ...(isRecordValue(listed) && typeof listed.nextPageToken === "string" ? { nextPageToken: listed.nextPageToken } : {}),
+        ...(isRecordValue(listed) && typeof listed.incompleteSearch === "boolean" ? { incompleteSearch: listed.incompleteSearch } : {}),
+      })
     },
   )
 
@@ -1562,7 +1614,7 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
     describeRoute({
       tags: ["Capability Sources"],
       summary: "Read a Google Drive file's text or binary content as the calling member",
-      description: "Reads one Google Drive file, exporting Google Docs editors files as plain text. Downloaded files are content-sniffed with strict UTF-8 detection; declared text is bounded, and binary content is returned as standard base64 only up to the internal model-safety limit.",
+      description: "Reads a Drive file. Docs and Slides export as plain text; Sheets exports the first tab as CSV. For every spreadsheet tab or edits use the spreadsheet metadata and values capabilities. Downloaded content is bounded; binary files use standard base64 within the model-safety limit.",
       responses: {
         200: jsonResponse("Google Drive file returned.", driveFileResponseSchema),
         400: jsonResponse("The Drive item is not a readable file.", invalidRequestSchema),
@@ -1582,8 +1634,8 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
       if (token.kind === "google_api_error") {
         return c.json({ error: "google_api_error", message: token.message }, 502)
       }
-      if (token.kind === "needs_connection") {
-        return c.json({ error: "needs_connection", message: token.message }, 409)
+      if (token.kind === "needs_connection" || token.kind === "policy_blocked") {
+        return c.json({ error: token.kind, message: token.message }, token.kind === "policy_blocked" ? 403 : 409)
       }
       const permissionMessage = driveReadPermissionMessage(token.account)
       if (permissionMessage) {
@@ -1637,7 +1689,7 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
         ? new URL(`${driveApiBase()}/drive/v3/files/${encodeURIComponent(fileId)}/export`)
         : new URL(`${driveApiBase()}/drive/v3/files/${encodeURIComponent(fileId)}`)
       if (isGoogleAppsFile) {
-        contentUrl.searchParams.set("mimeType", "text/plain")
+        contentUrl.searchParams.set("mimeType", file.mimeType === "application/vnd.google-apps.spreadsheet" ? "text/csv" : "text/plain")
       } else {
         contentUrl.searchParams.set("alt", "media")
         contentUrl.searchParams.set("supportsAllDrives", "true")
@@ -1737,8 +1789,8 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
       if (token.kind === "google_api_error") {
         return c.json({ error: "google_api_error", message: token.message }, 502)
       }
-      if (token.kind === "needs_connection") {
-        return c.json({ error: "needs_connection", message: token.message }, 409)
+      if (token.kind === "needs_connection" || token.kind === "policy_blocked") {
+        return c.json({ error: token.kind, message: token.message }, token.kind === "policy_blocked" ? 403 : 409)
       }
       if (missingScope(token.account, [DRIVE_FILE_SCOPE, DRIVE_FULL_SCOPE])) {
         return c.json({ error: "needs_connection", message: missingPermissionMessage("Google Drive write") }, 409)
@@ -1785,11 +1837,12 @@ export function registerGoogleWorkspaceRoutes<T extends { Variables: OrgRouteVar
     "/v1/capabilities/google-workspace/gmail-drafts",
     describeRoute({
       tags: ["Capability Sources"],
-      summary: "Create a Gmail draft or threaded reply draft without attachments",
-      description: "Creates a plain-text Gmail draft in the calling member own mailbox. For workspace attachments, use the openwork-cloud-uploads gmail_create_draft_with_attachments action so file bytes stay outside model context. Set threadId for replies and forwards. Always share the returned draftUrl.",
+      summary: "Create a Gmail draft or threaded reply with optional workspace attachments",
+      description: "Creates a plain-text Gmail draft in the calling member own mailbox. Optional attachments are workspace paths, up to 10 files totaling at most 4 MiB, fulfilled outside model context by a supporting OpenWork host on direct execute_capability calls. Code Mode and other MCP hosts cannot fulfill attachments and create no draft. Set threadId for replies and forwards. Always share the returned draftUrl.",
       responses: {
         200: jsonResponse("Draft created.", createDraftResponseSchema),
         400: jsonResponse("The draft request was invalid.", z.union([invalidRequestSchema, missingThreadIdSchema])),
+        422: jsonResponse("Workspace attachments require a supporting OpenWork host; no draft was created.", gmailFileInputPreflightSchema),
         401: jsonResponse("The caller must be signed in.", unauthorizedSchema),
         409: jsonResponse("The calling member has not connected their Google account or is missing permission.", needsConnectionSchema),
         502: jsonResponse("Google rejected the request.", upstreamErrorSchema),

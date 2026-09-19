@@ -20,6 +20,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SANDBOX="openwork-server-$(date +%Y%m%d-%H%M%S)-$$-$(od -An -N2 -tx2 /dev/urandom | tr -d ' ')"
 DAYTONA_SERVER_SNAPSHOT="${DAYTONA_SERVER_SNAPSHOT:-openwork-server}"
 DAYTONA_TARGET="${DAYTONA_TARGET:-us}"
+DAYTONA_AUTO_STOP_MINUTES="${DAYTONA_AUTO_STOP_MINUTES:-60}"
 DEN_API_PORT="${DEN_API_PORT:-8788}"
 DEN_WEB_PORT="${DEN_WEB_PORT:-3005}"
 MAX_WAIT="${DAYTONA_SERVER_MAX_WAIT:-240}"
@@ -51,6 +52,10 @@ while [ "$#" -gt 0 ]; do
     --name)
       shift
       SANDBOX="${1:?missing sandbox name}"
+      ;;
+    --auto-stop)
+      shift
+      DAYTONA_AUTO_STOP_MINUTES="${1:?missing auto-stop minutes}"
       ;;
     --help|-h)
       sed -n '1,13p' "$0"
@@ -85,12 +90,20 @@ case "$REF" in
     ;;
 esac
 
+case "$DAYTONA_AUTO_STOP_MINUTES" in
+  ""|*[!0-9]*) echo "ERROR: auto-stop minutes must be a whole number from 0 through 1440" >&2; exit 1 ;;
+esac
+if [ "$DAYTONA_AUTO_STOP_MINUTES" -gt 1440 ]; then
+  echo "ERROR: auto-stop minutes must be a whole number from 0 through 1440" >&2
+  exit 1
+fi
+
 snapshot_id() {
   daytona snapshot list -f json | node -e 'const name = process.argv[1]; let input = ""; process.stdin.on("data", (chunk) => input += chunk); process.stdin.on("end", () => { const snapshot = JSON.parse(input).find((item) => item.name === name); if (snapshot) process.stdout.write(snapshot.id || snapshot.name); });' "$1"
 }
 
 SNAPSHOT_ID="$(snapshot_id "$DAYTONA_SERVER_SNAPSHOT")"
-CREATE_ARGS=(--name "$SANDBOX" --auto-stop 60 --public --target "$DAYTONA_TARGET")
+CREATE_ARGS=(--name "$SANDBOX" --auto-stop "$DAYTONA_AUTO_STOP_MINUTES" --public --target "$DAYTONA_TARGET")
 if [ -n "$SNAPSHOT_ID" ]; then
   echo "==> Using Daytona server snapshot: $DAYTONA_SERVER_SNAPSHOT"
   CREATE_ARGS+=(--snapshot "$SNAPSHOT_ID")
@@ -101,7 +114,17 @@ fi
 
 echo "==> Creating server sandbox: $SANDBOX"
 echo "    Ref: $REF"
+created=0
+cleanup_failed_provision() {
+  status=$?
+  if [ "$status" -ne 0 ] && [ "$created" -eq 1 ]; then
+    printf 'y\n' | daytona delete "$SANDBOX" >/dev/null 2>&1 || true
+  fi
+  exit "$status"
+}
+trap cleanup_failed_provision EXIT
 daytona create "${CREATE_ARGS[@]}"
+created=1
 
 echo "==> Waiting for sandbox exec readiness..."
 exec_ready=0
@@ -141,7 +164,13 @@ daytona exec "$SANDBOX" -- "bash -lc 'set -euo pipefail; cd /workspace; mkdir -p
 
 echo "==> Starting OpenWork Den server stack..."
 BOOTSTRAP_ADMIN_EMAILS_B64="$(printf %s "${DEN_BOOTSTRAP_ADMIN_EMAILS:-}" | base64 | tr -d '\n')"
-daytona exec "$SANDBOX" -- "bash -lc 'set -euo pipefail; cd /workspace; DEN_BOOTSTRAP_ADMIN_EMAILS=\"\$(printf %s $BOOTSTRAP_ADMIN_EMAILS_B64 | base64 -d)\" DEN_GENERATED_ARTIFACT_VIEWS_ENABLED=\"$DEN_GENERATED_ARTIFACT_VIEWS_ENABLED\" DEN_WEB_PUBLIC_URL=\"$DEN_WEB_URL\" DEN_API_PUBLIC_URL=\"$DEN_API_URL\" DEN_WEB_PORT=$DEN_WEB_PORT DEN_API_PORT=$DEN_API_PORT RUN_SEED=$RUN_SEED bash .devcontainer/start-daytona-server.sh'"
+# Caller-supplied Den env (base64 KEY=VALUE lines from the eval harness); the
+# start script exports it before launching Den. Base64 keeps values out of
+# this command line.
+case "${OPENWORK_DEN_EXTRA_ENV_B64:-}" in
+  *[!A-Za-z0-9+/=]*) echo "ERROR: OPENWORK_DEN_EXTRA_ENV_B64 must be base64." >&2; exit 1 ;;
+esac
+daytona exec "$SANDBOX" -- "bash -lc 'set -euo pipefail; cd /workspace; OPENWORK_DEN_EXTRA_ENV_B64=\"${OPENWORK_DEN_EXTRA_ENV_B64:-}\" DEN_BOOTSTRAP_ADMIN_EMAILS=\"\$(printf %s $BOOTSTRAP_ADMIN_EMAILS_B64 | base64 -d)\" DEN_GENERATED_ARTIFACT_VIEWS_ENABLED=\"$DEN_GENERATED_ARTIFACT_VIEWS_ENABLED\" DEN_WEB_PUBLIC_URL=\"$DEN_WEB_URL\" DEN_API_PUBLIC_URL=\"$DEN_API_URL\" DEN_WEB_PORT=$DEN_WEB_PORT DEN_API_PORT=$DEN_API_PORT RUN_SEED=$RUN_SEED bash .devcontainer/start-daytona-server.sh'"
 
 echo "==> Waiting for public Den Web health (up to ${MAX_WAIT}s)..."
 elapsed=0
@@ -177,3 +206,4 @@ echo ""
 echo "  Cleanup:"
 echo "    daytona delete $SANDBOX"
 echo "============================================"
+created=0

@@ -897,6 +897,21 @@ export async function getLocalManagedMcpConnection(config: ServerConfig, workspa
   return withVaultRead(config, (vault) => publicConnection(requireConnection(vault, workspaceId, name)));
 }
 
+/** Private App-host identity: a same-name gateway does not identify its current OAuth account. */
+export async function localManagedMcpAppIdentity(config: ServerConfig, workspaceId: string, name: string, url: unknown) {
+  if (url !== runtimeConfig(config, workspaceId, name, true).url) return null;
+  return withVaultRead(config, (vault) => {
+    const connection = requireConnection(vault, workspaceId, name);
+    return {
+      id: connection.id,
+      serverUrl: connection.serverUrl,
+      enabled: connection.enabled,
+      credentialRevision: connection.credential?.revision ?? null,
+      registrationRevision: connection.clientRegistration?.revision ?? null,
+    };
+  });
+}
+
 type AuthorizationStatePayload = {
   version: 1;
   workspaceId: string;
@@ -1156,6 +1171,7 @@ export async function completeLocalManagedMcpAuthorization(
   config: ServerConfig,
   state: string,
   code: string,
+  responseIssuer?: string,
 ): Promise<{ connection: LocalManagedMcpPublicConnection; workspaceId: string }> {
   const payload = await verifyAuthorizationState(config, state);
   const diagnostics: EnterpriseMcpDiagnosticEvent[] = [];
@@ -1166,6 +1182,7 @@ export async function completeLocalManagedMcpAuthorization(
       redirectUri: payload.redirectUri,
       code,
       authorizationId: state,
+      responseIssuer,
     });
     await verifyTools(config, payload.workspaceId, payload.name, payload.redirectUri, diagnostics);
     await writeManagedRuntimeEntry(config, payload.workspaceId, payload.name, true);

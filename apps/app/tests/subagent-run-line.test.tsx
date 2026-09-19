@@ -102,4 +102,26 @@ describe("SubagentRunLine", () => {
       failed: false,
     })).toBe("reconnecting");
   });
+
+  test("silence is not completion and cannot replace waiting, retrying, or disconnected status", () => {
+    const input = { permissionPending: false, inFlight: true, failed: false, noNewActivity: true };
+    expect(subagentRunActivity(input)).toBe("no-new-activity");
+    expect(subagentRunActivity({ ...input, questionPending: true })).toBe("waiting-question");
+    expect(subagentRunActivity({ ...input, retrying: true })).toBe("retrying");
+    expect(subagentRunActivity({ ...input, syncDegraded: true })).toBe("reconnecting");
+    expect(subagentRunActivity({ ...input, inFlight: false })).toBe("completed");
+  });
+
+  test("shows static uncertainty for a restored task whose native start is absent", () => {
+    const part = {
+      ...taskPart("input-streaming"),
+      toolCallId: "call-unknown-start",
+      callProviderMetadata: { opencode: { partId: "part-unknown-start" } },
+    };
+    const html = render(part);
+    expect(html).toContain('data-subagent-activity="waiting-start"');
+    expect(html).toContain("Waiting for task update");
+    expect(html).not.toContain("Working 0s");
+    expect(html).not.toContain("ow-text-shimmer");
+  });
 });

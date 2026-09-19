@@ -11,6 +11,17 @@ import type { ApprovalRequest, ServerConfig, TokenScope, WorkspaceInfo } from ".
 import { ensureDir, exists, shortId } from "../utils.js";
 import { addRoute, type RequestContext, type Route } from "./registry.js";
 
+/**
+ * Build a Content-Disposition header value that is safe for Unicode filenames.
+ * Uses RFC 6266 `filename*` (UTF-8 percent-encoded) with an ASCII fallback.
+ */
+function contentDisposition(disposition: "attachment" | "inline", filename: string): string {
+  // ASCII fallback: replace any non-ASCII character with '_'
+  const asciiName = filename.replace(/[^\x20-\x7E]/g, "_");
+  const encodedName = encodeURIComponent(filename);
+  return `${disposition}; filename="${asciiName}"; filename*=UTF-8''${encodedName}`;
+}
+
 const FILE_SESSION_DEFAULT_TTL_MS = 15 * 60 * 1000;
 const FILE_SESSION_MIN_TTL_MS = 30 * 1000;
 const FILE_SESSION_MAX_TTL_MS = 24 * 60 * 60 * 1000;
@@ -446,12 +457,25 @@ function normalizeResolvedRelativePath(input: string): string {
   return parts.join("/");
 }
 
-async function listWorkspaceCatalogEntries(workspaceRoot: string, excludeHeavyDirectories = false): Promise<FileSessionCatalogEntry[]> {
+async function listWorkspaceCatalogEntries(workspaceRoot: string, excludeHeavyDirectories = false) {
   const rootResolved = resolve(workspaceRoot);
   const items: FileSessionCatalogEntry[] = [];
+  const skippedDirectories: string[] = [];
 
   const walk = async (dirPath: string) => {
-    const entries = await readdir(dirPath, { withFileTypes: true });
+    const entries = await readdir(dirPath, { withFileTypes: true }).catch((error: unknown) => {
+      if (error instanceof Error && "code" in error && (error.code === "EACCES" || error.code === "EPERM")) {
+        if (dirPath === rootResolved) {
+          throw new ApiError(403, "workspace_permission_denied", "OpenWork does not have permission to list this workspace folder.");
+        }
+        skippedDirectories.push(relative(rootResolved, dirPath).replace(/\\/g, "/"));
+        return [];
+      }
+      if (dirPath === rootResolved && error instanceof Error && "code" in error && error.code === "ENOENT") {
+        throw new ApiError(404, "workspace_not_found", "The workspace folder no longer exists.");
+      }
+      throw error;
+    });
     entries.sort((a, b) => a.name.localeCompare(b.name));
 
     for (const entry of entries) {
@@ -463,7 +487,15 @@ async function listWorkspaceCatalogEntries(workspaceRoot: string, excludeHeavyDi
       const rel = normalizeResolvedRelativePath(relRaw);
 
       if (entry.isDirectory()) {
-        const info = await stat(absPath);
+        let info;
+        try {
+          info = await stat(absPath);
+        } catch (error: unknown) {
+          if (error instanceof Error && "code" in error && (error.code === "ENOENT" || error.code === "EACCES" || error.code === "EPERM")) {
+            continue;
+          }
+          throw error;
+        }
         items.push({
           path: rel,
           kind: "dir",
@@ -476,7 +508,15 @@ async function listWorkspaceCatalogEntries(workspaceRoot: string, excludeHeavyDi
       }
 
       if (!entry.isFile()) continue;
-      const info = await stat(absPath);
+      let info;
+      try {
+        info = await stat(absPath);
+      } catch (error: unknown) {
+        if (error instanceof Error && "code" in error && (error.code === "ENOENT" || error.code === "EACCES" || error.code === "EPERM")) {
+          continue;
+        }
+        throw error;
+      }
       items.push({
         path: rel,
         kind: "file",
@@ -487,12 +527,10 @@ async function listWorkspaceCatalogEntries(workspaceRoot: string, excludeHeavyDi
     }
   };
 
-  if (await exists(rootResolved)) {
-    await walk(rootResolved);
-  }
+  await walk(rootResolved);
 
   items.sort((a, b) => a.path.localeCompare(b.path));
-  return items;
+  return { items, skippedDirectories };
 }
 
 
@@ -579,7 +617,7 @@ export function registerFileRoutes(options: RegisterFileRoutesOptions): void {
     const headers = new Headers();
     headers.set("Content-Type", "application/octet-stream");
     headers.set("Content-Length", String(info.size));
-    headers.set("Content-Disposition", `attachment; filename=\"${basename(relativePath)}\"`);
+    headers.set("Content-Disposition", contentDisposition("attachment", basename(relativePath)));
     const stream = Readable.toWeb(createReadStream(absPath)) as unknown as ReadableStream;
     return new Response(stream, { status: 200, headers });
   });
@@ -669,7 +707,7 @@ export function registerFileRoutes(options: RegisterFileRoutesOptions): void {
     const headers = new Headers();
     headers.set("Content-Type", "application/octet-stream");
     headers.set("Content-Length", String(info.size));
-    headers.set("Content-Disposition", `attachment; filename="${basename(relativePath)}"`);
+    headers.set("Content-Disposition", contentDisposition("attachment", basename(relativePath)));
     const stream = Readable.toWeb(createReadStream(absPath)) as unknown as ReadableStream;
     return new Response(stream, { status: 200, headers });
   });
@@ -717,7 +755,7 @@ export function registerFileRoutes(options: RegisterFileRoutesOptions): void {
     const limit = parseCatalogLimit(ctx.url.searchParams.get("limit"));
     const excludeHeavyDirectories = ctx.url.searchParams.get("excludeHeavyDirectories") === "true";
 
-    const entries = await listWorkspaceCatalogEntries(workspace.path, excludeHeavyDirectories);
+    const { items: entries, skippedDirectories } = await listWorkspaceCatalogEntries(workspace.path, excludeHeavyDirectories);
     const filtered = entries.filter((entry) => {
       if (!includeDirs && entry.kind === "dir") return false;
       if (!matchesCatalogFilter(entry.path, prefix)) return false;
@@ -736,6 +774,8 @@ export function registerFileRoutes(options: RegisterFileRoutesOptions): void {
       generatedAt: Date.now(),
       cursor: events.cursor,
       total: filtered.length,
+      incomplete: skippedDirectories.length > 0,
+      skippedDirectories,
       truncated,
       nextAfter,
       items,
@@ -897,7 +937,7 @@ export function registerFileRoutes(options: RegisterFileRoutesOptions): void {
     const headers = new Headers();
     headers.set("Content-Type", contentTypeForPath(relativePath));
     headers.set("Content-Length", String(info.size));
-    headers.set("Content-Disposition", `inline; filename="${basename(relativePath)}"`);
+    headers.set("Content-Disposition", contentDisposition("inline", basename(relativePath)));
     const stream = Readable.toWeb(createReadStream(absPath)) as unknown as ReadableStream;
     return new Response(stream, { status: 200, headers });
   });

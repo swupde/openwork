@@ -10,7 +10,6 @@ const workflowPaths = [
   ".github/workflows/ci-enterprise-mcp-mock.yml",
   ".github/workflows/den-db-check.yml",
   ".github/workflows/ci-i18n.yml",
-  ".github/workflows/spec-impact.yml",
 ]
 const expectedConcurrency = [
   "concurrency:",
@@ -21,6 +20,7 @@ const expectedConcurrency = [
 test("PR validation workflows cancel superseded runs without cancelling branch pushes", async () => {
   for (const workflowPath of workflowPaths) {
     const workflow = await readFile(path.join(repoRoot, workflowPath), "utf8")
+    assert.equal((workflow.match(/^concurrency:$/gm) || []).length, 1, `${workflowPath} must have one concurrency mapping`)
     for (const line of expectedConcurrency) {
       assert.ok(workflow.includes(line), `${workflowPath} is missing ${line}`)
     }

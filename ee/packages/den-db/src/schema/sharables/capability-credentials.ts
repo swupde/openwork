@@ -4,6 +4,7 @@ import {
   index,
   mysqlEnum,
   mysqlTable,
+  text,
   timestamp,
   uniqueIndex,
   varchar,
@@ -170,6 +171,7 @@ export const ExternalMcpConnectionTable = mysqlTable(
       "organization_id",
     ).notNull(),
     name: varchar("name", { length: 255 }).notNull(),
+    externalKey: varchar("external_key", { length: 128 }),
     url: varchar("url", { length: 2048 }).notNull(),
     authType: mysqlEnum("auth_type", externalMcpAuthTypeValues).notNull(),
     /**
@@ -229,7 +231,7 @@ export const ExternalMcpConnectionTable = mysqlTable(
     accessToken: encryptedTextColumn("access_token"),
     refreshToken: encryptedTextColumn("refresh_token"),
     tokenType: varchar("token_type", { length: 64 }),
-    scope: varchar("scope", { length: 1024 }),
+    scope: text("scope"),
     expiresAt: timestamp("expires_at", { fsp: 3 }),
     /**
      * Transient PKCE code verifier, present only between connect/start and
@@ -255,6 +257,10 @@ export const ExternalMcpConnectionTable = mysqlTable(
   },
   (table) => [
     index("external_mcp_connection_organization_id").on(table.organizationId),
+    uniqueIndex("external_mcp_connection_org_external_key").on(
+      table.organizationId,
+      table.externalKey,
+    ),
   ],
 )
 

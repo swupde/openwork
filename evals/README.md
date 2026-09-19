@@ -25,7 +25,7 @@ Demo-driven features start from a world script plus a spec in `evals/specs`.
 | substrate | What runs the Den control plane: local processes or `kind`. |
 | witness | A deterministic provider stand-in that records what it saw. |
 | fault | Declared misbehavior used to reproduce a failure condition. |
-| surface | A drivable UI: Electron, or Chrome on Den Web. |
+| surface | A drivable UI: `appWeb` (the app in headless Chrome), `desktop` (Electron), or `web` (Den UI in Chrome). |
 | origin | Whether a resource is launched or attached. See below. |
 | live | A spec attached to a live shared substrate; red is an incident signal about the service, not a verdict on the diff. |
 
@@ -45,15 +45,13 @@ Skills own mechanics; this README owns the map and vocabulary.
 | Task | Skill to load | When |
 | --- | --- | --- |
 | Author a spec | `write-a-spec` | Add executable coverage under `evals/specs`. |
-| Run tests | `run-tests` | Run a selected testkit spec locally or on Daytona. |
+| Run tests | `run-tests` | Run a selected spec; the CLI chooses and reports placement. |
 | Failing or red run | `diagnose-a-red-run` | Classify a failure before changing code. |
-| Publish evidence | `publish-evidence` | Publish an existing ambient evidence run. |
-| Declare a PR verdict | `prove-a-pr` | Decide Passed, Incomplete, or Failed from assertions. |
+| Publish evidence or declare a PR verdict | `publish-evidence` | Judge and publish an existing ambient evidence run. |
 | Missing secret or environment variable | `get-env-var` | Load a required team secret into the shell. |
 | Drive local Electron via CDP | `browser-automation` | Explore or debug the local desktop surface. |
-| Daytona E2E | `daytona-electron-test` | Launch and drive Electron in Daytona. |
-| Daytona server or Den setup | `daytona-cloud-server` | Prepare the server-side Daytona sandbox. |
-| Provider keys in Daytona | `daytona-secrets-volume` | Use provider credentials from the Daytona secrets volume. |
+| Daytona setup or sandbox debugging | `daytona` | Repair the CLI, snapshots, sandboxes, or secrets volume. |
+| Demo artifacts | `record-a-demo` | Capture supplementary screenshots or recordings. |
 
 ## Install and run
 
@@ -66,16 +64,84 @@ pnpm evals:pr
 pnpm evals:e2e app-smoke
 ```
 
+`pnpm --dir evals typecheck` (also `pnpm evals:typecheck`) type-checks every
+spec, world, driver, script, and package under `evals/` and must exit 0 (run it
+before pushing; the CI step lands separately). It compiles with the bundler resolution Vitest
+uses and reports only diagnostics that belong to `evals/` (or to files the
+config includes explicitly), because the `apps/` and `ee/` sources a spec pulls
+in are compiled by their own projects with their own flags. Nothing inside
+`evals/` is filtered: a spec that no longer matches the testkit API is red here.
+
 ### E2E CLI
 
 Run the E2E lane with `pnpm evals:e2e [test-names...]`. Naming a test
 auto-satisfies the opt-in flags declared in its source, but value-bearing
 environment variables such as `OPENWORK_EVAL_MODEL` are never auto-set. Vision
 judging is deferred by default; add `--with-llm-vision` to judge inline. Use
-`--local` to force isolated local resources, `--daytona` for Daytona resources,
+`--local` to force isolated local resources, `--daytona` to require Daytona,
 `--den <url>` to reuse Den, or `--publish --pr <number>` to judge and publish
-existing evidence. Without a placement flag, the CLI preserves the ambient
-placement environment.
+existing evidence. Without a placement flag, the CLI probes Daytona auth and
+prints `placement: <daytona|local> (<reason>)` for the placement asserted in the
+runtime environment. `--local` and `--daytona` override inherited placement;
+transport, engine, and surface selectors are never inferred as source opt-ins.
+
+Registered cases select a concrete world and can select their engine without
+raw environment variables. `CONT-01` and `SWITCH-10` are fixed headless app-web
+worlds. Use `pnpm evals:e2e --list` to see the registered cases. The legacy
+`--surface` selector is migration validation only: it cannot change a declared
+world's implementation, and selecting Electron for either case is rejected.
+
+```bash
+pnpm evals:e2e streamed-markdown-answer --local --engine v2 --case CONT-01
+pnpm evals:e2e live-tool-visible-after-session-switch --daytona --engine v1 --case SWITCH-10
+```
+
+A focused web case avoids legacy Den/Electron suite preparation, but still
+boots the real Vite app, server, engine, and Chrome; install dependencies first.
+This fast path is not a guarantee for the duration of a first cold install.
+Explicit `--local` placement cannot be overridden by source consent or inherited
+Daytona settings. `--daytona` uses provided slot environment as advanced
+configuration, runs one selected case per sandbox, and checks the immutable
+ref/source guard before launch.
+
+Under Daytona the spec files run from this checkout while the sandbox builds
+`OPENWORK_EVAL_REF` (default `dev`). The CLI resolves that ref against `origin`,
+appends `ref=<ref>` to the placement line, and warns on stderr when it differs
+from the runner `HEAD`; `--strict-ref` (or `OPENWORK_EVAL_STRICT_REF=1`) turns
+the warning into a failure before any sandbox is provisioned. Evidence records
+both commits: `gitSha` is the runner checkout and `sandboxRef` is the ref the
+sandbox built. To test a branch, push it and export
+`OPENWORK_EVAL_REF=$(git rev-parse HEAD)`.
+
+`--case` filters Vitest by the registered literal case prefix. A passing result
+means that selected case passed; other cases in the file are reported as not
+run. A selected skip, unknown result, zero matches, or missing JSON report is
+incomplete; any non-selected case that executes is a contract failure.
+Daytona slot IDs and refs remain advanced environment configuration.
+
+### Bounded world migration
+
+The audited migration covers only `CONT-01` (`chatStreamContinuityWeb`) in
+`specs/streamed-markdown-answer.e2e.test.ts` and `SWITCH-10`
+(`sessionSwitchLatencyWeb`) in
+`specs/live-tool-visible-after-session-switch.e2e.test.ts`. Each binding declares
+`resources: { surfaces: ["appWeb"], services: ["mock"] }` and boots through
+`seed.appWeb`, whose default is `headless: true`. Neither world reads surface
+or headless environment selectors. CONT-01 tests ordinary app UI and has no
+native variant.
+
+Both cases assert the runtime user agent contains `HeadlessChrome`, that the
+Electron bridge is absent, and that the app origin, server health, and selected
+engine routes match the fixture. Source SHA metadata is recorded and checked
+when available (required on Daytona); this is not a full source receipt or
+proof of uncommitted source contents.
+
+The other cases and legacy worlds in these mixed files, including
+`streamedMarkdown`, `streamedToolHistory`, and the existing live-tool switching
+setup, are untouched and explicitly deferred. Shared `worlds/chat.ts` and the
+rest of the legacy world inventory are outside this bounded migration. Running
+an entire mixed file still includes its legacy setup; selecting a migrated case
+does not certify or migrate the other cases.
 
 | Exit | Named test | Unfiltered E2E suite | Publish |
 | --- | --- | --- | --- |
@@ -84,6 +150,9 @@ placement environment.
 | `2` | Incomplete because it skipped | Not used | Claims pending judgment |
 
 See `run-tests` for environment requirements and the cold-boot verdict check.
+
+Every `evals/specs/*.e2e.test.ts` file on disk runs in the E2E lane. To stop a
+spec from running, delete it; history keeps the removed test available.
 
 ### Live lane
 
@@ -107,6 +176,14 @@ self-service deletion endpoint) must be documented with exact identities.
 
 ## Authoring contract
 
+The spec boundary ratchet (`scripts/spec-boundary-ratchet.mjs`) rejects new
+files that import product source (`../../apps|packages|ee`) or that never cross
+a product boundary (`app()`, `chrome()`, `server()`, `spec.world()`, or a
+world import); a file with no boundary is also called out for `node:fs` and
+`node:child_process`. Its `specs/boundary-ratchet.baseline.json`
+grandfathers legacy files and only shrinks. Cleanup deletes them, moves unit
+tests next to their module, or folds their assertions into a journey spec.
+
 - Import `test` from `@openwork/testkit`.
 - Name app-driving files `<slug>.e2e.test.ts`; app-less tests use `<slug>.test.ts`.
 - Live specs use `<slug>.live.test.ts`, never run in PR/E2E suites, and require a consent environment variable.
@@ -116,6 +193,131 @@ self-service deletion endpoint) must be documented with exact identities.
 - Bound every wait and declare external requirements in `needs()` so missing
   dependencies skip with a named reason.
 - Assert both positive and negative sides of identity or permission boundaries.
+
+## Writing specs
+
+New app-driving specs use `spec.world()` and four capability-restricted
+channels. Import them only from `@openwork/testkit`.
+
+| Channel | Purpose | Allowed effects |
+| --- | --- | --- |
+| `seed` | Arrange the world | Create Den, desktops, browsers, data, mocks, sessions, and faults; this is the only API/state write channel. |
+| `user` | Act as a person | Trusted CDP mouse, keyboard, navigation, reload, visible assertions, screenshots, and vision checks. It cannot evaluate JS, fetch, or use app controls. |
+| `agent` | Use the product automation rail | Explicit `window.__openworkControl` actions, including agent sends and session actions. |
+| `probe` | Observe without changing state | Read text, composer/storage/hash/API/witness state, and poll with `eventually`. Probe API calls are GET-only. |
+
+A world is an imperative async function. Resources created through `seed` are
+owned by the fixture's `AsyncDisposableStack` and released in reverse order.
+Worlds are per-test by default; `{ scope: "file" }` shares exactly the handles
+the world returns. E2E files automatically need
+`OPENWORK_EVAL_E2E_TESTS=1`, and unmet needs skip before the world starts.
+
+```ts
+export async function emptySession(seed: Seed) {
+  const workspacePath = seed.tmpPath("empty-session");
+  const app = await seed.appWeb({ workspacePath });
+  await seed.workspace(app, workspacePath);
+  await seed.session(app);
+  return { app };
+}
+```
+
+Ordinary app UI authoring defaults to `seed.appWeb({ workspacePath })` (headless Chrome, the real
+app, server, and engine). Bind the world's resources explicitly at `spec.world`:
+
+```ts
+const test = spec.world(emptySession, {
+  resources: { surfaces: ["appWeb"], services: [] },
+});
+```
+
+Use `seed.desktop()` only for a native capability a browser cannot prove, and
+explain that capability in the binding's `nativeReason`, for example:
+
+```ts
+const nativeTest = spec.world(nativeFileDialog, {
+  resources: {
+    surfaces: ["desktop"],
+    services: [],
+    nativeReason: "Verify the operating-system file dialog opened through the Electron bridge.",
+  },
+});
+```
+
+Surfaces, services, and placement are separate: declare `den` and `mock` under
+`services` when the world creates them; choose local or Daytona with the runner's
+placement flags. `seed.web()` drives **Den UI**, not the app, and requires
+`surfaces: ["web"]` plus `services: ["den"]`. For declared worlds, the resource
+guard refuses an undeclared surface or service before launch, and a desktop
+declaration requires a non-empty `nativeReason`. Undeclared legacy worlds are
+temporarily allowed within the deferred migration scope; that compatibility is
+not the authoring default.
+
+`app` and `web` are conventional primary surface names. If the returned world
+has one of them (or exactly one surface), channel calls use it by default;
+otherwise bind explicitly with `user.on(surface)`, `agent.on(surface)`, or
+`probe.on(surface)`.
+
+Use `step(name, fn)` for a claim-sized frame. Steps may nest; failures are
+recorded and rethrown, and a later attempted step is marked `not-reached`.
+Every channel call and step automatically contributes a chronological evidence
+trace and the body wrapper records the passed, failed, or skipped outcome.
+
+The body call-order rule prevents accidental setup disguised as user behavior:
+`seed.*` before the first `user.*` or `agent.*` act throws. Put that setup in the
+world. Mid-flow seeding after an act is explicit and allowed; probes do not
+change the ordering state.
+
+`seed.evalIn()` (`[seed:raw]`) and `probe.eval()` (`[probe:raw]`) are migration
+escape hatches. Both take type-checked browser callbacks and await promises automatically.
+`probe.eval` accepts `{ timeoutMs?: number }` after either `(callback)` or
+`(surface, callback)`. Raw JavaScript strings are rejected. New specs must not use them. The channel ratchet
+records current legacy usage per E2E file and fails on increases or stale
+baseline entries.
+
+Before, composer reload coverage imported hosts, behaviors, CDP evaluation, and
+evidence APIs directly. After, the journey is only:
+
+```ts
+const test = spec.world(emptySession, {
+  resources: { surfaces: ["appWeb"], services: [] },
+});
+test("a draft survives reloads", async ({ user, probe, step }) => {
+  await user.type("composer", "Keep this draft");
+  const revision = await probe.storage("openwork.session-drafts.v2", pickRevision);
+  await step("draft survives three reloads", async () => {
+    for (let i = 0; i < 3; i += 1) {
+      await user.reload();
+      await user.see("composer", { editable: true, text: "Keep this draft" });
+    }
+  });
+  expect(await probe.storage("openwork.session-drafts.v2", pickRevision)).toBe(revision);
+});
+```
+
+`"composer"` is the documented well-known target for the Lexical
+`[contenteditable="true"][data-lexical-editor="true"]` editor. Other targets use
+accessible name, role, label, placeholder, test ID, and optional `nth`; `text`
+and `label` accept strings or regular expressions. A unique visible element
+whose inner text starts with a string is the fallback for a non-exact text/name
+match.
+
+`user.type(target, text)` appends by default. Pass `{ replace: true }` to focus
+with a real click, select all with the platform key chord, and replace the
+current value. `user.see(target, { text })` compares contenteditable inner text
+and accepts a string or regular expression. Clicks require center-point hit
+testing; `{ hitTest: false }` is a last resort for an intentionally covered
+target and still performs a trusted CDP click at that element's center.
+
+`probe.dom(selector)` reads a fixed DOM snapshot: matching elements in document
+order with text, focus and rectangles, plus viewport/document widths. It never
+returns input values or accepts executable callbacks. Use it for geometry and
+focus assertions after trusted `user.press("Tab")` actions, rather than raw eval.
+
+Worlds can arrange a shaped Den connection with `seed.denLink(den, options)`;
+the returned link is fixture-owned. `probe.connectState(app)` reads the
+testkit's normalized desktop Connect state without exposing the raw helper to a
+spec.
 
 ## Layers
 
@@ -316,12 +518,20 @@ without that origin, Better Auth rejects eval sign-in with
 
 ## Daytona E2E tests
 
-Use the maintained Daytona setup from `run-tests`, then run a selected test
-through the E2E CLI:
+Run a selected test through the E2E CLI:
 
 ```bash
-pnpm evals:e2e app-smoke --daytona
+pnpm evals:e2e app-smoke
 ```
+
+Without a placement flag, the CLI uses Daytona when `daytona snapshot list`
+succeeds and local otherwise, then prints the placement and reason. `--daytona`
+requires Daytona; `--local` forces local.
+
+Use `--engine v1|v2` for a named spec. A registered `--case` selects its concrete
+world; the migrated cases use headless app-web on either placement. Legacy cases
+in files run without `--case` retain their existing environment-driven behavior.
+The test-evidence header records the selected engine.
 
 Use direct CDP tools only to explore or debug. Convert repeatable coverage into
 a testkit test.
@@ -362,3 +572,88 @@ The low-level escape hatch available today is
 existing Den at the `server()` level and is called `reuse` in current code.
 Attached mode has no `apiLog()` and does not support `seedProfile`. Locally
 launched mocks are loopback-only and therefore unreachable from a remote Den.
+
+## Daytona reference
+
+### Ports
+
+| Service | Port |
+| --- | ---: |
+| noVNC | 6080 |
+| Vite HMR | 5173 |
+| Electron CDP | 9825 |
+| Den Web | 3005 |
+| Den API | 8788 |
+| Worker proxy | 8789 |
+| Artifacts | 8090 |
+| MySQL (internal) | 3306 |
+
+### Electron UI selectors
+
+| Control | Stable selector/search | Source |
+| --- | --- | --- |
+| Settings | `[data-testid="account-status-menu"]`, then `Settings` | `domains/session/sidebar/account-status-menu.tsx` |
+| Back to app | button text `Back to app` | `domains/settings/shell/settings-shell.tsx` |
+| New task | `button[aria-label="New task"]` | `domains/session/sidebar/app-sidebar.tsx` |
+| Run task | button text `Run task` | `domains/session/surface/composer/composer.tsx` |
+| Model selector | `button[aria-label="Change model"]` | `domains/session/surface/composer/composer.tsx` |
+| Composer | `[contenteditable="true"][data-lexical-editor="true"]` | `domains/session/surface/composer/editor.tsx` |
+| AI Providers | button text `AI Providers` | `domains/settings/shell/settings-page.tsx` |
+| Connect provider | button text `Connect provider` | `domains/settings/pages/ai-view.tsx` |
+| Provider search | `input[placeholder="Filter providers by name or ID"]` | `domains/connections/provider-auth/provider-auth-modal.tsx` |
+| Manual key | button containing `Manually enter API Key` | `provider-auth-modal.tsx` |
+| API key | `input[type="password"][placeholder="sk-..."]` | `provider-auth-modal.tsx` |
+| Save key | button text `Save key` | `provider-auth-modal.tsx` |
+
+### Lexical composer typing
+
+```js
+const editor = document.querySelector('[contenteditable="true"][data-lexical-editor="true"]')
+editor.focus()
+document.execCommand("selectAll", false, null)
+document.execCommand("insertText", false, "YOUR PROMPT HERE")
+```
+
+### Two-sandbox Den + Electron
+
+```bash
+bash .devcontainer/test-server-on-daytona.sh <ref>
+bash .devcontainer/test-on-daytona.sh <ref> \
+  --den-base-url <DEN_WEB_URL> \
+  --den-api-base-url <DEN_API_URL>
+```
+
+
+### Type-checked browser code
+
+Use the existing user/locator helpers for ordinary interaction. When an existing
+probe needs browser-only logic, author a self-contained TypeScript callback:
+
+```ts
+const fits: boolean = await probe.eval(
+  () => document.documentElement.scrollWidth <= window.innerWidth,
+);
+const count: number = await probe.eval(browserScript(
+  (selector) => document.querySelectorAll(selector).length,
+  ["[data-message-role=assistant]"],
+));
+```
+
+Import `browserScript` from `@openwork/testkit` in specs and `@openwork/cdp` in
+worlds and lower layers. It binds explicit serializable arguments; browser code
+cannot capture test variables or imported runtime helpers. Return plain data,
+not elements or functions. API JSON remains `unknown` where the contract is
+unknown; validate it before relying on a shape.
+
+For code that must run before navigation, worlds use
+`addInitScript(client, browserScript(callback, [args]))`. Its `dispose()` and
+`Symbol.asyncDispose` remove the registration for future documents; an observer
+already running in the current page still needs its own cleanup.
+
+`pnpm evals:check-browser` checks browser callback bodies, argument/result types,
+closure captures (including imported aliases), and raw CDP execution bypasses.
+It runs in the test-framework CI command. Unlike running a TypeScript test,
+this invokes the TypeScript checker, scoped to browser callback bodies and the
+CDP browser-script modules. `pnpm --dir evals typecheck` (see Install and run)
+checks everything else under `evals/`; neither claims that the unrelated `apps/`
+or `ee/` projects a spec imports compile under evals flags.

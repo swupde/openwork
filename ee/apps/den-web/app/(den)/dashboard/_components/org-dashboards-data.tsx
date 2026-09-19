@@ -45,6 +45,8 @@ export type ConnectionMcpApp = DashboardElement & {
   connectionId: string;
   description: string | null;
   requiresInput: boolean;
+  /** Launch-input keys the tool's input schema marks required. */
+  requiredInputKeys: string[];
   requiresApproval: boolean;
 };
 
@@ -167,6 +169,9 @@ function parseConnectionApp(value: unknown): ConnectionMcpApp | null {
     connectionId: element.connectionId,
     description: readString(value.description),
     requiresInput: value.requiresInput === true,
+    requiredInputKeys: Array.isArray(value.requiredInputKeys)
+      ? value.requiredInputKeys.filter((key): key is string => typeof key === "string" && key.length > 0)
+      : [],
     requiresApproval: value.requiresApproval === true,
   };
 }
@@ -261,10 +266,10 @@ export function useUpdateDashboard() {
       });
       return input.dashboardId;
     },
-    onSuccess: (dashboardId) => {
-      queryClient.invalidateQueries({ queryKey: orgDashboardsQueryKeys.list(organizationId) });
-      queryClient.invalidateQueries({ queryKey: orgDashboardsQueryKeys.detail(organizationId, dashboardId) });
-    },
+    onSuccess: (dashboardId) => Promise.all([
+      queryClient.invalidateQueries({ queryKey: orgDashboardsQueryKeys.list(organizationId) }),
+      queryClient.invalidateQueries({ queryKey: orgDashboardsQueryKeys.detail(organizationId, dashboardId) }),
+    ]),
   });
 }
 

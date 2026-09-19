@@ -5,15 +5,27 @@ import { createDenTypeId } from "@openwork-ee/utils/typeid"
 import type { Hono, MiddlewareHandler } from "hono"
 import { describeRoute } from "hono-openapi"
 import { z } from "zod"
-import { organizationCloudEnabled } from "../../capability-sources/cloud-rollout.js"
+import { cloudHostingAvailable } from "../../capability-sources/cloud-hosting.js"
 import { db } from "../../db.js"
 import { env, type DenOrgMode } from "../../env.js"
 import { orgMemberRoute } from "../../middleware/index.js"
 import { jsonResponse, notFoundSchema, unauthorizedSchema } from "../../openapi.js"
 import { materializeCloudWorkerProviders } from "../../llm/cloud-provider-materialization.js"
-import { getOpenWorkWebBillingSummary } from "../../stripe-billing.js"
-import { currentDaytonaSandboxName, flushWorkerCheckpointOnDaytona, getDaytonaSandboxRecord, inspectDaytonaSandbox, refreshDaytonaSignedPreview, stopWorkerOnDaytona } from "../../workers/daytona.js"
+import {
+  getOpenWorkWebRuntimeAccess,
+  openWorkWebAccessRequiredPayload,
+  type OpenWorkWebRuntimeAccessResolver,
+} from "../../openwork-web-runtime-access.js"
 import { CLOUD_INSTANCE_BACKEND, CLOUD_INSTANCE_NAME } from "../../workers/cloud-constants.js"
+import { currentInstanceName } from "@openwork-ee/cloud-runtime/orchestrator"
+import {
+  cloudRuntimeAvailable,
+  cloudRuntimeOrchestratorConfig,
+  cloudRuntimeStore,
+  currentCloudImageVersion,
+  getCloudRuntime,
+  type CloudRuntimeAvailabilityOptions,
+} from "../../workers/cloud-runtime.js"
 import { recoverClaimedCloudWorker as defaultRecoverCloudWorker, wakeCloudWorker as defaultWakeCloudWorker } from "../../workers/cloud-lifecycle.js"
 import {
   probeCloudRuntimeSignedPreview,
@@ -35,14 +47,12 @@ import {
 import type { OrgRouteVariables } from "../org/shared.js"
 import { continueCloudProvisioning, token } from "../workers/shared.js"
 
-type CloudRouteOptions = {
+type CloudRouteOptions = CloudRuntimeAvailabilityOptions & {
   memberRoute?: MiddlewareHandler<{ Variables: OrgRouteVariables }>
   orgMode?: DenOrgMode
-  provisionerMode?: "stub" | "render" | "daytona"
-  daytonaApiKey?: string
   gatewayKey?: string
   continueProvisioning?: typeof continueCloudProvisioning
-  refreshSignedPreview?: typeof refreshDaytonaSignedPreview
+  refreshSignedPreview?: RefreshSignedPreview
   cloudWorkerStore?: CloudWorkerStore
   ensureCloudWorker?: EnsureCloudWorker
   getSandboxRecord?: GetSandboxRecord
@@ -53,7 +63,7 @@ type CloudRouteOptions = {
   flushWorkerCheckpoint?: FlushWorkerCheckpoint
   stopCloudWorker?: StopCloudWorker
   materializeProviders?: typeof materializeCloudWorkerProviders
-  getOpenWorkWebAccess?: (organizationId: OrgId) => Promise<{ hasAccess: boolean }>
+  getOpenWorkWebAccess?: OpenWorkWebRuntimeAccessResolver
   now?: () => number
 }
 
@@ -108,6 +118,7 @@ type EnsureCloudWorker = (input: {
   store: CloudWorkerStore
 }) => Promise<CloudWorker>
 type GetSandboxRecord = (workerId: CloudWorker["id"]) => Promise<CloudSandboxRecord | null>
+type RefreshSignedPreview = (workerId: CloudWorker["id"]) => Promise<CloudSandboxRecord | null>
 type InspectSandbox = (workerId: CloudWorker["id"]) => Promise<CloudSandboxInspection>
 type ProbeSignedPreview = typeof probeCloudRuntimeSignedPreview
 type WakeCloudWorker = (workerId: CloudWorker["id"]) => Promise<void>
@@ -171,15 +182,7 @@ function cloudNotFound() {
   return { error: "cloud_not_found" }
 }
 
-function openWorkWebAccessRequired() {
-  return {
-    error: "openwork_web_access_required" as const,
-    message: "OpenWork Web access is not active for this organization.",
-  }
-}
-
 const logger = appLogger.child({ component: "cloud_routes" })
-const cloudWorkerNameMaxLength = 255
 const gatewayKeyHeader = "X-OpenWork-Gateway-Key"
 const ensureCloudWorkerInFlight = new Map<string, Promise<CloudWorker>>()
 
@@ -216,38 +219,6 @@ function changedRows(result: unknown): number | null {
 function hasChangedRows(result: unknown) {
   const rows = changedRows(result)
   return rows !== null && rows > 0
-}
-
-function truncateForWorkerName(value: string) {
-  return Array.from(value).slice(0, cloudWorkerNameMaxLength).join("").trim()
-}
-
-function emailLocalPart(email: string | null | undefined) {
-  const trimmed = email?.trim() ?? ""
-  if (!trimmed) {
-    return null
-  }
-
-  return trimmed.split("@")[0]?.trim() || trimmed
-}
-
-function displayNameForCloudWorker(payload: NonNullable<OrgRouteVariables["organizationContext"]>, user: CloudRouteUser) {
-  const member = payload.members.find((entry) => entry.userId === payload.currentMember.userId) ?? null
-  const memberName = member?.user.name.trim()
-  if (memberName) {
-    return memberName
-  }
-
-  const userName = user.name?.trim()
-  if (userName) {
-    return userName
-  }
-
-  return emailLocalPart(member?.user.email) ?? emailLocalPart(user.email) ?? "member"
-}
-
-function cloudWorkerName(payload: NonNullable<OrgRouteVariables["organizationContext"]>, user: CloudRouteUser) {
-  return truncateForWorkerName(`${CLOUD_INSTANCE_NAME} — ${displayNameForCloudWorker(payload, user)}`)
 }
 
 function ensureKey(orgId: OrgId, userId: UserId) {
@@ -351,13 +322,13 @@ const databaseCloudWorkerStore: CloudWorkerStore = {
   },
 }
 
-function hasDaytonaProvisioner(options: CloudRouteOptions) {
-  const apiKey = options.daytonaApiKey !== undefined ? options.daytonaApiKey : env.daytona.apiKey
-  return (options.provisionerMode ?? env.provisionerMode) === "daytona" && Boolean(apiKey?.trim())
-}
-
+// Deployment-level availability only. The single-org and no-provisioner 404s
+// are unchanged from the retired per-organization rollout gate, which also
+// returned false outside multi_org; organization entitlement is the separate
+// Web access check on each execution route.
 function cloudAvailable(payload: NonNullable<OrgRouteVariables["organizationContext"]>, options: CloudRouteOptions) {
-  return organizationCloudEnabled(payload.organization.metadata, { orgMode: options.orgMode ?? env.orgMode }) && hasDaytonaProvisioner(options)
+  return cloudHostingAvailable({ orgMode: options.orgMode ?? env.orgMode })
+    && cloudRuntimeAvailable({ provisionerMode: options.provisionerMode, daytonaApiKey: options.daytonaApiKey })
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -491,32 +462,45 @@ async function ensureCloudWorker(input: {
   return promise
 }
 
-function workerNeedsUserRequestedUpdate(worker: CloudWorker) {
-  const snapshot = env.daytona.snapshot
-  return Boolean(snapshot && (worker.image_version ?? null) !== snapshot)
+/** Share the browser's member-scoped creation and race handling with MCP. */
+export function ensureMemberCloudWorker(input: { orgId: OrgId; createdByUserId: UserId }) {
+  return ensureCloudWorker({
+    ...input,
+    name: CLOUD_INSTANCE_NAME,
+    continueProvisioning: continueCloudProvisioning,
+    store: databaseCloudWorkerStore,
+  })
 }
 
-function isRunningSandboxState(state: string | null) {
-  const normalized = state?.toLowerCase() ?? ""
-  return normalized === "running" || normalized === "started"
+type CurrentImageVersion = () => string | null
+
+function workerNeedsUserRequestedUpdate(worker: CloudWorker, imageVersion: string | null) {
+  return Boolean(imageVersion && (worker.image_version ?? null) !== imageVersion)
 }
 
-function isStoppedSandboxState(state: string | null) {
-  return state?.toLowerCase() === "stopped"
+function isRunningSandboxState(inspection: CloudSandboxInspection) {
+  return inspection?.state === "running"
 }
 
-function cloudInstanceName(worker: CloudWorker, sandbox: CloudSandboxRecord | null) {
-  if (!sandbox) return null
-  const storedName = sandbox.sandbox_id?.trim() ?? ""
+function isStoppedSandboxState(inspection: CloudSandboxInspection) {
+  return inspection?.state === "stopped"
+}
+
+function cloudInstanceName(worker: CloudWorker, sandbox: CloudSandboxRecord | null, imageVersion: string | null) {
+  if (!sandbox?.sandbox) return null
+  const storedName = sandbox.sandbox.ref.sandboxId?.trim() ?? ""
   if (storedName) return storedName
-  if ("sandbox_id" in sandbox) {
-    return currentDaytonaSandboxName({ workerId: worker.id, name: worker.name })
-  }
-  return null
+  return currentInstanceName(cloudRuntimeOrchestratorConfig().instanceNamePrefix, { workerId: worker.id, name: worker.name }, imageVersion)
 }
 
-function memberCloudInstanceResponse(worker: CloudWorker, instance: CloudRuntimeState, sandbox: CloudSandboxRecord | null): CloudInstanceMemberResponse {
-  const instanceName = cloudInstanceName(worker, sandbox)
+function memberCloudInstanceResponse(
+  worker: CloudWorker,
+  instance: CloudRuntimeState,
+  sandbox: CloudSandboxRecord | null,
+  currentImageVersion: CurrentImageVersion,
+): CloudInstanceMemberResponse {
+  const latestVersion = currentImageVersion()
+  const instanceName = cloudInstanceName(worker, sandbox, latestVersion)
   const failure = instance.status === "ready"
     ? null
     : instance.failure ?? cloudStartupFailureFromWorker(worker)
@@ -525,7 +509,7 @@ function memberCloudInstanceResponse(worker: CloudWorker, instance: CloudRuntime
     url: instance.url,
     imageVersion: worker.image_version ?? null,
     ...(instanceName ? { instanceName } : {}),
-    latestVersion: env.daytona.snapshot ?? null,
+    latestVersion,
     ...(failure ? { failure: publicCloudStartupFailure(failure) } : {}),
   }
 }
@@ -534,7 +518,7 @@ async function resolveCloudInstanceForMember(input: {
   payload: NonNullable<OrgRouteVariables["organizationContext"]>
   user: CloudRouteUser
   continueProvisioning: typeof continueCloudProvisioning
-  refreshSignedPreview: typeof refreshDaytonaSignedPreview
+  refreshSignedPreview: RefreshSignedPreview
   store: CloudWorkerStore
   ensureWorker: EnsureCloudWorker
   getSandboxRecord: GetSandboxRecord
@@ -543,12 +527,13 @@ async function resolveCloudInstanceForMember(input: {
   startWake: (workerId: CloudWorker["id"]) => void
   startRecovery: (workerId: CloudWorker["id"]) => void
   now: () => number
+  currentImageVersion: CurrentImageVersion
   forceFailedRecovery?: boolean
 }) {
   const worker = await input.ensureWorker({
     orgId: input.payload.organization.id,
     createdByUserId: input.user.id,
-    name: cloudWorkerName(input.payload, input.user),
+    name: CLOUD_INSTANCE_NAME,
     continueProvisioning: input.continueProvisioning,
     store: input.store,
   })
@@ -564,6 +549,7 @@ async function resolveCloudInstanceForMember(input: {
     startRecovery: input.startRecovery,
     store: input.store,
     now: input.now,
+    currentImageVersion: input.currentImageVersion,
     forceFailedRecovery: input.forceFailedRecovery,
   })
 
@@ -576,12 +562,13 @@ async function requestCloudInstanceUpdate(input: {
   inspectSandbox: InspectSandbox
   flushWorkerCheckpoint: FlushWorkerCheckpoint
   stopCloudWorker: StopCloudWorker
+  currentImageVersion: CurrentImageVersion
 }): Promise<CloudInstanceUpdateResponse> {
   if (!input.worker) {
     return { ok: true, status: "update_requested" }
   }
 
-  if (!workerNeedsUserRequestedUpdate(input.worker)) {
+  if (!workerNeedsUserRequestedUpdate(input.worker, input.currentImageVersion())) {
     return { ok: false, error: "already_current" }
   }
 
@@ -598,8 +585,7 @@ async function requestCloudInstanceUpdate(input: {
     return { ok: false, error: "flush_failed" }
   }
 
-  const state = inspection?.state ?? null
-  if (isStoppedSandboxState(state) || !isRunningSandboxState(state)) {
+  if (isStoppedSandboxState(inspection) || !isRunningSandboxState(inspection)) {
     return { ok: true, status: "update_requested" }
   }
 
@@ -619,7 +605,7 @@ async function resolveCloudInstanceForGateway(input: {
   payload: NonNullable<OrgRouteVariables["organizationContext"]>
   user: CloudRouteUser
   continueProvisioning: typeof continueCloudProvisioning
-  refreshSignedPreview: typeof refreshDaytonaSignedPreview
+  refreshSignedPreview: RefreshSignedPreview
   store: CloudWorkerStore
   ensureWorker: EnsureCloudWorker
   getSandboxRecord: GetSandboxRecord
@@ -629,6 +615,7 @@ async function resolveCloudInstanceForGateway(input: {
   startRecovery: (workerId: CloudWorker["id"]) => void
   materializeProviders: typeof materializeCloudWorkerProviders
   now: () => number
+  currentImageVersion: CurrentImageVersion
 }): Promise<CloudGatewayInstanceResponse> {
   const resolved = await resolveCloudRuntimeAccess({
     organizationId: input.payload.organization.id,
@@ -637,7 +624,7 @@ async function resolveCloudInstanceForGateway(input: {
     loadWorker: async () => input.ensureWorker({
       orgId: input.payload.organization.id,
       createdByUserId: input.user.id,
-      name: cloudWorkerName(input.payload, input.user),
+      name: CLOUD_INSTANCE_NAME,
       continueProvisioning: input.continueProvisioning,
       store: input.store,
     }),
@@ -649,6 +636,7 @@ async function resolveCloudInstanceForGateway(input: {
     startRecovery: input.startRecovery,
     store: input.store,
     now: input.now,
+    currentImageVersion: input.currentImageVersion,
   })
   if (resolved.status !== "ready") {
     const status = resolved.status === "missing" ? "failed" : resolved.status
@@ -702,21 +690,22 @@ export function registerCloudRoutes<T extends { Variables: OrgRouteVariables }>(
 ) {
   const orgMemberRouteMiddleware = options.memberRoute ?? orgMemberRoute()
   const materializeProviders = options.materializeProviders ?? materializeCloudWorkerProviders
-  const getOpenWorkWebAccess = options.getOpenWorkWebAccess ?? getOpenWorkWebBillingSummary
+  const getOpenWorkWebAccess = options.getOpenWorkWebAccess ?? getOpenWorkWebRuntimeAccess
   const continueProvisioning: typeof continueCloudProvisioning = options.continueProvisioning
     ?? ((input, continueOptions = {}) => continueCloudProvisioning(input, { ...continueOptions, materializeProviders }))
-  const refreshSignedPreview = options.refreshSignedPreview ?? refreshDaytonaSignedPreview
+  const refreshSignedPreview = options.refreshSignedPreview ?? ((workerId) => getCloudRuntime().refreshEndpoint(workerId))
   const store = options.cloudWorkerStore ?? databaseCloudWorkerStore
   const ensureWorker = options.ensureCloudWorker ?? ensureCloudWorker
-  const getSandboxRecord = options.getSandboxRecord ?? getDaytonaSandboxRecord
-  const inspectSandbox = options.inspectSandbox ?? inspectDaytonaSandbox
+  const getSandboxRecord = options.getSandboxRecord ?? ((workerId) => cloudRuntimeStore().get(workerId))
+  const inspectSandbox = options.inspectSandbox ?? ((workerId) => getCloudRuntime().inspect(workerId))
   const signedPreviewProbe = options.probeSignedPreview ?? probeCloudRuntimeSignedPreview
   const wakeCloudWorker = options.wakeCloudWorker ?? defaultWakeCloudWorker
   const recoverCloudWorker = options.recoverCloudWorker
     ?? (options.wakeCloudWorker ? options.wakeCloudWorker : defaultRecoverCloudWorker)
-  const flushWorkerCheckpoint = options.flushWorkerCheckpoint ?? flushWorkerCheckpointOnDaytona
-  const stopCloudWorker = options.stopCloudWorker ?? stopWorkerOnDaytona
+  const flushWorkerCheckpoint = options.flushWorkerCheckpoint ?? ((workerId) => getCloudRuntime().flushCheckpoint(workerId))
+  const stopCloudWorker = options.stopCloudWorker ?? ((workerId) => getCloudRuntime().stop(workerId))
   const now = options.now ?? Date.now
+  const currentImageVersion: CurrentImageVersion = () => currentCloudImageVersion({ provisionerMode: options.provisionerMode })
   const gatewayKey = options.gatewayKey !== undefined ? options.gatewayKey : env.gatewayKey
   const wakingWorkers = new Set<CloudWorker["id"]>()
 
@@ -750,19 +739,28 @@ export function registerCloudRoutes<T extends { Variables: OrgRouteVariables }>(
       responses: {
         200: jsonResponse("Cloud instance status returned successfully.", cloudInstanceResponseSchema),
         401: jsonResponse("The caller must be signed in to open Cloud.", unauthorizedSchema),
+        403: jsonResponse("OpenWork Web access is not active for the organization.", openWorkWebAccessRequiredSchema),
         404: jsonResponse("Cloud is not available for this organization.", notFoundSchema),
       },
     }),
     orgMemberRouteMiddleware,
     async (c) => {
       const payload = c.get("organizationContext")
-      if (!cloudAvailable(payload, options)) {
-        return c.json(cloudNotFound(), 404)
-      }
-
       const user = c.get("user")
       if (!hasCloudUserId(user)) {
         return c.json({ error: "unauthorized" }, 401)
+      }
+
+      // Published desktops reach this route only from inside the gateway
+      // runtime, after OpenWorkWebAccessGate (v0.18.42+) has already resolved
+      // Web access for the organization; see openwork-web-runtime-access.ts.
+      const webAccess = await getOpenWorkWebAccess(payload.organization.id)
+      if (!webAccess.hasAccess) {
+        return c.json(openWorkWebAccessRequiredPayload(), 403)
+      }
+
+      if (!cloudAvailable(payload, options)) {
+        return c.json(cloudNotFound(), 404)
       }
 
       const resolved = await resolveCloudInstanceForMember({
@@ -778,10 +776,11 @@ export function registerCloudRoutes<T extends { Variables: OrgRouteVariables }>(
         startWake,
         startRecovery,
         now,
+        currentImageVersion,
       })
 
       const sandbox = await getSandboxRecord(resolved.worker.id)
-      return c.json(memberCloudInstanceResponse(resolved.worker, resolved.instance, sandbox))
+      return c.json(memberCloudInstanceResponse(resolved.worker, resolved.instance, sandbox, currentImageVersion))
     },
   )
 
@@ -794,19 +793,25 @@ export function registerCloudRoutes<T extends { Variables: OrgRouteVariables }>(
       responses: {
         200: jsonResponse("Cloud instance recovery was requested.", cloudInstanceResponseSchema),
         401: jsonResponse("The caller must be signed in to retry Cloud.", unauthorizedSchema),
+        403: jsonResponse("OpenWork Web access is not active for the organization.", openWorkWebAccessRequiredSchema),
         404: jsonResponse("Cloud is not available for this organization.", notFoundSchema),
       },
     }),
     orgMemberRouteMiddleware,
     async (c) => {
       const payload = c.get("organizationContext")
-      if (!cloudAvailable(payload, options)) {
-        return c.json(cloudNotFound(), 404)
-      }
-
       const user = c.get("user")
       if (!hasCloudUserId(user)) {
         return c.json({ error: "unauthorized" }, 401)
+      }
+
+      const webAccess = await getOpenWorkWebAccess(payload.organization.id)
+      if (!webAccess.hasAccess) {
+        return c.json(openWorkWebAccessRequiredPayload(), 403)
+      }
+
+      if (!cloudAvailable(payload, options)) {
+        return c.json(cloudNotFound(), 404)
       }
 
       const resolved = await resolveCloudInstanceForMember({
@@ -822,11 +827,12 @@ export function registerCloudRoutes<T extends { Variables: OrgRouteVariables }>(
         startWake,
         startRecovery,
         now,
+        currentImageVersion,
         forceFailedRecovery: true,
       })
 
       const sandbox = await getSandboxRecord(resolved.worker.id)
-      return c.json(memberCloudInstanceResponse(resolved.worker, resolved.instance, sandbox))
+      return c.json(memberCloudInstanceResponse(resolved.worker, resolved.instance, sandbox, currentImageVersion))
     },
   )
 
@@ -839,19 +845,25 @@ export function registerCloudRoutes<T extends { Variables: OrgRouteVariables }>(
       responses: {
         200: jsonResponse("Cloud instance update request handled.", cloudInstanceUpdateResponseSchema),
         401: jsonResponse("The caller must be signed in to update Cloud.", unauthorizedSchema),
+        403: jsonResponse("OpenWork Web access is not active for the organization.", openWorkWebAccessRequiredSchema),
         404: jsonResponse("Cloud is not available for this organization.", notFoundSchema),
       },
     }),
     orgMemberRouteMiddleware,
     async (c) => {
       const payload = c.get("organizationContext")
-      if (!cloudAvailable(payload, options)) {
-        return c.json(cloudNotFound(), 404)
-      }
-
       const user = c.get("user")
       if (!hasCloudUserId(user)) {
         return c.json({ error: "unauthorized" }, 401)
+      }
+
+      const webAccess = await getOpenWorkWebAccess(payload.organization.id)
+      if (!webAccess.hasAccess) {
+        return c.json(openWorkWebAccessRequiredPayload(), 403)
+      }
+
+      if (!cloudAvailable(payload, options)) {
+        return c.json(cloudNotFound(), 404)
       }
 
       const worker = await getCloudWorker(payload.organization.id, user.id, store)
@@ -861,6 +873,7 @@ export function registerCloudRoutes<T extends { Variables: OrgRouteVariables }>(
         inspectSandbox,
         flushWorkerCheckpoint,
         stopCloudWorker,
+        currentImageVersion,
       })
 
       return c.json(result)
@@ -901,7 +914,7 @@ export function registerCloudRoutes<T extends { Variables: OrgRouteVariables }>(
 
       const webAccess = await getOpenWorkWebAccess(payload.organization.id)
       if (!webAccess.hasAccess) {
-        return c.json(openWorkWebAccessRequired(), 403)
+        return c.json(openWorkWebAccessRequiredPayload(), 403)
       }
 
       const instance = await resolveCloudInstanceForGateway({
@@ -918,6 +931,7 @@ export function registerCloudRoutes<T extends { Variables: OrgRouteVariables }>(
         startRecovery,
         materializeProviders,
         now,
+        currentImageVersion,
       })
 
       return c.json(instance)

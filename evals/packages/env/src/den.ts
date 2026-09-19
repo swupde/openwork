@@ -18,6 +18,7 @@ import {
 import { denFetch, ensureMemberSession, freshSession, signIn } from "@openwork/behaviors";
 import { progress, trackResource } from "@openwork/world";
 import { createConnection } from "mysql2/promise";
+import type { ExecuteValues } from "mysql2";
 import type { ChildProcess } from "node:child_process";
 import type { DenRef, DenSession } from "@openwork/behaviors";
 import type { DbHandle, Place } from "./place.ts";
@@ -56,6 +57,8 @@ export interface ServerOptions {
   reuseMembers?: Record<string, PersonShape>;
   ports?: { api: number; web: number };
   seedProfile?: "demo-org";
+  /** Daytona idle shutdown in minutes. Preview worlds pass 0 so their lifetime owns teardown. */
+  daytonaAutoStopMinutes?: number;
   /**
    * Extra origins Den should trust, on top of its own API and web hosts. A
    * loopback identity provider needs this: Den refuses to register an SSO
@@ -449,7 +452,7 @@ export async function inviteMember(den: Den, key: string, person?: PersonShape):
   return member;
 }
 
-export async function queryDenDatabase(databaseUrl: string, statement: string, values: readonly unknown[] = []): Promise<unknown[]> {
+export async function queryDenDatabase(databaseUrl: string, statement: string, values: readonly ExecuteValues[] = []): Promise<unknown[]> {
   const connection = await createConnection(databaseUrl);
   try {
     const [rows] = await connection.execute(statement, [...values]);
@@ -546,6 +549,7 @@ async function bootDaytonaMocks(
       sandbox,
       port: definition.daytonaPort,
       allowUnauthenticatedMcp: definition.allowUnauthenticatedMcp,
+      appToolName: definition.appToolName,
     });
     const booted: BootedMock = await definition.connect(remote.url);
     handles[name] = booted.handle;
@@ -665,14 +669,32 @@ export async function server(options: ServerOptions): Promise<Den> {
     }
     const base = options.place.denBase();
     if (base.kind !== "daytona") throw new Error("Daytona place returned a local Den base.");
-    const preparedSandbox = process.env.OPENWORK_EVAL_DAYTONA_DEN_SANDBOX?.trim();
+    const denEnv = Object.fromEntries(
+      Object.entries(options.env ?? {}).flatMap(([key, value]) => (value === undefined ? [] : [[key, value]])),
+    );
+    const needsOwnDen = Object.keys(denEnv).length > 0;
+    // A prewarmed Den is already running with its own env, so a test that
+    // needs Den env gets a dedicated sandbox rather than a silently wrong Den.
+    const preparedSandbox = needsOwnDen ? undefined : process.env.OPENWORK_EVAL_DAYTONA_DEN_SANDBOX?.trim();
+    if (needsOwnDen && process.env.OPENWORK_EVAL_DAYTONA_DEN_SANDBOX?.trim()) {
+      console.error(`[openwork/testkit] server({ env: ${Object.keys(denEnv).join(", ")} }) provisions its own Den sandbox instead of the prewarmed one.`);
+    }
+    // Whoever hands us a prewarmed Den also hands us the public identity it was
+    // started with (OPENWORK_EVAL_DAYTONA_DEN_WEB_URL / _API_URL); every
+    // Den-signed link carries that identity, so reuse must not mint fresh aliases.
+    const preparedWebUrl = process.env.OPENWORK_EVAL_DAYTONA_DEN_WEB_URL?.trim();
+    const preparedApiUrl = process.env.OPENWORK_EVAL_DAYTONA_DEN_API_URL?.trim();
+    const reuseUrls = preparedSandbox && preparedWebUrl && preparedApiUrl ? { webUrl: preparedWebUrl, apiUrl: preparedApiUrl } : undefined;
     const orgShape = options.org ?? {};
     const isolatePreparedTest = Boolean(preparedSandbox && options.provision !== false);
     const bootstrapAdmin = personDefaults("admin", orgShape.admin, runId);
     const provisioned = await provisionDenSandbox({
       ref: base.ref,
       reuse: preparedSandbox,
+      reuseUrls,
       bootstrapAdminEmail: bootstrapAdmin.email,
+      env: denEnv,
+      ...(options.daytonaAutoStopMinutes === undefined ? {} : { autoStopMinutes: options.daytonaAutoStopMinutes }),
       log: (line) => console.error(`[openwork/testkit] ${line}`),
     });
     let bootedMocks: { handles: Record<string, MockHandle>; env: Record<string, string> } = { handles: {}, env: {} };
@@ -750,7 +772,7 @@ export async function server(options: ServerOptions): Promise<Den> {
     throw new Error("Local Den requires MySQL on 127.0.0.1:3306. Run: pnpm dev:den:mysql");
   }
   if (!await localRedisIsRunning()) {
-    throw new Error("Local Den requires Redis on 127.0.0.1:6379. Run: redis-server --port 6379 --daemonize yes --save '' --appendonly no");
+    throw new Error("Local Den requires Redis at DATABASE_REDIS_URL or redis://127.0.0.1:6379. Start an isolated Redis and configure DATABASE_REDIS_URL.");
   }
 
   const bootedMocks = await bootLocalMocks(options.place, options.mocks ?? {});
@@ -809,8 +831,8 @@ export async function server(options: ServerOptions): Promise<Den> {
       DATABASE_URL: database.url,
       DEN_DB_ENCRYPTION_KEY: DATABASE_ENCRYPTION_KEY,
       BETTER_AUTH_SECRET,
-      BETTER_AUTH_URL: `http://localhost:${webPort}`,
-      DEN_BASE_URL: `http://localhost:${webPort}`,
+      BETTER_AUTH_URL: ref.webUrl,
+      DEN_BASE_URL: ref.webUrl,
       DEN_API_PUBLIC_URL: ref.apiUrl,
       DEN_API_PORT: String(apiPort),
       DEN_WEB_PORT: String(webPort),
@@ -843,8 +865,8 @@ export async function server(options: ServerOptions): Promise<Den> {
           DEN_WEB_HOST: "127.0.0.1",
           ...commonEnv,
           DEN_API_BASE: `http://127.0.0.1:${apiPort}`,
-          DEN_BASE_URL: `http://localhost:${webPort}`,
-          DEN_AUTH_ORIGIN: `http://localhost:${webPort}`,
+          DEN_BASE_URL: ref.webUrl,
+          DEN_AUTH_ORIGIN: ref.webUrl,
           DEN_AUTH_FALLBACK_BASE: `http://127.0.0.1:${apiPort}`,
         }, join(logsDir, "web.log"));
     const webStep = web ? steps.step("den-web", "den-web", { log: web.logPath }) : null;
