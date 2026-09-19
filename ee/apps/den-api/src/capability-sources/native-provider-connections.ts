@@ -77,7 +77,7 @@ export function buildNativeProviderEntry(
   state: {
     clientConfigured: boolean
     connectedForMe: boolean
-    connectedAt?: Date
+    connectedAt?: Date | null
     externalAccountId?: string | null
     grantedScopes?: string[] | null
     reconnect?: NativeProviderReconnectState

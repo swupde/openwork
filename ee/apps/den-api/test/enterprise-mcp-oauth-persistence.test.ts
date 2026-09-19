@@ -669,6 +669,8 @@ describe("Den enterprise MCP OAuth persistence adapter", () => {
       .limit(1)
     const before = beforeRows[0]
     if (!before) throw new Error("Expected the pending account row.")
+    expect(before.accessToken).toBeNull()
+    expect(before.connectedAt).toBeNull()
 
     await persistence.credentials.save({
       context: reconnectContext,
@@ -684,7 +686,75 @@ describe("Den enterprise MCP OAuth persistence adapter", () => {
       .where(drizzle.eq(schema.ConnectedAccountTable.id, before.id))
       .limit(1)
     expect(afterRows[0]?.accessToken).toBe("fresh-member-access")
-    expect(afterRows[0]?.connectedAt.getTime()).toBeGreaterThan(before.connectedAt.getTime())
+    expect(afterRows[0]?.connectedAt).toBeInstanceOf(Date)
+
+    const connectedAt = afterRows[0]!.connectedAt!.getTime()
+    const credential = await persistence.credentials.load(reconnectContext)
+    await persistence.credentials.save({
+      context: reconnectContext,
+      tokens: { access_token: "refreshed-member-access", token_type: "Bearer" },
+      source: "refresh",
+      expectedCredentialRevision: credential?.revision,
+    })
+    const readAccount = async () => (await db.select().from(schema.ConnectedAccountTable)
+      .where(drizzle.eq(schema.ConnectedAccountTable.id, before.id)))[0]!
+    expect((await readAccount()).connectedAt?.getTime()).toBe(connectedAt)
+
+    await persistence.authorizations.begin({
+      context: reconnectContext, id: "second-member-authorization", codeVerifier: "s".repeat(43),
+      expiresAt: Date.now() + 600_000, clientRegistrationRevision: registration.revision,
+    })
+    const second = await persistence.authorizations.load({ context: reconnectContext, id: "second-member-authorization" })
+    if (!second) throw new Error("Expected a second authorization.")
+    await persistence.credentials.save({
+      context: reconnectContext, tokens: { access_token: "reconnected-member-access", token_type: "Bearer" },
+      source: "authorization-code", authorization: second.handle, clientRegistrationRevision: registration.revision,
+    })
+    expect((await readAccount()).connectedAt!.getTime()).toBeGreaterThan(connectedAt)
+  })
+
+  test("legacy member OAuth keeps pending timestamps null and clears invalidated connections", async () => {
+    const { ExternalMcpOAuthProvider } = await import("../src/capability-sources/external-mcp-client.js")
+    const { ExternalMcpDiagnosticTracker } = await import("../src/capability-sources/external-mcp-diagnostics.js")
+    const legacy = await createExternalMcpConnection({
+      organizationId, name: "Legacy pending regression", url: "https://mcp.example.test/legacy-pending",
+      authType: "oauth", credentialMode: "per_member", createdByOrgMembershipId: memberId,
+      access: { orgWide: true, memberIds: [], teamIds: [] },
+    })
+    const provider = new ExternalMcpOAuthProvider(legacy, "http://127.0.0.1:8790/callback", "legacy-state",
+      { orgMembershipId: memberId }, new ExternalMcpDiagnosticTracker("legacy-pending-regression"))
+    const readAccount = async () => (await db.select().from(schema.ConnectedAccountTable)
+      .where(drizzle.and(drizzle.eq(schema.ConnectedAccountTable.providerId, legacy.id),
+        drizzle.eq(schema.ConnectedAccountTable.orgMembershipId, memberId))))[0]!
+    await provider.saveCodeVerifier("v".repeat(43))
+    expect((await readAccount()).connectedAt).toBeNull()
+    await provider.codeVerifier()
+    await provider.saveTokens({ access_token: "legacy-access", token_type: "Bearer" })
+    const connectedAt = (await readAccount()).connectedAt
+    expect(connectedAt).toBeInstanceOf(Date)
+    await provider.saveTokens({ access_token: "legacy-refreshed", token_type: "Bearer" })
+    expect((await readAccount()).connectedAt?.getTime()).toBe(connectedAt!.getTime())
+    await provider.invalidateCredentials("tokens")
+    expect((await readAccount()).connectedAt).toBeNull()
+    expect((await readAccount()).accessToken).toBeNull()
+  })
+
+  test("native OAuth completion sets a pending timestamp and refresh preserves it", async () => {
+    const { upsertConnectedAccount, completeConnectedAccountForActiveMember, refreshConnectedAccountForActiveMember } =
+      await import("../src/capability-sources/oauth-credentials.js")
+    const identity = { organizationId, orgMembershipId: memberId, providerId: "native-pending-regression" }
+    const pending = await upsertConnectedAccount({ ...identity, pendingCodeVerifier: "native-pending-verifier" })
+    expect(pending.connectedAt).toBeNull()
+    const completed = await completeConnectedAccountForActiveMember({
+      ...identity, expectedAccountId: pending.id, expectedPendingCodeVerifier: "native-pending-verifier",
+      accessToken: "native-access", refreshToken: "native-refresh", pendingCodeVerifier: null,
+    })
+    expect(completed?.connectedAt).toBeInstanceOf(Date)
+    const refreshed = await refreshConnectedAccountForActiveMember({
+      ...identity, expectedAccountId: pending.id, expectedAccessToken: "native-access", expectedRefreshToken: "native-refresh",
+      accessToken: "native-refreshed",
+    })
+    expect(refreshed?.connectedAt?.getTime()).toBe(completed?.connectedAt?.getTime())
   })
 
   test("never persists a member token issuer to the shared connection configuration", async () => {

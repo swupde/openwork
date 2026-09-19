@@ -1,0 +1,1 @@
+ALTER TABLE `connected_account` MODIFY COLUMN `connected_at` timestamp(3);
