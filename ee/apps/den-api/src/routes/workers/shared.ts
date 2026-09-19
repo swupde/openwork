@@ -3,6 +3,7 @@ import { and, asc, desc, eq, inArray, isNull } from "@openwork-ee/den-db/drizzle
 import {
   AuditEventTable,
   AuthUserTable,
+  CloudRuntimeInstanceTable,
   DaytonaSandboxTable,
   MemberTable,
   WorkerBundleTable,
@@ -15,6 +16,7 @@ import { z } from "zod"
 import { requireCloudWorkerAccess } from "../../billing/polar.js"
 import { db } from "../../db.js"
 import { env } from "../../env.js"
+import { keysetCursorQuerySchema } from "../../list-pagination.js"
 import type { UserOrganizationsContext } from "../../middleware/index.js"
 import { denTypeIdSchema } from "../../openapi.js"
 import { appLogger } from "../../observability/logger.js"
@@ -31,7 +33,14 @@ import {
 import { customDomainForWorker } from "../../workers/vanity-domain.js"
 import { resolveCloudRuntimeAccess } from "../../workers/worker-access.js"
 import { CLOUD_INSTANCE_BACKEND } from "../../workers/cloud-constants.js"
+import { cloudRuntimeConfigured, endpointKindForProvider, isCloudRuntimeProviderId } from "../../workers/cloud-runtime.js"
 import { fetchPreviewNoRedirect } from "../../workers/preview-fetch.js"
+import {
+  getOpenWorkWebRuntimeAccess,
+  openWorkWebAccessRequiredPayload,
+  requireOpenWorkWebRuntimeAccess,
+  type OpenWorkWebRuntimeAccessResolver,
+} from "../../openwork-web-runtime-access.js"
 
 const logger = appLogger.child({ component: "worker_routes" })
 
@@ -49,6 +58,7 @@ export const updateWorkerSchema = z.object({
 })
 
 export const listWorkersQuerySchema = z.object({
+  cursor: keysetCursorQuerySchema.optional(),
   limit: z.coerce.number().int().min(1).max(50).default(20),
 })
 
@@ -91,6 +101,7 @@ type CloudProvisioningStore = {
   touchProvisioningWorker: (workerId: WorkerId) => Promise<void>
 }
 type ContinueCloudProvisioningOptions = {
+  getOpenWorkWebAccess?: OpenWorkWebRuntimeAccessResolver
   provisionWorker?: ProvisionWorker
   store?: CloudProvisioningStore
   materializeProviders?: typeof materializeCloudWorkerProviders
@@ -138,13 +149,15 @@ const databaseCloudProvisioningStore: CloudProvisioningStore = {
 
 export function persistedWorkerInstanceUrl(provisioned: Pick<ProvisionedWorker, "provider" | "url">) {
   const lifecycleBaseUrl = env.apiPublicUrl ?? env.betterAuthUrl
-  return provisioned.provider === "daytona"
+  // Contract providers hand out expiring endpoints, so the durable instance URL
+  // is Den's lifecycle route rather than the endpoint itself.
+  return isCloudRuntimeProviderId(provisioned.provider)
     ? `${lifecycleBaseUrl.replace(/\/+$/, "")}/v1/cloud/instance`
     : provisioned.url
 }
 
 export function workerSandboxBackend(input: Pick<z.infer<typeof createWorkerSchema>, "destination" | "sandboxBackend">) {
-  if (input.destination === "cloud" && env.provisionerMode === "daytona") return CLOUD_INSTANCE_BACKEND
+  if (input.destination === "cloud" && cloudRuntimeConfigured()) return CLOUD_INSTANCE_BACKEND
   return input.sandboxBackend ?? null
 }
 
@@ -320,9 +333,23 @@ export async function fetchWorkerRuntimeJson(input: {
   method?: "GET" | "POST"
   body?: unknown
 }, options: {
+  getOpenWorkWebAccess?: OpenWorkWebRuntimeAccessResolver
   resolveCloudAccess?: ResolveCloudRuntimeAccess
   fetchImpl?: typeof fetch
 } = {}) {
+  // Published desktops hold cloud worker tokens only after OpenWorkWebAccessGate
+  // (v0.18.42+) granted Web access; this recheck covers lapsed entitlement and
+  // callers that bypass the gate. See openwork-web-runtime-access.ts.
+  if (input.worker.destination === "cloud") {
+    const webAccess = await (options.getOpenWorkWebAccess ?? getOpenWorkWebRuntimeAccess)(input.worker.org_id)
+    if (!webAccess.hasAccess) {
+      return {
+        ok: false as const,
+        status: 403,
+        payload: openWorkWebAccessRequiredPayload(),
+      }
+    }
+  }
   const access = await getWorkerRuntimeAccess(input.worker, options.resolveCloudAccess ?? resolveCloudRuntimeAccess)
   if (!access) {
     return {
@@ -406,7 +433,9 @@ export function toInstanceResponse(instance: WorkerInstanceRow | null) {
   return {
     provider: instance.provider,
     region: instance.region,
-    url: instance.provider === "daytona" ? null : instance.url,
+    url: isCloudRuntimeProviderId(instance.provider) ? null : instance.url,
+    // Clients decide URL durability from this, never from the provider name.
+    endpointKind: endpointKindForProvider(instance.provider),
     status: instance.status,
     createdAt: instance.created_at,
     updatedAt: instance.updated_at,
@@ -447,6 +476,14 @@ async function runCloudProvisioning(input: {
   const deadlineMs = options.deadlineMs ?? env.cloudProvisionDeadlineMs
 
   try {
+    if (!input.orgId) throw new Error("cloud_worker_organization_required")
+    // Entitlement can lapse between claim and provisioning; a lapse is recorded
+    // as the dedicated web_access_required failure (cloud-failure.ts), which the
+    // published desktop renders through its existing failed-instance state.
+    await requireOpenWorkWebRuntimeAccess(
+      input.orgId,
+      options.getOpenWorkWebAccess ?? getOpenWorkWebRuntimeAccess,
+    )
     await withProvisioningHeartbeat({
       workerId: input.workerId,
       touch: store.touchProvisioningWorker,
@@ -547,12 +584,26 @@ export async function requireCloudAccessOrPayment(input: {
 }
 
 export async function getWorkerTokensAndConnect(worker: WorkerRow, options: {
+  getOpenWorkWebAccess?: OpenWorkWebRuntimeAccessResolver
   resolveCloudAccess?: ResolveCloudRuntimeAccess
   loadActiveTokens?: LoadActiveWorkerTokens
   fetchImpl?: typeof fetch
   includeExpiringOpenworkUrl?: boolean
   apiPublicUrl?: string
 } = {}) {
+  // Same rollout note as fetchWorkerRuntimeJson: the desktop gate already ran
+  // before a published client asks for cloud worker tokens.
+  if (worker.destination === "cloud") {
+    const webAccess = await (options.getOpenWorkWebAccess ?? getOpenWorkWebRuntimeAccess)(worker.org_id)
+    if (!webAccess.hasAccess) {
+      return {
+        error: {
+          status: 403,
+          body: openWorkWebAccessRequiredPayload(),
+        },
+      }
+    }
+  }
   if (worker.destination === "cloud" && worker.sandbox_backend === CLOUD_INSTANCE_BACKEND) {
     const tokenRows = await (options.loadActiveTokens ?? loadActiveWorkerTokens)(worker.id)
     const hostToken = tokenRows.find((entry) => entry.scope === "host")?.token ?? null
@@ -653,6 +704,7 @@ export async function deleteWorkerCascade(worker: WorkerRow) {
 
   await db.transaction(async (tx) => {
     await tx.delete(WorkerTokenTable).where(eq(WorkerTokenTable.worker_id, worker.id))
+    await tx.delete(CloudRuntimeInstanceTable).where(eq(CloudRuntimeInstanceTable.worker_id, worker.id))
     await tx.delete(DaytonaSandboxTable).where(eq(DaytonaSandboxTable.worker_id, worker.id))
     await tx.delete(WorkerInstanceTable).where(eq(WorkerInstanceTable.worker_id, worker.id))
     await tx.delete(WorkerBundleTable).where(eq(WorkerBundleTable.worker_id, worker.id))

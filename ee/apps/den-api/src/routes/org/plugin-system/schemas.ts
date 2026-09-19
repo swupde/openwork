@@ -219,9 +219,55 @@ export const resourceAccessGrantWriteSchema = z.object({
   }
 })
 
+/**
+ * The same connector setup an admin fills in on the Connections page. It
+ * configures the connection for a plugin-declared MCP server, either inline
+ * while creating the plugin or later through the configure route.
+ */
+export const pluginMcpConnectionSetupSchema = z.object({
+  authType: z.enum(["oauth", "apikey", "none"]).optional().default("oauth"),
+  credentialMode: z.enum(["shared", "per_member"]).optional(),
+  apiKey: z.string().trim().min(1).max(4096).optional(),
+  oauthClient: z.object({
+    clientId: z.string().trim().min(1).max(512),
+    clientSecret: z.string().trim().min(1).max(4096).optional(),
+  }).optional(),
+})
+
 export const pluginCreateComponentSchema = z.object({
   type: configObjectTypeSchema,
-  input: configObjectInputSchema,
+  input: configObjectInputSchema.optional(),
+  connection: pluginMcpConnectionSetupSchema.optional(),
+  connectionId: z.string().trim().min(1).max(160).optional(),
+}).superRefine((value, ctx) => {
+  if (value.connection && value.type !== "mcp") {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "connection is only allowed on mcp components.",
+      path: ["connection"],
+    })
+  }
+  if (value.connectionId && value.type !== "mcp") {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "connectionId is only allowed on mcp components.",
+      path: ["connectionId"],
+    })
+  }
+  if (value.connection && value.connectionId) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "Provide either connection or connectionId, not both.",
+      path: ["connectionId"],
+    })
+  }
+  if (!value.input && !value.connectionId) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "input is required unless connectionId is provided.",
+      path: ["input"],
+    })
+  }
 })
 
 export const pluginCreateSchema = z.object({
@@ -424,16 +470,9 @@ export const githubPluginMcpImportSchema = githubPluginMcpImportPreviewSchema.ex
   selectedServerNames: z.array(z.string().trim().min(1).max(255)).max(200).optional(),
 })
 
-export const pluginMcpRequirementConfigureSchema = z.object({
+export const pluginMcpRequirementConfigureSchema = pluginMcpConnectionSetupSchema.extend({
   configObjectId: configObjectIdSchema,
   serverName: z.string().trim().min(1).max(255),
-  authType: z.enum(["oauth", "apikey", "none"]).optional().default("oauth"),
-  credentialMode: z.enum(["shared", "per_member"]).optional(),
-  apiKey: z.string().trim().min(1).max(4096).optional(),
-  oauthClient: z.object({
-    clientId: z.string().trim().min(1).max(512),
-    clientSecret: z.string().trim().min(1).max(4096).optional(),
-  }).optional(),
 })
 
 export const githubDiscoveryTreeQuerySchema = z.object({
@@ -694,6 +733,7 @@ export const marketplacePluginSchema = z.object({
 }).meta({ ref: "PluginArchMarketplacePluginMembership" })
 
 export const marketplaceSchema = z.object({
+  externalKey: z.string().nullable(),
   id: marketplaceIdSchema,
   organizationId: denTypeIdSchema("organization"),
   name: z.string().trim().min(1).max(255),

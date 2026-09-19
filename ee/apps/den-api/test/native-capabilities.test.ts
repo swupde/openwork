@@ -218,17 +218,29 @@ describe("native capability search", () => {
     const matches = await nativeCapabilities.searchNativeCapabilities({
       organizationId,
       member,
-      query: "Acme Labs gmail drafts",
+      query: "Acme Labs gmail",
       catalog,
       limit: 20,
     })
     const draftTool = "postCapabilitiesGoogleWorkspaceGmailDrafts"
     const labsDraft = matches.find((match) => match.name === nativeCapabilities.buildNativeCapabilityName(labsConnectionId, draftTool))
-    const operationsDraft = matches.find((match) => match.name === nativeCapabilities.buildNativeCapabilityName(operationsConnectionId, draftTool))
+    const neutralMatches = await nativeCapabilities.searchNativeCapabilities({ organizationId, member, query: "gmail drafts", catalog, limit: 20 })
+    const operationsDraft = neutralMatches.find((match) => match.name === nativeCapabilities.buildNativeCapabilityName(operationsConnectionId, draftTool))
     expect(matches[0]?.name.startsWith(`native:${labsConnectionId}:`)).toBe(true)
     expect(labsDraft?.summary.startsWith("[Acme Labs]")).toBe(true)
     expect(operationsDraft?.summary.startsWith("[Acme Operations]")).toBe(true)
-    expect(labsDraft?.inputSchema).toBe(catalog.find((operation) => operation.name === draftTool)?.inputSchema)
+    expect(labsDraft).not.toHaveProperty("inputSchema")
+    expect(labsDraft).not.toHaveProperty("querySchema")
+    const gmailMessagesTool = "getCapabilitiesGoogleWorkspaceGmailMessages"
+    const labsGmailMessages = matches.find((match) => match.name === nativeCapabilities.buildNativeCapabilityName(labsConnectionId, gmailMessagesTool))
+    expect(labsGmailMessages?.querySchema).toMatchObject({
+      type: "object",
+      properties: {
+        q: expect.objectContaining({ type: "string" }),
+        maxResults: expect.objectContaining({ type: "integer", minimum: 1, maximum: 25, default: 10 }),
+      },
+    })
+    expect(JSON.stringify(labsGmailMessages)).not.toContain('"checks":')
   })
 
   test("returns one connection status instead of tools for a disconnected connector", async () => {
@@ -248,7 +260,7 @@ describe("native capability search", () => {
     })
   })
 
-  test("preserves Calendar's UTC datetime schema in native discovery", async () => {
+  test("preserves Calendar's RFC 3339 datetime schema in native discovery", async () => {
     const matches = await nativeCapabilities.searchNativeCapabilities({
       organizationId,
       member,
@@ -268,7 +280,6 @@ describe("native capability search", () => {
         timeMax: { type: "string", format: "date-time" },
         maxResults: { type: "integer", minimum: 1, maximum: 100, default: 25 },
       },
-      additionalProperties: false,
     })
   })
 })

@@ -14,7 +14,7 @@ synchronize members and groups.
 
 You need:
 
-- An OpenWork owner, or a member who can manage security configuration.
+- An OpenWork owner or super-admin.
 - An Okta administrator who can create and assign application integrations.
 - Control of DNS for the email domain you will associate with the connection.
 - The final HTTPS OpenWork web origin, for example
@@ -170,6 +170,26 @@ the successful test. If you edit the SSO configuration after a successful test,
 test it again before enabling. Test links expire after five minutes.
 
 Only after this succeeds should you configure SCIM.
+
+## Just-in-time provisioning and password signup
+
+After Okta SAML SSO is enabled for a verified domain, OpenWork's standard
+sign-in flow routes users with that email domain to the organization SSO flow.
+When a user completes SAML sign-in successfully, OpenWork can create their
+organization membership just in time with the default `Member` role.
+
+JIT provisioning happens only after successful SAML authentication. Creating an
+email/password account with the same email domain does not add the user to the
+organization or create a SCIM-managed identity. If that user later completes
+SSO, OpenWork can link the matching account and provision the organization
+membership through SSO.
+
+OpenWork does not convert SAML attributes such as `role`, `groups`, or `admin`
+into elevated organization roles. Owners and super-admins assign roles in
+OpenWork; ownership changes require ownership transfer. For group-based Admin,
+first configure [Okta SCIM provisioning](/cloud/scim-okta), then explicitly
+approve the synchronized team using
+[Team Admin access](/cloud/members-and-rbac#team-admin-access).
 
 ## Troubleshooting
 

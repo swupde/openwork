@@ -1,5 +1,6 @@
 import { create } from "zustand";
 
+import { createPromptMessageID } from "../../../../app/lib/opencode";
 import type { ComposerAttachment, ComposerDraft } from "../../../../app/types";
 import type { ComposerMentionKind } from "./composer/mention-encoding";
 
@@ -23,15 +24,31 @@ export type ComposerSessionState = {
   revertMessageId: string | null;
 };
 
+export function snapshotComposerSessionState(state: ComposerSessionState): ComposerSessionState {
+  return {
+    draft: state.draft,
+    attachments: state.attachments.map((attachment) => ({ ...attachment })),
+    mentions: { ...state.mentions },
+    pasteParts: state.pasteParts.map((part) => ({ ...part })),
+    revertMessageId: state.revertMessageId,
+  };
+}
+
 export type ComposerStateStore = {
+  failedDrafts: Record<string, ComposerSessionState[]>;
+  pendingMessages: Record<string, {
+    draft: ComposerDraft & { messageId: string };
+    /** The composer as submitted, so a send whose hold is released later can still be saved as unsent. */
+    composer: ComposerSessionState;
+    previousMessageIds: string[];
+    submissionMessageIds: readonly string[];
+    serverMessageId?: string;
+    preparedText?: string;
+    settled: boolean;
+  }[]>;
+  pendingFocusSessionId: string | null;
   sessions: Record<string, ComposerSessionState>;
   queuedDrafts: Record<string, QueuedComposerItem[]>;
-  /**
-   * Sent-prompt history per session, oldest first. Kept outside
-   * `sessions` because `clearSession` resets the composer after every
-   * send and must not wipe the recall history (#2012).
-   */
-  history: Record<string, string[]>;
   setDraft: (sessionId: string, draft: string) => void;
   replaceDraft: (sessionId: string, draft: string, revertMessageId?: string | null) => void;
   hydrateDraft: (sessionId: string, draft: string) => void;
@@ -39,7 +56,6 @@ export type ComposerStateStore = {
   setAttachments: (sessionId: string, attachments: ComposerAttachment[]) => void;
   setMentions: (sessionId: string, mentions: Record<string, ComposerMentionKind>) => void;
   setPasteParts: (sessionId: string, pasteParts: ComposerPastePart[]) => void;
-  appendHistory: (sessionId: string, text: string) => void;
   appendQueuedDraft: (sessionId: string, draft: ComposerDraft) => void;
   removeQueuedDraft: (sessionId: string, id: string) => void;
   updateQueuedDraft: (sessionId: string, id: string, draft: ComposerDraft) => void;
@@ -52,9 +68,7 @@ export type ComposerStateStore = {
 const EMPTY_ATTACHMENTS: ComposerAttachment[] = [];
 const EMPTY_MENTIONS: Record<string, ComposerMentionKind> = {};
 const EMPTY_PASTE_PARTS: ComposerPastePart[] = [];
-const EMPTY_HISTORY: string[] = [];
 const EMPTY_QUEUED_DRAFTS: QueuedComposerItem[] = [];
-const HISTORY_LIMIT = 50;
 const composerSessionDraftScopes = new Map<string, string>();
 
 export function claimComposerSessionDraftScope(sessionId: string, scopeKey: string) {
@@ -96,13 +110,15 @@ function getWritableSession(state: ComposerStateStore, sessionId: string): Compo
 }
 
 function createQueuedItem(draft: ComposerDraft, id?: string): QueuedComposerItem {
-  return { id: id ?? crypto.randomUUID(), draft };
+  return { id: id ?? crypto.randomUUID(), draft: { ...draft, messageId: draft.messageId ?? createPromptMessageID() } };
 }
 
 export const useComposerStateStore = create<ComposerStateStore>((set) => ({
+  failedDrafts: {},
+  pendingMessages: {},
+  pendingFocusSessionId: null,
   sessions: {},
   queuedDrafts: {},
-  history: {},
   setDraft: (sessionId, draft) => set((state) => {
     const current = getWritableSession(state, sessionId);
     const revertMessageId = draft ? current.revertMessageId : null;
@@ -162,16 +178,6 @@ export const useComposerStateStore = create<ComposerStateStore>((set) => ({
     if (current.pasteParts === pasteParts) return state;
     return { sessions: { ...state.sessions, [sessionId]: { ...current, pasteParts } } };
   }),
-  appendHistory: (sessionId, text) => set((state) => {
-    const trimmed = text.trim();
-    if (!trimmed) return state;
-    const current = state.history[sessionId] ?? EMPTY_HISTORY;
-    // Skip consecutive duplicates so spamming the same prompt does not
-    // fill the recall buffer.
-    if (current[current.length - 1] === trimmed) return state;
-    const next = [...current, trimmed].slice(-HISTORY_LIMIT);
-    return { history: { ...state.history, [sessionId]: next } };
-  }),
   appendQueuedDraft: (sessionId, draft) => set((state) => {
     const current = state.queuedDrafts[sessionId] ?? EMPTY_QUEUED_DRAFTS;
     return { queuedDrafts: { ...state.queuedDrafts, [sessionId]: [...current, createQueuedItem(draft)] } };
@@ -193,7 +199,7 @@ export const useComposerStateStore = create<ComposerStateStore>((set) => ({
     const next = current.map((item) => {
       if (item.id !== id) return item;
       changed = true;
-      return { ...item, draft };
+      return { ...item, draft: { ...draft, messageId: item.draft.messageId } };
     });
     if (!changed) return state;
     return { queuedDrafts: { ...state.queuedDrafts, [sessionId]: next } };
@@ -220,7 +226,7 @@ export const useComposerStateStore = create<ComposerStateStore>((set) => ({
   prependQueuedDrafts: (sessionId, items) => set((state) => {
     if (items.length === 0) return state;
     const current = state.queuedDrafts[sessionId] ?? EMPTY_QUEUED_DRAFTS;
-    return { queuedDrafts: { ...state.queuedDrafts, [sessionId]: [...items, ...current] } };
+    return { queuedDrafts: { ...state.queuedDrafts, [sessionId]: [...items.map((item) => createQueuedItem(item.draft, item.id)), ...current] } };
   }),
   clearSession: (sessionId) => set((state) => {
     if (!state.sessions[sessionId]) return state;
@@ -244,10 +250,6 @@ export function getComposerMentions(state: ComposerStateStore, sessionId: string
 
 export function getComposerPasteParts(state: ComposerStateStore, sessionId: string): ComposerPastePart[] {
   return state.sessions[sessionId]?.pasteParts ?? EMPTY_PASTE_PARTS;
-}
-
-export function getComposerHistory(state: ComposerStateStore, sessionId: string): string[] {
-  return state.history[sessionId] ?? EMPTY_HISTORY;
 }
 
 export function getComposerQueuedDrafts(state: ComposerStateStore, sessionId: string): QueuedComposerItem[] {

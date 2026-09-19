@@ -25,13 +25,13 @@ on:
       - "packaging/docker/Dockerfile.den"
       - "packaging/docker/Dockerfile.den-gateway"
       - "packaging/docker/Dockerfile.den-web"
-      - "packaging/docker/Dockerfile.inference"
+      - "packaging/docker/Dockerfile.gateway"
       - "packaging/helm/openwork-ee/**"
       - "ee/apps/den-api/**"
       - "ee/apps/den-gateway/**"
       - "ee/apps/den-web/**"
-      - "ee/apps/inference/**"
-      - "!ee/apps/inference/src/models/base.json"
+      - "ee/apps/gateway/**"
+      - "!ee/apps/gateway/src/models/base.json"
       - "ee/packages/**"
       - "packages/automations/**"
       - "packages/codemode/**"
@@ -276,7 +276,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ${{ matrix.image == 'openwork-den-api' && 'packaging/docker/Dockerfile.den' || matrix.image == 'openwork-den-web' && 'packaging/docker/Dockerfile.den-web' || matrix.image == 'openwork-inference' && 'packaging/docker/Dockerfile.inference' || 'packaging/docker/Dockerfile.den-gateway' }}
+          file: ${{ matrix.image == 'openwork-den-api' && 'packaging/docker/Dockerfile.den' || matrix.image == 'openwork-den-web' && 'packaging/docker/Dockerfile.den-web' || matrix.image == 'openwork-inference' && 'packaging/docker/Dockerfile.gateway' || 'packaging/docker/Dockerfile.den-gateway' }}
           platforms: ${{ env.RELEASE_PLATFORM }}
           load: ${{ github.event_name == 'pull_request' }}
           push: ${{ needs.artifact-version.outputs.publish == 'true' }}
@@ -295,7 +295,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ${{ matrix.image == 'openwork-den-api' && 'packaging/docker/Dockerfile.den' || matrix.image == 'openwork-den-web' && 'packaging/docker/Dockerfile.den-web' || matrix.image == 'openwork-inference' && 'packaging/docker/Dockerfile.inference' || 'packaging/docker/Dockerfile.den-gateway' }}
+          file: ${{ matrix.image == 'openwork-den-api' && 'packaging/docker/Dockerfile.den' || matrix.image == 'openwork-den-web' && 'packaging/docker/Dockerfile.den-web' || matrix.image == 'openwork-inference' && 'packaging/docker/Dockerfile.gateway' || 'packaging/docker/Dockerfile.den-gateway' }}
           platforms: ${{ env.RELEASE_PLATFORM }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}

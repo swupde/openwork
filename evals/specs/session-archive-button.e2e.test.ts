@@ -1,453 +1,731 @@
 import { expect } from "vitest";
-import { control, createAndSelectWorkspace, evalIn, seedSessions, waitFor } from "@openwork/behaviors";
-import type { Surface } from "@openwork/cdp";
-import { screenshot, validate } from "@openwork/test-evidence";
-import { desktop } from "@openwork/hosts";
-import { eventually, needs, test } from "@openwork/testkit";
+import { spec, type SpecBodyContext } from "@openwork/testkit";
+import { archiveActiveSessions } from "../worlds/session-shell.ts";
+import { awayFirstPrompt, awayQueuedPrompt } from "../worlds/chat.ts";
 
-const e2eTestsEnabled = process.env.OPENWORK_EVAL_E2E_TESTS === "1";
-const title = e2eTestsEnabled
-  ? "the sidebar archive affordance archives and restores the intended session in its own workspace"
-  : "session archive button skipped — needs: set OPENWORK_EVAL_E2E_TESTS=1";
+const test = spec.world(archiveActiveSessions, { timeout: 12 * 60_000 });
 
-type SessionCandidate = {
-  workspaceId: string;
-  sessionId: string;
-  title: string;
-};
+async function archiveActions({ world, user, agent, probe }: Pick<SpecBodyContext<Awaited<ReturnType<typeof archiveActiveSessions>>>, "world" | "user" | "agent" | "probe">) {
+  const { a1 } = world;
+  const route = (target: typeof a1) => `#/workspace/${target.workspaceId}/session/${target.sessionId}`;
+  const start = (target: typeof a1) => `#/workspace/${target.workspaceId}/session`;
+  const quickAction = (target: typeof a1) => ({ testId: `session-archive-${target.sessionId}` });
+  const aborts = async () => (await world.facts()).requests.filter(request => request.action === "abort");
+  const initial = await world.facts();
+  const initialIds = initial.sessions.map(session => session.sessionId).sort();
 
-type ListedSession = {
-  sessionId: string;
-  title: string;
-  workspace: string;
-};
-
-type WorkspaceSessionState = {
-  sessionId: string;
-  title: string;
-  archivedAt: number;
-};
-
-type SidebarFacts = {
-  activeSessionIds: string[];
-  archivedSessionIds: string[];
-  archivedExpanded: boolean;
-};
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function parseListedSessions(value: unknown): ListedSession[] {
-  if (!Array.isArray(value)) {
-    throw new Error(`session.list_sessions did not return a list: ${JSON.stringify(value)}`);
-  }
-  return value.map((entry) => {
-    if (
-      !isRecord(entry)
-      || typeof entry.sessionId !== "string"
-      || typeof entry.title !== "string"
-      || typeof entry.workspace !== "string"
-    ) {
-      throw new Error(`session.list_sessions returned a malformed entry: ${JSON.stringify(entry)}`);
+  async function open(target: typeof a1, via: "sidebar" | "control" = "sidebar") {
+    if (via === "control") {
+      expect(await agent.run("session.open", { sessionId: target.sessionId })).toMatchObject({ ok: true, sessionId: target.sessionId });
+    } else {
+      await user.click({ testId: `sidebar-session-${target.sessionId}` });
     }
-    return { sessionId: entry.sessionId, title: entry.title, workspace: entry.workspace };
-  });
-}
-
-function parseWorkspaceSessionStates(value: unknown): WorkspaceSessionState[] {
-  if (!Array.isArray(value)) {
-    throw new Error(`Workspace session listing did not return a list: ${JSON.stringify(value)}`);
+    await probe.eventually(() => probe.hash(), { within: 30_000, label: "owning session opens", until: hash => hash === route(target) });
+    await probe.eventually(() => world.facts(), { within: 30_000, label: "owning surface mounts", until: facts => facts.surfaces.includes(target.sessionId) });
+    await user.see("composer", { editable: true });
   }
-  return value.map((entry) => {
-    if (
-      !isRecord(entry)
-      || typeof entry.sessionId !== "string"
-      || typeof entry.title !== "string"
-      || typeof entry.archivedAt !== "number"
-    ) {
-      throw new Error(`Workspace session listing returned a malformed entry: ${JSON.stringify(entry)}`);
+
+  async function send(target: typeof a1, text: string, expectedRequests?: number) {
+    const before = { target, diagnostics: await world.diagnostics(), facts: await world.facts() };
+    try {
+      expect(await probe.hash()).toBe(route(target));
+      await probe.eventually(() => world.surfaceReady(target.sessionId), { within: 30_000, label: "composer snapshot belongs to the mounted send target" });
+      await user.type("composer", text, { replace: true });
+      await user.see("composer", { text });
+      await user.press("Enter");
+      await user.see({ text });
+      if (expectedRequests !== undefined) {
+        await probe.eventually(async () => ({ requests: await world.requests(), transcript: await world.transcript(target) }), {
+          within: 60_000, label: `${target.title} reaches the held provider and owning transcript`,
+          until: result => result.requests.length === expectedRequests && result.transcript.some(message => message.role === "user" && message.text.includes(text)),
+        });
+      }
+    } catch (error) {
+      console.info("[archive send:failure]", JSON.stringify({ before, diagnostics: await world.diagnostics(), facts: await world.facts(), provider: await world.requests() }));
+      await user.screenshot();
+      throw error;
     }
-    return { sessionId: entry.sessionId, title: entry.title, archivedAt: entry.archivedAt };
-  });
-}
-
-function parseSidebarFacts(value: unknown): SidebarFacts {
-  if (!isRecord(value) || !Array.isArray(value.activeSessionIds) || !Array.isArray(value.archivedSessionIds)) {
-    throw new Error(`Sidebar facts were malformed: ${JSON.stringify(value)}`);
   }
-  const activeSessionIds = value.activeSessionIds.filter((entry): entry is string => typeof entry === "string");
-  const archivedSessionIds = value.archivedSessionIds.filter((entry): entry is string => typeof entry === "string");
-  if (
-    activeSessionIds.length !== value.activeSessionIds.length
-    || archivedSessionIds.length !== value.archivedSessionIds.length
-    || typeof value.archivedExpanded !== "boolean"
-  ) {
-    throw new Error(`Sidebar facts contained invalid fields: ${JSON.stringify(value)}`);
+
+  async function archive(target: typeof a1) {
+    await user.hover({ testId: `sidebar-session-${target.sessionId}` });
+    await user.click(quickAction(target));
   }
-  return { activeSessionIds, archivedSessionIds, archivedExpanded: value.archivedExpanded };
-}
 
-async function activeWorkspaceId(app: Surface): Promise<string> {
-  const value = await evalIn(app, `localStorage.getItem("openwork.react.activeWorkspace") ?? ""`);
-  if (typeof value !== "string" || !value) {
-    throw new Error(`The selected workspace was unavailable: ${JSON.stringify(value)}`);
+  async function archived(target: typeof a1, expected: boolean) {
+    const facts = await probe.eventually(() => world.facts(), {
+      within: 30_000, label: `${target.title} archived=${expected}`,
+      until: facts => facts.sessions.find(session => session.sessionId === target.sessionId)?.archived === expected
+        && facts.activeRows.includes(target.sessionId) !== expected
+        && (!expected || !facts.tabs.includes(target.sessionId)),
+    });
+    expect(facts.sessions.find(session => session.sessionId === target.sessionId)?.workspaceId).toBe(target.workspaceId);
+    expect(facts.sessions.map(session => session.sessionId).sort()).toEqual(initialIds);
+    if (expected) await probe.eventually(() => world.undoToastSettled(), { within: 10_000, label: "View/Undo toast entrance settles" });
+    return facts;
   }
-  return value;
+
+  return { route, start, aborts, open, send, archive, archived };
 }
 
-async function readListedSessions(app: Surface): Promise<ListedSession[]> {
-  return parseListedSessions(await control(app, "session.list_sessions"));
-}
+test("archiving exits only the viewed conversation, and working sessions require a confirmed stop without replay", async ({ world, user, agent, probe, step }) => {
+  const { a1, a2, b1, faultCandidate } = world;
+  const { route, start, aborts, open, send, archive, archived } = await archiveActions({ world, user, agent, probe });
+  const unsentDraft = "Keep this unsent draft when I cancel archiving.";
 
-/**
- * session.list_sessions identifies sessions across workspaces but does not
- * expose time.archived, so inspect the same native session list through each
- * workspace-scoped OpenWork server endpoint for the archived timestamp.
- */
-async function readWorkspaceSessionStates(app: Surface, workspaceId: string): Promise<WorkspaceSessionState[]> {
-  const value = await evalIn(app, `(async () => {
-    const info = await window.__OPENWORK_ELECTRON__?.invokeDesktop?.("openworkServerInfo");
-    if (!info?.running || !info.baseUrl) throw new Error("OpenWork server is unavailable");
-    const response = await fetch(
-      String(info.baseUrl).replace(/\\/+$/, "")
-        + "/workspace/" + encodeURIComponent(${JSON.stringify(workspaceId)})
-        + "/opencode/session?limit=200",
-      {
-        headers: { Authorization: "Bearer " + String(info.ownerToken ?? info.clientToken ?? "") },
-        signal: AbortSignal.timeout(15000),
-      },
-    );
-    if (!response.ok) throw new Error("Workspace session listing failed with HTTP " + response.status);
-    const body = await response.json();
-    if (!Array.isArray(body)) throw new Error("Workspace session listing was not an array");
-    return body.map((session) => ({
-      sessionId: typeof session?.id === "string" ? session.id : "",
-      title: typeof session?.title === "string" ? session.title : "",
-      archivedAt: typeof session?.time?.archived === "number" ? session.time.archived : 0,
-    }));
-  })()`, { awaitPromise: true, timeoutMs: 20_000 });
-  return parseWorkspaceSessionStates(value);
-}
-
-async function waitForWorkspaceSessionStates(
-  app: Surface,
-  workspaceId: string,
-  label: string,
-  until: (states: WorkspaceSessionState[]) => boolean,
-): Promise<WorkspaceSessionState[]> {
-  return eventually(() => readWorkspaceSessionStates(app, workspaceId), {
-    within: 60_000,
-    intervalMs: 500,
-    label,
-    until,
+  await step("idle active archive returns to the same workspace without creating a session; Undo reopens without sending", async () => {
+    await open(a2);
+    await archive(a2);
+    await user.see({ text: "Session archived" });
+    await user.notSee({ text: "This session is still working" });
+    await probe.eventually(() => probe.hash(), { within: 15_000, label: "same workspace start", until: hash => hash === start(a2) });
+    const facts = await archived(a2, true);
+    expect(facts.surfaces).not.toContain(a2.sessionId);
+    expect(facts.tabs).not.toContain(a2.sessionId);
+    expect(facts.memory[a2.workspaceId]).not.toBe(a2.sessionId);
+    expect(facts.sessions.find(session => session.sessionId === a1.sessionId)?.archived).toBe(false);
+    await user.click({ role: "button", label: "Undo" });
+    await archived(a2, false);
+    await probe.eventually(() => probe.hash(), { within: 15_000, label: "Undo reopens idle session", until: hash => hash === route(a2) });
+    expect(await world.requests()).toHaveLength(0);
+    expect(await aborts()).toHaveLength(0);
   });
-}
 
-function stateFor(states: WorkspaceSessionState[], candidate: SessionCandidate): WorkspaceSessionState {
-  const state = states.find((entry) => entry.sessionId === candidate.sessionId);
-  if (!state) throw new Error(`${candidate.title} was absent from its workspace session listing.`);
-  return state;
-}
+  await step("inactive cross-workspace archive and Undo leave the selected conversation unchanged", async () => {
+    await open(b1);
+    await open(a2);
+    await archive(b1);
+    await user.see({ text: "Session archived" });
+    const facts = await archived(b1, true);
+    expect(await probe.hash()).toBe(route(a2));
+    expect(facts.surfaces).toContain(a2.sessionId);
+    expect(facts.memory[b1.workspaceId]).not.toBe(b1.sessionId);
+    expect(facts.sessions.filter(session => session.workspaceId === a2.workspaceId).every(session => !session.archived)).toBe(true);
+    await user.click({ role: "button", label: world.workspaceBName });
+    await probe.eventually(() => probe.hash(), { within: 15_000, label: "workspace switch does not reopen archived memory", until: hash => hash === start(b1) });
+    await open(a2);
+    await user.click({ role: "button", label: "Undo" });
+    await archived(b1, false);
+    expect(await probe.hash()).toBe(route(a2));
+    expect(await world.requests()).toHaveLength(0);
+  });
 
-function activeRowSelector(candidate: SessionCandidate): string {
-  return `[data-sidebar-workspace-id="${candidate.workspaceId}"] [data-sidebar-session-id="${candidate.sessionId}"]`;
-}
+  await step("Undo restores metadata but does not steal navigation after the user opens another conversation", async () => {
+    await archive(a2);
+    await archived(a2, true);
+    await open(a1);
+    await user.click({ role: "button", label: "Undo" });
+    await archived(a2, false);
+    expect(await probe.hash()).toBe(route(a1));
+    expect(await world.requests()).toHaveLength(0);
+  });
 
-function archivedRowSelector(candidate: SessionCandidate): string {
-  return `[data-global-archived-sessions] [data-sidebar-session-id="${candidate.sessionId}"][data-sidebar-session-workspace-id="${candidate.workspaceId}"]`;
-}
-
-async function ensureActiveSessionRowVisible(app: Surface, candidate: SessionCandidate): Promise<void> {
-  const selector = activeRowSelector(candidate);
-  const visible = await evalIn(app, `(() => {
-    const row = document.querySelector(${JSON.stringify(selector)});
-    return row instanceof HTMLElement && row.getClientRects().length > 0;
-  })()`);
-  if (visible !== true) {
-    const clicked = await evalIn(app, `(() => {
-      const workspace = document.querySelector(${JSON.stringify(`[data-sidebar-workspace-id="${candidate.workspaceId}"]`)});
-      const button = [...(workspace?.querySelectorAll("button") ?? [])]
-        .find((entry) => entry.getAttribute("aria-label") === "Expand");
-      if (!(button instanceof HTMLButtonElement)) return false;
-      button.click();
-      return true;
-    })()`);
-    expect(clicked, `expand workspace containing ${candidate.title}`).toBe(true);
+  for (const mode of ["retry", "permission", "question"] satisfies Array<"retry" | "permission" | "question">) {
+    await step(`${mode} work requires confirmation and cancel leaves metadata and navigation untouched`, async () => {
+      await world.networkFault(mode, faultCandidate.sessionId);
+      const observations = await world.faultObservation();
+      for (const observation of observations) {
+        if (observation.workspaceId !== faultCandidate.workspaceId || observation.endpoint !== (mode === "retry" ? "session/status" : mode)) {
+          expect(observation.observed).toEqual(observation.actual);
+        } else if (mode === "retry") {
+          expect(observation.observed).toEqual({ ...observation.actual, [faultCandidate.sessionId]: expect.objectContaining({ type: "retry" }) });
+        } else {
+          expect(observation.observed).toEqual([...observation.actual, expect.objectContaining({ sessionID: faultCandidate.sessionId })]);
+        }
+      }
+      await archive(faultCandidate);
+      await user.see({ text: "This session is still working" });
+      await user.see({ text: "Stop the current task and archive?" });
+      expect(await world.archiveAccessibleDescription()).toBe("Stop the current task and archive?");
+      await user.click({ role: "button", label: "Keep session open" });
+      await world.networkFault("none", faultCandidate.sessionId);
+      for (const observation of await world.faultObservation()) expect(observation.observed).toEqual(observation.actual);
+      await archived(faultCandidate, false);
+      expect(await probe.hash()).toBe(route(a1));
+      expect(await aborts()).toHaveLength(0);
+    });
   }
-  await waitFor(app, `(() => {
-    const row = document.querySelector(${JSON.stringify(selector)});
-    return row instanceof HTMLElement && row.getClientRects().length > 0;
-  })()`, {
-    timeoutMs: 30_000,
-    label: `active sidebar row for ${candidate.title}`,
+
+  await step("a running task with queued work is not stopped or archived by cancelling either entry point", async () => {
+    await open(b1);
+    await send(b1, "Keep the other workspace task running for archive isolation proof.", 1);
+    await open(a1);
+    await send(a1, awayFirstPrompt, 2);
+    await send(a1, awayQueuedPrompt);
+    await user.see({ text: awayQueuedPrompt });
+    await user.type("composer", unsentDraft);
+    const transcript = await world.transcript(a1);
+    await archive(a1);
+    await user.see({ text: "This session is still working" });
+    await user.click({ role: "button", label: "Keep session open" });
+    await archived(a1, false);
+    await user.see({ text: awayQueuedPrompt });
+    await user.see("composer", { text: unsentDraft });
+    expect(await world.transcript(a1)).toEqual(transcript);
+    expect(await aborts()).toHaveLength(0);
+    expect(await world.requests()).toHaveLength(2);
+    const controlAttempt = agent.run("session.archive", { sessionId: a1.sessionId, archived: true }).catch((error: unknown) => error);
+    await user.see({ text: "This session is still working" });
+    await user.click({ role: "button", label: "Keep session open" });
+    expect(await controlAttempt).toMatchObject({
+      message: "Desktop control action session.archive failed: Session archive was cancelled or could not be confirmed",
+    });
+    await archived(a1, false);
+    await user.see({ text: awayQueuedPrompt });
+    await user.see("composer", { text: unsentDraft });
+    expect(await world.transcript(a1)).toEqual(transcript);
+    expect(await aborts()).toHaveLength(0);
+    expect(await probe.hash()).toBe(route(a1));
   });
-}
 
-async function clickArchiveQuickAction(
-  app: Surface,
-  candidate: SessionCandidate,
-  actionLabel: "Archive session" | "Unarchive session",
-): Promise<void> {
-  const rowSelector = actionLabel === "Archive session"
-    ? activeRowSelector(candidate)
-    : archivedRowSelector(candidate);
-  const buttonSelector = `[data-session-hover-actions] button[aria-label="${actionLabel}"]`;
-  await waitFor(app, `(() => {
-    const row = document.querySelector(${JSON.stringify(rowSelector)});
-    return row?.querySelector(${JSON.stringify(buttonSelector)}) instanceof HTMLButtonElement;
-  })()`, {
-    timeoutMs: 30_000,
-    label: `${actionLabel} quick action for ${candidate.title}`,
+  await archive(a1);
+  for (const mode of ["false", "error", "timeout", "unconfirmed"] satisfies Array<"false" | "error" | "timeout" | "unconfirmed">) {
+    await step(`abort ${mode} leaves the session accessible and unarchived with a retryable dialog`, async () => {
+      const before = (await aborts()).length;
+      await world.networkFault(mode, a1.sessionId);
+      await user.click({ role: "button", label: "Stop and archive" });
+      await probe.eventually(async () => (await aborts()).length, { within: 20_000, label: `abort ${mode} attempted`, until: count => count > before });
+      await user.see({ role: "button", label: "Stop and archive" }, { timeoutMs: 25_000 });
+      await user.see({ text: /The session has not been archived/ });
+      const facts = await archived(a1, false);
+      expect(await probe.hash()).toBe(route(a1));
+      expect(facts.surfaces).toContain(a1.sessionId);
+      expect(facts.sessions.find(session => session.sessionId === a1.sessionId)?.status).not.toBe("idle");
+      expect(facts.sessions.find(session => session.sessionId === b1.sessionId)?.archived).toBe(false);
+      expect((await aborts()).slice(before).every(request => request.path === `/workspace/${a1.workspaceId}/opencode/session/${a1.sessionId}/abort`)).toBe(true);
+      expect(facts.requests.filter(request => request.action === "metadata" && request.sessionId === a1.sessionId)).toHaveLength(0);
+      expect(await world.requests()).toHaveLength(2);
+    });
+  }
+
+  await step("Stopping keeps the transcript accessible until the owning engine confirms stop; Undo never replays the cancelled queue", async () => {
+    await world.networkFault("hold", a1.sessionId);
+    const before = (await aborts()).length;
+    await user.click({ role: "button", label: "Stop and archive" });
+    await user.see({ role: "button", label: "Stopping..." });
+    await probe.eventually(async () => (await aborts()).length, { within: 15_000, label: "abort held before engine", until: count => count > before });
+    const stopping = await archived(a1, false);
+    expect(stopping.surfaces).toContain(a1.sessionId);
+    expect(stopping.sessions.find(session => session.sessionId === a1.sessionId)?.status).not.toBe("idle");
+    expect(await probe.hash()).toBe(route(a1));
+    await world.releaseAbort();
+    await world.networkFault("none", a1.sessionId);
+    await user.see({ text: "Session archived" }, { timeoutMs: 30_000 });
+    const stopped = await archived(a1, true);
+    expect(stopped.sessions.find(session => session.sessionId === a1.sessionId)?.status).toBe("idle");
+    expect(stopped.sessions.find(session => session.sessionId === b1.sessionId)?.status).not.toBe("idle");
+    expect(stopped.surfaces).not.toContain(a1.sessionId);
+    expect(stopped.tabs).not.toContain(a1.sessionId);
+    expect((await aborts()).every(request => request.path.includes(`/workspace/${a1.workspaceId}/`) && request.sessionId === a1.sessionId)).toBe(true);
+    expect(await probe.hash()).toBe(start(a1));
+    await user.click({ role: "button", label: "Undo" });
+    await archived(a1, false);
+    await probe.eventually(() => probe.hash(), { within: 15_000, label: "Undo reopens stopped transcript", until: hash => hash === route(a1) });
+    await user.notSee({ text: awayQueuedPrompt });
+    // Cross the drain's observation timeout while unmounted, then remount.
+    await open(b1);
+    const deadline = Date.now() + 12_000;
+    await probe.eventually(async () => {
+      expect(await world.requests()).toHaveLength(2);
+      return Date.now() >= deadline;
+    }, { within: 15_000, label: "cancelled queue never drains in the background" });
+    await open(a1);
+    await user.notSee({ text: awayQueuedPrompt });
+    expect(await world.requests()).toHaveLength(2);
+    expect((await world.facts()).requests.filter(request => request.action === "prompt_async")).toHaveLength(2);
   });
-  const clicked = await evalIn(app, `(() => {
-    const row = document.querySelector(${JSON.stringify(rowSelector)});
-    const button = row?.querySelector(${JSON.stringify(buttonSelector)});
-    if (!(row instanceof HTMLElement) || !(button instanceof HTMLButtonElement)) return false;
-    row.scrollIntoView({ block: "center" });
-    button.click();
-    return true;
-  })()`);
-  expect(clicked, `${actionLabel} quick action for ${candidate.title}`).toBe(true);
-}
 
-async function expandArchivedSection(app: Surface, candidate: SessionCandidate): Promise<void> {
-  await waitFor(app, `Boolean(document.querySelector("[data-global-archived-sessions]"))`, {
-    timeoutMs: 30_000,
-    label: "Archived sidebar section",
+  await step("stopping an unmounted working session uses its owning endpoint and leaves the viewed workspace unchanged", async () => {
+    await open(a2);
+    await world.networkFault("none", b1.sessionId);
+    await archive(b1);
+    await user.see({ text: "This session is still working" });
+    await user.click({ role: "button", label: "Stop and archive" });
+    await user.see({ text: "Session archived" });
+    const facts = await archived(b1, true);
+    expect(await probe.hash()).toBe(route(a2));
+    expect(facts.sessions.find(session => session.sessionId === b1.sessionId)?.status).toBe("idle");
+    expect(facts.sessions.filter(session => session.workspaceId === a2.workspaceId).every(session => !session.archived)).toBe(true);
+    const targetedAborts = (await aborts()).filter(request => request.sessionId === b1.sessionId);
+    expect(targetedAborts.length).toBeGreaterThan(0);
+    expect(targetedAborts.every(request => request.path === `/workspace/${b1.workspaceId}/opencode/session/${b1.sessionId}/abort`)).toBe(true);
+    await user.click({ role: "button", label: "Undo" });
+    await archived(b1, false);
+    expect(await probe.hash()).toBe(route(a2));
+    expect(await world.requests()).toHaveLength(2);
   });
-  await evalIn(app, `(() => {
-    const section = document.querySelector("[data-global-archived-sessions]");
-    const trigger = section?.querySelector("button");
-    if (!(trigger instanceof HTMLButtonElement)) return false;
-    if (trigger.getAttribute("aria-expanded") !== "true") trigger.click();
-    return true;
-  })()`);
-  await waitFor(app, `(() => {
-    const section = document.querySelector("[data-global-archived-sessions]");
-    const trigger = section?.querySelector("button");
-    const row = document.querySelector(${JSON.stringify(archivedRowSelector(candidate))});
-    return trigger?.getAttribute("aria-expanded") === "true"
-      && row instanceof HTMLElement
-      && row.getClientRects().length > 0;
-  })()`, {
-    timeoutMs: 30_000,
-    label: `${candidate.title} visible in expanded Archived section`,
+
+  await step("a task finishing while its dialog is open can archive after fresh idle even with a false abort acknowledgment, without restarting", async () => {
+    await send(a2, "Finish this task while the archive dialog is open.", 3);
+    await archive(a2);
+    await user.see({ text: "This session is still working" });
+    const before = (await aborts()).length;
+    await world.releaseRun();
+    await probe.eventually(() => world.facts(), {
+      within: 30_000, label: "task finished naturally in confirmation",
+      until: facts => facts.sessions.find(session => session.sessionId === a2.sessionId)?.status === "idle",
+    });
+    expect(await world.transcript(a2)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ sessionId: a2.sessionId, role: "assistant", text: "Archive fixture reply.", completed: expect.any(Number) }),
+    ]));
+    await world.networkFault("false", a2.sessionId);
+    await user.click({ role: "button", label: "Stop and archive" });
+    await user.see({ text: "Session archived" });
+    await archived(a2, true);
+    expect(await probe.hash()).toBe(start(a2));
+    expect((await aborts()).slice(before).every(request => request.path === `/workspace/${a2.workspaceId}/opencode/session/${a2.sessionId}/abort`)).toBe(true);
+    expect((await aborts()).slice(before).some(request => request.result === "false")).toBe(true);
+    await world.networkFault("none", a2.sessionId);
+    await user.click({ role: "button", label: "Undo" });
+    await archived(a2, false);
+    expect(await world.requests()).toHaveLength(3);
   });
-}
 
-async function readSidebarFacts(app: Surface, workspaceId: string): Promise<SidebarFacts> {
-  const value = await evalIn(app, `(() => {
-    const visibleIds = (root) => [...(root?.querySelectorAll("[data-sidebar-session-id]") ?? [])]
-      .filter((entry) => entry instanceof HTMLElement && entry.getClientRects().length > 0)
-      .map((entry) => entry.getAttribute("data-sidebar-session-id"))
-      .filter(Boolean);
-    const activeRoot = document.querySelector(${JSON.stringify(`[data-sidebar-workspace-id="${workspaceId}"]`)});
-    const archivedRoot = document.querySelector("[data-global-archived-sessions]");
-    return {
-      activeSessionIds: visibleIds(activeRoot),
-      archivedSessionIds: visibleIds(archivedRoot),
-      archivedExpanded: archivedRoot?.querySelector("button")?.getAttribute("aria-expanded") === "true",
-    };
-  })()`);
-  return parseSidebarFacts(value);
-}
-
-async function waitForSidebarFacts(
-  app: Surface,
-  workspaceId: string,
-  expected: {
-    active: string[];
-    inactive: string[];
-    archived: string[];
-    notArchived: string[];
-  },
-  label: string,
-): Promise<SidebarFacts> {
-  await waitFor(app, `(() => {
-    const visibleIds = (root) => [...(root?.querySelectorAll("[data-sidebar-session-id]") ?? [])]
-      .filter((entry) => entry instanceof HTMLElement && entry.getClientRects().length > 0)
-      .map((entry) => entry.getAttribute("data-sidebar-session-id"))
-      .filter(Boolean);
-    const activeRoot = document.querySelector(${JSON.stringify(`[data-sidebar-workspace-id="${workspaceId}"]`)});
-    const archivedRoot = document.querySelector("[data-global-archived-sessions]");
-    const activeIds = new Set(visibleIds(activeRoot));
-    const archivedIds = new Set(visibleIds(archivedRoot));
-    const expected = ${JSON.stringify(expected)};
-    return expected.active.every((id) => activeIds.has(id))
-      && expected.inactive.every((id) => !activeIds.has(id))
-      && expected.archived.every((id) => archivedIds.has(id))
-      && expected.notArchived.every((id) => !archivedIds.has(id));
-  })()`, { timeoutMs: 30_000, label });
-  return readSidebarFacts(app, workspaceId);
-}
-
-test.skipIf(!e2eTestsEnabled)(title, { timeout: 12 * 60_000 }, async ({ evidence }) => {
-  needs({ optIn: ["OPENWORK_EVAL_E2E_TESTS"] });
-
-  await using app = await desktop({ name: "session-archive-button" });
-  const stamp = `${Date.now()}-${process.pid}`;
-  const workspaceB = await createAndSelectWorkspace(app, {
-    path: `/tmp/openwork-session-archive-${stamp}-b`,
+  await step("a failed session archives directly; Undo restores it without retrying the failed send", async () => {
+    await open(b1);
+    await world.networkFault("prompt_error", b1.sessionId);
+    await send(b1, "Fail this send for the archive journey.");
+    await user.see({ text: /Injected send failure/ });
+    await world.networkFault("none", b1.sessionId);
+    const before = (await aborts()).length;
+    await archive(b1);
+    await user.see({ text: "Session archived" });
+    await user.notSee({ text: "This session is still working" });
+    await archived(b1, true);
+    expect(await probe.hash()).toBe(start(b1));
+    await user.click({ role: "button", label: "Undo" });
+    await archived(b1, false);
+    expect(await aborts()).toHaveLength(before);
+    expect(await world.requests()).toHaveLength(3);
   });
-  const [seededB1] = await seedSessions(app, [`Archive B1 ${stamp}`]);
-  if (!seededB1) throw new Error("Workspace B session was not created.");
-  const sessionB1: SessionCandidate = { ...seededB1, workspaceId: workspaceB.workspaceId };
 
-  await control(app, "workspace.create", {
-    path: `/tmp/openwork-session-archive-${stamp}-a`,
-  }, { timeoutMs: 90_000 });
-  await waitFor(app, `(localStorage.getItem("openwork.react.activeWorkspace") ?? "") !== ""
-    && (localStorage.getItem("openwork.react.activeWorkspace") ?? "") !== ${JSON.stringify(workspaceB.workspaceId)}`, {
-    timeoutMs: 120_000,
-    label: "workspace A selected after creation",
+  await step("completed ordinary sessions archive directly through control, retain their transcript, and reopen read-only until restored", async () => {
+    await open(a2);
+    const transcript = await world.transcript(a2);
+    expect(transcript).toEqual(expect.arrayContaining([expect.objectContaining({ role: "user", text: "Finish this task while the archive dialog is open." })]));
+    expect(await agent.run("session.archive", { sessionId: a2.sessionId, archived: true })).toEqual({ ok: true, sessionId: a2.sessionId, archived: true });
+    await archived(a2, true);
+    await user.notSee({ text: "This session is still working" });
+    await agent.run("session.open", { sessionId: a2.sessionId });
+    await user.see({ testId: "archived-session" });
+    await user.notSee("composer");
+    expect(await agent.actions()).toEqual(expect.arrayContaining([expect.objectContaining({ id: "composer.send", disabled: true })]));
+    expect(await world.transcript(a2)).toEqual(transcript);
+    expect(await agent.run("session.archive", { sessionId: a2.sessionId, archived: false })).toEqual({ ok: true, sessionId: a2.sessionId, archived: false });
+    await archived(a2, false);
+    await user.notSee({ testId: "archived-session" });
+    await user.see("composer", { editable: true });
+
+    await archive(a2);
+    await archived(a2, true);
+    await agent.run("session.open", { sessionId: a2.sessionId });
+    await user.see({ testId: "archived-session" });
+    await user.click({ role: "button", label: "Restore" });
+    await archived(a2, false);
+    await user.see("composer", { editable: true });
+    expect(await world.transcript(a2)).toEqual(transcript);
+    expect(await world.requests()).toHaveLength(3);
+    await user.notSee({ text: "Session archived" }, { timeoutMs: 15_000 });
   });
-  const workspaceAId = await activeWorkspaceId(app);
-  const [seededA1, seededA2] = await seedSessions(app, [
-    `Archive A1 ${stamp}`,
-    `Archive A2 ${stamp}`,
-  ]);
-  if (!seededA1 || !seededA2) throw new Error("Workspace A sessions were not created.");
-  const sessionA1: SessionCandidate = { ...seededA1, workspaceId: workspaceAId };
-  const sessionA2: SessionCandidate = { ...seededA2, workspaceId: workspaceAId };
 
-  await ensureActiveSessionRowVisible(app, sessionA1);
-  await ensureActiveSessionRowVisible(app, sessionA2);
-  expect(await activeWorkspaceId(app)).toBe(workspaceAId);
+  await step("Undo after leaving for Settings restores metadata without reviving the unmounted route", async () => {
+    await archive(a2);
+    await archived(a2, true);
+    await agent.run("settings.panel.open", { panel: "general" });
+    const settingsHash = await probe.eventually(() => probe.hash(), {
+      within: 15_000, label: "Settings owns navigation", until: hash => hash.includes("/settings/"),
+    });
+    await user.click({ role: "button", label: "Undo" });
+    await probe.eventually(() => world.facts(), {
+      within: 15_000, label: "Undo restores metadata while Settings stays open",
+      until: facts => facts.sessions.find(session => session.sessionId === a2.sessionId)?.archived === false,
+    });
+    expect(await probe.hash()).toBe(settingsHash);
+    expect(await world.requests()).toHaveLength(3);
+    await user.click({ role: "button", label: "Back to app" });
+    await open(a2);
+  });
 
-  const baselineListing = await readListedSessions(app);
-  const listedA1 = baselineListing.find((entry) => entry.sessionId === sessionA1.sessionId);
-  const listedA2 = baselineListing.find((entry) => entry.sessionId === sessionA2.sessionId);
-  const listedB1 = baselineListing.find((entry) => entry.sessionId === sessionB1.sessionId);
-  expect(listedA1?.title).toBe(sessionA1.title);
-  expect(listedA2?.title).toBe(sessionA2.title);
-  expect(listedB1?.title).toBe(sessionB1.title);
-  expect(listedA1?.workspace).toBe(listedA2?.workspace);
-  expect(listedA1?.workspace).not.toBe(listedB1?.workspace);
+  await step("an archive completing after route unmount cannot redirect away from Settings", async () => {
+    await world.networkFault("hold_archive", a2.sessionId);
+    await archive(a2);
+    await probe.eventually(() => world.facts(), {
+      within: 15_000, label: "archive metadata write held",
+      until: facts => facts.requests.some(request => request.action === "metadata" && request.sessionId === a2.sessionId && request.result === null),
+    });
+    await agent.run("settings.panel.open", { panel: "general" });
+    const settingsHash = await probe.hash();
+    expect(settingsHash).toContain("/settings/");
+    await world.releaseAbort();
+    await world.networkFault("none", a2.sessionId);
+    await user.see({ text: "Session archived" });
+    expect(await probe.hash()).toBe(settingsHash);
+    const facts = await world.facts();
+    expect(facts.sessions.find(session => session.sessionId === a2.sessionId)?.archived).toBe(true);
+    expect(facts.tabs).not.toContain(a2.sessionId);
+    await user.click({ role: "button", label: "Undo" });
+    await probe.eventually(() => world.facts(), {
+      within: 15_000, label: "late archive Undo is metadata-only",
+      until: facts => facts.sessions.find(session => session.sessionId === a2.sessionId)?.archived === false,
+    });
+    expect(await probe.hash()).toBe(settingsHash);
+    await user.click({ role: "button", label: "Back to app" });
+    await open(a2);
+    expect(await world.requests()).toHaveLength(3);
+  });
 
-  const baselineA = await waitForWorkspaceSessionStates(
-    app,
-    workspaceAId,
-    "unarchived workspace A baseline",
-    (states) => [sessionA1, sessionA2].every((candidate) => {
-      const state = states.find((entry) => entry.sessionId === candidate.sessionId);
-      return state?.archivedAt === 0;
-    }),
-  );
-  expect(stateFor(baselineA, sessionA1).archivedAt).toBe(0);
-  expect(stateFor(baselineA, sessionA2).archivedAt).toBe(0);
+  await step("a global queued admission cannot archive before settling or requeue its late failure after Undo", async () => {
+    await world.holdRun();
+    await open(a1);
+    await send(a1, "Hold another task before the late queued admission.", 4);
+    await send(a1, "This queued admission must never be replayed.");
+    await user.see({ text: "This queued admission must never be replayed." });
+    await open(b1);
+    await world.networkFault("hold_prompt", a1.sessionId);
+    const before = (await world.facts()).requests.filter(request => request.action === "prompt_async").length;
+    await world.releaseRun();
+    await probe.eventually(() => world.facts(), {
+      within: 30_000, label: "unmounted queue starts an admission that remains unconfirmed",
+      until: facts => facts.requests.filter(request => request.action === "prompt_async").length === before + 1,
+    });
+    await archive(a1);
+    await user.see({ text: "This session is still working" });
+    await user.click({ role: "button", label: "Stop and archive" });
+    await user.see({ text: /The session has not been archived/ }, { timeoutMs: 25_000 });
+    await archived(a1, false);
+    expect(await probe.hash()).toBe(route(b1));
+    await world.releaseAbort();
+    await world.networkFault("none", a1.sessionId);
+    await user.click({ role: "button", label: "Stop and archive" });
+    await user.see({ text: "Session archived" });
+    await archived(a1, true);
+    expect(await probe.hash()).toBe(route(b1));
+    await user.click({ role: "button", label: "Undo" });
+    await archived(a1, false);
+    await open(a1);
+    await user.notSee({ text: "This queued admission must never be replayed." });
+    const deadline = Date.now() + 12_000;
+    await probe.eventually(async () => {
+      expect(await world.requests()).toHaveLength(4);
+      expect((await world.facts()).requests.filter(request => request.action === "prompt_async")).toHaveLength(before + 1);
+      return Date.now() >= deadline;
+    }, { within: 20_000, label: "late admission failure does not replay on restore" });
+  });
 
-  // Claim 1: archiving A1 through its sidebar quick action moves only A1.
-  await clickArchiveQuickAction(app, sessionA1, "Archive session");
-  const archivedA = await waitForWorkspaceSessionStates(
-    app,
-    workspaceAId,
-    "A1 archived while A2 remains active",
-    (states) => {
-      const a1 = states.find((entry) => entry.sessionId === sessionA1.sessionId);
-      const a2 = states.find((entry) => entry.sessionId === sessionA2.sessionId);
-      return typeof a1?.archivedAt === "number" && a1.archivedAt > 0 && a2?.archivedAt === 0;
-    },
-  );
-  await expandArchivedSection(app, sessionA1);
-  const archiveSidebar = await waitForSidebarFacts(app, workspaceAId, {
-    active: [sessionA2.sessionId],
-    inactive: [sessionA1.sessionId],
-    archived: [sessionA1.sessionId],
-    notArchived: [sessionA2.sessionId],
-  }, "A1 leaves workspace A's active tree and only A1 appears in Archived");
-  const archiveListing = await readListedSessions(app);
-  expect(stateFor(archivedA, sessionA1).archivedAt).toBeGreaterThan(0);
-  expect(stateFor(archivedA, sessionA2).archivedAt).toBe(0);
-  expect(archiveSidebar.activeSessionIds).not.toContain(sessionA1.sessionId);
-  expect(archiveSidebar.archivedSessionIds).toContain(sessionA1.sessionId);
-  expect(archiveSidebar.activeSessionIds).toContain(sessionA2.sessionId);
-  expect(archiveSidebar.archivedSessionIds).not.toContain(sessionA2.sessionId);
-  expect(archiveListing.some((entry) => entry.sessionId === sessionA1.sessionId)).toBe(true);
-  expect(archiveListing.some((entry) => entry.sessionId === sessionA2.sessionId)).toBe(true);
-  evidence.recordAssertionEvidence(
-    "Archiving a selected-workspace session moves only that session into Archived",
-    `A1 archivedAt=${stateFor(archivedA, sessionA1).archivedAt}; A2 archivedAt=${stateFor(archivedA, sessionA2).archivedAt}; sidebar=${JSON.stringify(archiveSidebar)}.`,
-    true,
-  );
+  await step("archived side chats and tabs disappear, and archiving the main conversation never promotes its side chat", async () => {
+    await open(a2);
+    const before = (await aborts()).length;
+    const sideChatBadge = `[data-sidebar-session-workspace-id="${a2.workspaceId}"][data-sidebar-session-id="${a2.sessionId}"] [data-session-side-chat="${b1.sessionId}"]`;
+    for (const target of [b1, a2]) {
+      await user.press(world.paletteShortcut);
+      await user.type({ placeholder: "Search actions, settings, and sessions\u2026" }, "Open as side chat", { replace: true });
+      await user.click({ role: "option", label: /^Open as side chat/ });
+      const splitSearch = { placeholder: "Search sessions and workspaces..." };
+      await user.type(splitSearch, b1.title, { replace: true });
+      await user.click({ role: "option", label: new RegExp(`^${b1.title}\\s+${world.workspaceBName}(?:\\s|$)`) });
+      await user.notSee(splitSearch);
+      for (const [pane, session] of [["primary", a2], ["secondary", b1]] satisfies Array<[string, typeof a1]>) {
+        await probe.eventually(() => probe.dom(`[data-workbench-pane="${pane}"][data-workbench-workspace-id="${session.workspaceId}"] [data-session-surface-id="${session.sessionId}"]`), {
+          within: 15_000, label: `${pane} renders its owning workspace and session`,
+          until: value => value.elements.length === 1 && value.elements[0].rect.width > 0 && value.elements[0].rect.height > 0,
+        });
+      }
+      await probe.eventually(() => probe.dom(sideChatBadge), {
+        within: 15_000, label: "the main row retains the exact side-chat identity",
+        until: value => value.elements.length === 1 && value.elements[0].rect.width > 0,
+      });
+      expect(await probe.hash()).toBe(route(a2));
+      await user.notSee({ testId: `sidebar-session-${b1.sessionId}` });
+      const beforeMetadata = (await world.facts()).requests.filter(request => request.action === "metadata").length;
+      if (target === b1) {
+        // Paired side chats have focus/expand/close controls, not a standalone
+        // Archive button. The public action archives this exact secondary ID.
+        expect(await agent.actions()).toEqual(expect.arrayContaining([expect.objectContaining({ id: "session.archive", disabled: false })]));
+        expect(await agent.run("session.archive", { sessionId: b1.sessionId, archived: true })).toEqual({ ok: true, sessionId: b1.sessionId, archived: true });
+      } else {
+        await archive(a2);
+      }
+      await user.see({ text: "Session archived" });
+      await archived(target, true);
+      const facts = await probe.eventually(() => world.facts(), {
+        within: 15_000, label: "archiving removes only the intended surface without promoting the side chat",
+        until: facts => !facts.surfaces.includes(target.sessionId)
+          && (target === a2 ? !facts.surfaces.includes(b1.sessionId) : facts.surfaces.includes(a2.sessionId)),
+      });
+      expect(facts.surfaces).not.toContain(target.sessionId);
+      expect(facts.tabs).not.toContain(target.sessionId);
+      expect(facts.sessions.find(session => session.sessionId === (target === a2 ? b1.sessionId : a2.sessionId))?.archived).toBe(false);
+      expect(facts.requests.filter(request => request.action === "metadata").slice(beforeMetadata)).toEqual([
+        expect.objectContaining({ sessionId: target.sessionId, path: `/workspace/${target.workspaceId}/opencode/session/${target.sessionId}`, result: 200 }),
+      ]);
+      await probe.eventually(() => probe.hash(), { within: 15_000, label: "archive preserves the main route or returns it to workspace start", until: hash => hash === (target === a2 ? start(a2) : route(a2)) });
+      if (target === a2) expect(facts.surfaces).not.toContain(b1.sessionId);
+      else expect(facts.surfaces).toContain(a2.sessionId);
+      expect((await probe.dom('[data-workbench-pane="secondary"]')).elements).toHaveLength(0);
+      expect((await probe.dom(sideChatBadge)).elements).toHaveLength(0);
+      await user.click({ role: "button", label: "Undo" });
+      const restored = await archived(target, false);
+      await probe.eventually(() => probe.hash(), { within: 15_000, label: "Undo leaves primary route restored", until: hash => hash === route(a2) });
+      expect(restored.activeRows).toContain(a2.sessionId);
+      expect(restored.activeRows).toContain(b1.sessionId);
+      expect((await probe.dom('[data-workbench-pane="secondary"]')).elements).toHaveLength(0);
+      expect((await probe.dom(sideChatBadge)).elements).toHaveLength(0);
+    }
+    expect(await aborts()).toHaveLength(before);
+    expect(await world.requests()).toHaveLength(4);
+  });
 
-  {
-    const shot = await screenshot(app);
-    const seen = await validate(shot, [
-      `The expanded Archived section contains the session titled ${sessionA1.title}`,
-      `The workspace session list still contains the active session titled ${sessionA2.title}`,
-      "No error dialog or crash message is visible",
+  await step("the last background queued run completes without leaving a false working confirmation", async () => {
+    const before = (await world.requests()).length;
+    await world.holdRun();
+    await open(a2);
+    await send(a2, "Background completion initial task.", before + 1);
+    await send(a2, "Background completion last queued task.");
+    await user.see({ text: "Background completion last queued task." });
+    await open(b1);
+    await world.releaseRun();
+    await probe.eventually(async () => (await world.requests()).length, { within: 60_000, label: "last queued task reaches provider", until: count => count === before + 2 });
+    await probe.eventually(() => world.facts(), {
+      within: 30_000, label: "background queue finishes",
+      until: facts => facts.sessions.find(session => session.sessionId === a2.sessionId)?.status === "idle",
+    });
+    const transcript = await world.transcript(a2);
+    await archive(a2);
+    await user.see({ text: "Session archived" });
+    await user.notSee({ text: "This session is still working" });
+    await archived(a2, true);
+    expect(await probe.hash()).toBe(route(b1));
+    await user.click({ role: "button", label: "Undo" });
+    await archived(a2, false);
+    expect(await world.transcript(a2)).toEqual(transcript);
+    expect(await world.requests()).toHaveLength(before + 2);
+  });
+
+  await step("an idle parent stops its independently running child and cancels child queues, but archives only the parent", async () => {
+    const before = (await world.requests()).length;
+    const beforeAborts = (await aborts()).length;
+    await world.holdRun();
+    // Engine subtasks also have no standalone sidebar row.
+    await open(world.child, "control");
+    await send(world.child, "Independent child work for archive proof.", before + 1);
+    await send(world.child, "Cancelled child follow-up must not replay.");
+    await user.see({ text: "Cancelled child follow-up must not replay." });
+    await open(b1);
+    await archive(a1);
+    await user.see({ text: "This session is still working" });
+    await user.click({ role: "button", label: "Keep session open" });
+    expect(await aborts()).toHaveLength(beforeAborts);
+    await archive(a1);
+    await user.click({ role: "button", label: "Stop and archive" });
+    await user.see({ text: "Session archived" });
+    const facts = await archived(a1, true);
+    expect(facts.sessions.find(session => session.sessionId === world.child.sessionId)).toMatchObject({ archived: false, status: "idle" });
+    const ownedAborts = (await aborts()).slice(beforeAborts);
+    expect(ownedAborts.some(request => request.sessionId === world.child.sessionId)).toBe(true);
+    expect(ownedAborts.every(request => [a1.sessionId, world.child.sessionId].includes(request.sessionId)
+      && request.path === `/workspace/${a1.workspaceId}/opencode/session/${request.sessionId}/abort`)).toBe(true);
+    expect(await probe.hash()).toBe(route(b1));
+    await user.click({ role: "button", label: "Undo" });
+    await archived(a1, false);
+    await world.releaseRun();
+    await open(world.child, "control");
+    await user.notSee({ text: "Cancelled child follow-up must not replay." });
+    const deadline = Date.now() + 12_000;
+    await probe.eventually(async () => {
+      expect(await world.requests()).toHaveLength(before + 1);
+      return Date.now() >= deadline;
+    }, { within: 20_000, label: "restoring the parent never replays a descendant queue" });
+  });
+});
+
+test("accepted commands require exact engine admission before archive and never replay after Undo", async ({ world, user, agent, probe, step, evidence }) => {
+  const { a1, a2, b1 } = world;
+  const { aborts, open, send, archive, archived } = await archiveActions({ world, user, agent, probe });
+  expect(await world.requests()).toHaveLength(0);
+  expect(await aborts()).toHaveLength(0);
+  console.info("[archive command setup]", JSON.stringify(world.commandSetup));
+  await step("the owning engine exposes the configured command and fixture model", async () => {
+    expect(await probe.desktopApi(`/workspace/${a2.workspaceId}/opencode/command`)).toMatchObject({
+      status: 200,
+      body: expect.arrayContaining([expect.objectContaining({ name: "archive-witness", template: "Archive command witness task." })]),
+    });
+    expect(await probe.desktopApi(`/workspace/${a2.workspaceId}/opencode/config`)).toMatchObject({
+      status: 200,
+      body: { model: "session-archive-mock/mock-agent-workload-model", small_model: "session-archive-mock/mock-agent-workload-model" },
+    });
+  });
+
+  await step("an accepted response keeps Starting visible until native busy, then Working clears at completion without another send", async () => {
+    const prompt = "Suggest a simple plan for organizing a desk.";
+    await open(a1);
+    await world.holdRun();
+    await world.networkFault("accepted_prompt", a1.sessionId);
+    await agent.run("composer.set_text", { text: prompt });
+    await user.see("composer", { text: prompt });
+    await agent.run("composer.send");
+    const loading = `[data-session-surface-id="${a1.sessionId}"] [data-loading-message]`;
+    const startingUntil = Date.now() + 200;
+    try {
+      do {
+        const rows = (await probe.dom(loading)).elements;
+        expect(rows).toHaveLength(1);
+        expect(rows[0].text).toBe("Starting…");
+        expect(rows[0].rect.width).toBeGreaterThan(0);
+        expect(rows[0].rect.height).toBeGreaterThan(0);
+      } while (Date.now() < startingUntil);
+    } catch (error) {
+      const [diagnostics, facts, transcript, allLoading, statuses] = await Promise.all([
+        world.diagnostics(), world.facts(), world.transcript(a1),
+        probe.dom("[data-loading-message]"),
+        probe.dom(`[data-session-surface-id="${a1.sessionId}"] [role="status"]`),
+      ]);
+      evidence.recordJsonArtifact("Accepted prompt feedback failure", { sessionId: a1.sessionId, diagnostics, facts, transcript, allLoading, statuses });
+      await user.screenshot();
+      throw error;
+    }
+    const accepted = await world.facts();
+    const sends = accepted.requests.filter(request => ["command", "prompt_async"].includes(request.action));
+    expect(sends).toHaveLength(1);
+    expect(sends[0]).toMatchObject({ sessionId: a1.sessionId, action: "prompt_async", result: "accepted, not dispatched" });
+    expect(accepted.sessions.find(session => session.sessionId === a1.sessionId)?.status).toBe("idle");
+    expect(await world.requests()).toHaveLength(0);
+    expect((await probe.dom(`${loading}[data-loading-message="starting"]`)).elements).toHaveLength(1);
+    await world.releaseAbort();
+    await world.networkFault("none", a1.sessionId);
+    await probe.eventually(() => world.facts(), {
+      within: 30_000, label: "the single accepted prompt reaches native busy",
+      until: facts => facts.sessions.some(session => session.sessionId === a1.sessionId && session.status === "busy"),
+    });
+    await user.see({ text: "Working" });
+    expect((await probe.dom(`${loading}[data-loading-message="working"]`)).elements).toHaveLength(1);
+    expect((await probe.dom(`${loading}[data-loading-message="starting"]`)).elements).toHaveLength(0);
+    await world.releaseRun();
+    await user.see({ text: "Archive fixture reply." }, { timeoutMs: 60_000 });
+    await probe.eventually(() => world.facts(), {
+      within: 30_000, label: "the accepted prompt completes in the owning engine",
+      until: facts => facts.sessions.find(session => session.sessionId === a1.sessionId)?.status === "idle",
+    });
+    await user.notSee({ text: "Working" });
+    expect((await probe.dom(loading)).elements).toHaveLength(0);
+    const transcript = await world.transcript(a1);
+    expect(transcript.filter(message => message.role === "user")).toEqual([
+      expect.objectContaining({ id: sends[0].messageID, sessionId: a1.sessionId, text: prompt }),
     ]);
-    expect(seen.ok, seen.why).toBe(true);
+    expect(transcript).toEqual(expect.arrayContaining([
+      expect.objectContaining({ parentID: sends[0].messageID, role: "assistant", completed: expect.any(Number), pendingTools: false }),
+    ]));
+    const noReplayUntil = Date.now() + 1_500;
+    await probe.eventually(async () => {
+      expect((await world.facts()).requests.filter(request => ["command", "prompt_async"].includes(request.action))).toHaveLength(1);
+      expect(await world.requests()).toHaveLength(1);
+      return Date.now() >= noReplayUntil;
+    }, { within: 10_000, label: "completion never resubmits the accepted prompt" });
+  });
+
+  for (const queued of [false, true]) {
+    await step(`${queued ? "queued" : "direct"} accepted commands cannot archive before their engine admission is observed`, async () => {
+      await open(a2);
+      const before = (await world.requests()).length;
+      const beforeAborts = (await aborts()).length;
+      if (queued) {
+        await world.holdRun();
+        await send(a2, "Hold the run before queueing an archive command.", before + 1);
+      }
+      await world.networkFault("accepted_command", a2.sessionId);
+      const commandCount = (await world.facts()).requests.filter(request => request.action === "command").length;
+      await probe.eventually(() => world.surfaceReady(a2.sessionId), { within: 30_000, label: "command composer belongs to the owning session" });
+      await agent.run("composer.set_text", { text: "/archive-witness" });
+      await user.see("composer", { text: "/archive-witness" });
+      if (queued) {
+        await user.click("composer");
+        await user.press("Escape");
+        await user.press("Enter");
+        await user.see("composer", { text: "" });
+        await user.see({ text: "/archive-witness" });
+        await send(a2, "The message after the accepted command must never replay.");
+        await open(b1);
+        await world.releaseRun();
+      } else {
+        await agent.run("composer.send");
+      }
+      const accepted = await probe.eventually(() => world.facts(), {
+        within: 30_000, label: "proxy command accepted before upstream dispatch",
+        until: facts => facts.requests.filter(request => request.action === "command").length === commandCount + 1,
+      });
+      const command = accepted.requests.filter(request => request.action === "command")[commandCount];
+      expect(command).toMatchObject({ sessionId: a2.sessionId, path: `/workspace/${a2.workspaceId}/opencode/session/${a2.sessionId}/command`, command: { name: "archive-witness", arguments: "" }, result: "accepted, not dispatched" });
+      expect(command.messageID).toMatch(/^msg_/);
+      expect((await world.transcript(a2)).some(message => message.id === command.messageID)).toBe(false);
+      await archive(a2);
+      await user.see({ text: "This session is still working" });
+      await user.click({ role: "button", label: "Stop and archive" });
+      await user.see({ text: /The session has not been archived/ }, { timeoutMs: 25_000 });
+      await archived(a2, false);
+      expect(await world.requests()).toHaveLength(before + Number(queued));
+      expect((await world.facts()).requests.filter(request => request.action === "metadata")).toHaveLength(accepted.requests.filter(request => request.action === "metadata").length);
+
+      // A different run in the same engine session is not the command's admission.
+      // It can go busy and then terminal while the acknowledged command is still held.
+      await world.holdRun();
+      await world.dispatchUnrelatedPrompt(a2);
+      await probe.eventually(async () => ({ requests: await world.requests(), facts: await world.facts() }), {
+        within: 60_000, label: "unrelated work goes busy without admitting the held command",
+        until: value => value.requests.length === before + Number(queued) + 1 && value.facts.sessions.some(session => session.sessionId === a2.sessionId && session.status !== "idle"),
+      });
+      await user.click({ role: "button", label: "Stop and archive" });
+      await user.see({ text: /The session has not been archived/ }, { timeoutMs: 25_000 });
+      const unrelatedStopped = await archived(a2, false);
+      expect(unrelatedStopped.sessions.find(session => session.sessionId === a2.sessionId)?.status).toBe("idle");
+      const unrelatedTranscript = await world.transcript(a2);
+      expect(unrelatedTranscript.some(message => message.id === command.messageID)).toBe(false);
+      const unrelatedUser = unrelatedTranscript.findLast(message => message.role === "user" && message.text === "An independently submitted task, not the accepted command.");
+      expect(unrelatedUser).toBeDefined();
+      expect(unrelatedTranscript).toEqual(expect.arrayContaining([
+        expect.objectContaining({ parentID: unrelatedUser?.id, role: "assistant", completed: expect.any(Number), pendingTools: false }),
+      ]));
+      expect((await world.facts()).requests.filter(request => request.action === "metadata")).toHaveLength(accepted.requests.filter(request => request.action === "metadata").length);
+
+      await world.holdRun();
+      const expected = before + Number(queued) + 2;
+      try {
+        await world.releaseAbort();
+        await world.networkFault("none", a2.sessionId);
+        await probe.eventually(async () => ({ requests: await world.requests(), transcript: await world.transcript(a2), facts: await world.facts() }), {
+          within: 60_000, label: "exact accepted command reaches the engine and held provider",
+          until: value => value.requests.length === expected && value.transcript.some(message => message.id === command.messageID && message.role === "user"),
+        });
+      } catch (error) {
+        console.info("[archive command dispatch:failure]", JSON.stringify({
+          queued, command, expected, diagnostics: await world.diagnostics(),
+          commands: await probe.desktopApi(`/workspace/${a2.workspaceId}/opencode/command`),
+          transcript: await world.transcript(a2), provider: await world.requests(),
+        }));
+        throw error;
+      }
+      await user.click({ role: "button", label: "Stop and archive" });
+      await user.see({ text: "Session archived" });
+      await archived(a2, true);
+      const transcript = await world.transcript(a2);
+      expect(transcript).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: command.messageID, sessionId: a2.sessionId, role: "user" }),
+        expect.objectContaining({ parentID: command.messageID, sessionId: a2.sessionId, role: "assistant", completed: expect.any(Number), pendingTools: false }),
+      ]));
+      expect(transcript.find(message => message.role === "assistant" && message.parentID === command.messageID && message.completed !== null)?.finish).not.toBe("tool-calls");
+      await user.click({ role: "button", label: "Undo" });
+      await archived(a2, false);
+      await world.releaseRun();
+      await open(b1);
+      const deadline = Date.now() + 12_000;
+      await probe.eventually(async () => {
+        expect(await world.requests()).toHaveLength(expected);
+        expect((await world.facts()).requests.filter(request => request.action === "command")).toHaveLength(commandCount + 1);
+        return Date.now() >= deadline;
+      }, { within: 20_000, label: "unknown admission and its cancelled successor never replay after Undo" });
+      await open(a2);
+      await user.notSee({ text: "The message after the accepted command must never replay." });
+      const stopped = (await aborts()).slice(beforeAborts);
+      expect(stopped.length).toBeGreaterThan(0);
+      expect(stopped.every(request => request.sessionId === a2.sessionId && request.path === `/workspace/${a2.workspaceId}/opencode/session/${a2.sessionId}/abort`)).toBe(true);
+    });
   }
-
-  // Claim 2: the same affordance restores A1 without changing A2.
-  await clickArchiveQuickAction(app, sessionA1, "Unarchive session");
-  const restoredA = await waitForWorkspaceSessionStates(
-    app,
-    workspaceAId,
-    "A1 and A2 both active after unarchive",
-    (states) => [sessionA1, sessionA2].every((candidate) => {
-      const state = states.find((entry) => entry.sessionId === candidate.sessionId);
-      return state?.archivedAt === 0;
-    }),
-  );
-  const restoredSidebar = await waitForSidebarFacts(app, workspaceAId, {
-    active: [sessionA1.sessionId, sessionA2.sessionId],
-    inactive: [],
-    archived: [],
-    notArchived: [sessionA1.sessionId, sessionA2.sessionId],
-  }, "A1 and A2 converge in workspace A's active tree after unarchive");
-  expect(stateFor(restoredA, sessionA1).archivedAt).toBe(0);
-  expect(stateFor(restoredA, sessionA2).archivedAt).toBe(0);
-  expect(restoredSidebar.activeSessionIds).toContain(sessionA1.sessionId);
-  expect(restoredSidebar.activeSessionIds).toContain(sessionA2.sessionId);
-  expect(restoredSidebar.archivedSessionIds).not.toContain(sessionA1.sessionId);
-  expect(restoredSidebar.archivedSessionIds).not.toContain(sessionA2.sessionId);
-  evidence.recordAssertionEvidence(
-    "Unarchiving restores the intended session and leaves its neighbor untouched",
-    `A1 archivedAt=${stateFor(restoredA, sessionA1).archivedAt}; A2 archivedAt=${stateFor(restoredA, sessionA2).archivedAt}; sidebar=${JSON.stringify(restoredSidebar)}.`,
-    true,
-  );
-
-  // Claim 3: a row from workspace B must archive against B even while A stays selected.
-  await ensureActiveSessionRowVisible(app, sessionB1);
-  expect(await activeWorkspaceId(app)).toBe(workspaceAId);
-  await clickArchiveQuickAction(app, sessionB1, "Archive session");
-
-  const unchangedA = await waitForWorkspaceSessionStates(
-    app,
-    workspaceAId,
-    "workspace A remains unarchived after archiving B1",
-    (states) => states.length >= 2 && states.every((state) => state.archivedAt === 0),
-  );
-  expect(unchangedA.every((state) => state.archivedAt === 0)).toBe(true);
-  expect(stateFor(unchangedA, sessionA1).archivedAt).toBe(0);
-  expect(stateFor(unchangedA, sessionA2).archivedAt).toBe(0);
-  expect(await activeWorkspaceId(app)).toBe(workspaceAId);
-
-  const archivedB = await waitForWorkspaceSessionStates(
-    app,
-    workspaceB.workspaceId,
-    "B1 archived in workspace B while workspace A remains selected",
-    (states) => {
-      const b1 = states.find((entry) => entry.sessionId === sessionB1.sessionId);
-      return typeof b1?.archivedAt === "number" && b1.archivedAt > 0;
-    },
-  );
-  await expandArchivedSection(app, sessionB1);
-  const crossWorkspaceSidebar = await waitForSidebarFacts(app, workspaceB.workspaceId, {
-    active: [],
-    inactive: [sessionB1.sessionId],
-    archived: [sessionB1.sessionId],
-    notArchived: [sessionA1.sessionId, sessionA2.sessionId],
-  }, "B1 leaves workspace B's active tree and only B1 appears in Archived");
-  expect(stateFor(archivedB, sessionB1).archivedAt).toBeGreaterThan(0);
-  expect(crossWorkspaceSidebar.activeSessionIds).not.toContain(sessionB1.sessionId);
-  expect(crossWorkspaceSidebar.archivedSessionIds).toContain(sessionB1.sessionId);
-  evidence.recordAssertionEvidence(
-    "A cross-workspace archive click mutates the row's workspace, not the selected workspace",
-    `Selected workspace remained ${workspaceAId}; B1 archivedAt=${stateFor(archivedB, sessionB1).archivedAt}; A1/A2 archivedAt=${stateFor(unchangedA, sessionA1).archivedAt}/${stateFor(unchangedA, sessionA2).archivedAt}.`,
-    true,
-  );
 });

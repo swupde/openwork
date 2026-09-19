@@ -1,3 +1,4 @@
+import { desktopConfigSchema, type DesktopConfig } from "@openwork/types/den/desktop-policies-runtime";
 import { existsSync } from "node:fs";
 import { importNodeSqlite, runtimeDbPath } from "./runtime-db.js";
 import type { ServerConfig } from "./types.js";
@@ -6,6 +7,7 @@ import { createWorkspaceKvStore, isRecord } from "./workspace-kv-store.js";
 export { runtimeDbPath, runtimeStorageDir } from "./runtime-db.js";
 
 export type RuntimeOpencodeConfig = {
+  managedPolicy?: DesktopConfig;
   default_agent?: string;
   plugin?: string[];
   disabled_providers?: string[];
@@ -38,6 +40,7 @@ function normalizeRuntimeOpencodeConfig(value: unknown): RuntimeOpencodeConfig {
   const provider = isRecord(value.provider) ? value.provider : undefined;
   return {
     ...(defaultAgent ? { default_agent: defaultAgent } : {}),
+    ...(value.managedPolicy !== undefined ? { managedPolicy: desktopConfigSchema.parse(value.managedPolicy) } : {}),
     ...(plugin ? { plugin } : {}),
     ...(disabledProviders ? { disabled_providers: disabledProviders } : {}),
     ...(mcp ? { mcp } : {}),
@@ -145,6 +148,16 @@ export async function readRuntimeOpencodeConfig(config: ServerConfig, workspaceI
   return await runtimeOpencodeConfigStore.get(config, workspaceId) ?? {};
 }
 
+// App leases are process-local too. Retain entry tombstones so removal and
+// restoration cannot resurrect a lease; unrelated runtime writes do not touch it.
+const runtimeMcpRevisions = new WeakMap<ServerConfig, Map<string, Map<string, number>>>();
+
+/** Private generations for one named MCP's global and workspace runtime entries. */
+export function readRuntimeMcpConfigRevisions(config: ServerConfig, workspaceId: string, name: string): Array<number | null> {
+  const revisions = runtimeMcpRevisions.get(config);
+  return [ENGINE_GLOBAL_RUNTIME_CONFIG_ID, workspaceId].map(id => revisions?.get(id)?.get(name) ?? null);
+}
+
 export async function readGlobalRuntimeOpencodeConfig(config: ServerConfig): Promise<RuntimeOpencodeConfig> {
   return await readRuntimeOpencodeConfig(config, ENGINE_GLOBAL_RUNTIME_CONFIG_ID);
 }
@@ -208,7 +221,7 @@ export async function listRuntimeOpencodeConfigRows(config: ServerConfig): Promi
 
 export async function writeGlobalRuntimeOpencodeConfig(
   config: ServerConfig,
-  updater: (current: RuntimeOpencodeConfig) => RuntimeOpencodeConfig,
+  updater: (current: Omit<RuntimeOpencodeConfig, "managedPolicy">) => Omit<RuntimeOpencodeConfig, "managedPolicy">,
 ): Promise<{ config: RuntimeOpencodeConfig; changed: boolean }> {
   return await writeRuntimeOpencodeConfig(config, ENGINE_GLOBAL_RUNTIME_CONFIG_ID, updater);
 }
@@ -255,6 +268,7 @@ export function mergeRuntimeOpencodeConfigLayers(
   };
 
   return normalizeRuntimeOpencodeConfig({
+    ...(base.managedPolicy ? { managedPolicy: base.managedPolicy } : {}),
     ...(base.default_agent || overlay.default_agent ? { default_agent: overlay.default_agent ?? base.default_agent } : {}),
     ...(plugin.length ? { plugin } : {}),
     ...(disabledProviders.length ? { disabled_providers: disabledProviders } : {}),
@@ -513,22 +527,62 @@ export async function inspectRuntimeOpencodeConfig(
   return (await inspectRuntimeOpencodeConfigState(config, workspaceId, options)).config;
 }
 
-export async function writeRuntimeOpencodeConfig(
+// All runtime writers share this queue. A provider refresh cannot overwrite a
+// newer Den policy, and ordinary config edits cannot replace managed policy.
+const runtimeWrites = new WeakMap<ServerConfig, Promise<unknown>>();
+function updateRuntimeConfig(
   config: ServerConfig,
   workspaceId: string,
   updater: (current: RuntimeOpencodeConfig) => RuntimeOpencodeConfig,
 ): Promise<{ config: RuntimeOpencodeConfig; changed: boolean }> {
-  const row = await runtimeOpencodeConfigStore.getRow(config, workspaceId);
-  const current = row ? row.value : {};
-  const next = normalizeRuntimeOpencodeConfig(updater(current));
-  const now = Date.now();
-  const configJson = runtimeOpencodeConfigStore.serialize(next);
-  if (row?.valueJson === configJson) {
-    return { config: next, changed: false };
-  }
-  await runtimeOpencodeConfigStore.setSerialized(config, workspaceId, configJson, now);
-  for (const listener of writeListeners) listener(config, workspaceId);
-  return { config: next, changed: true };
+  const pending = runtimeWrites.get(config) ?? Promise.resolve();
+  const result = pending.catch(() => undefined).then(async () => {
+    const row = await runtimeOpencodeConfigStore.getRow(config, workspaceId);
+    const next = normalizeRuntimeOpencodeConfig(updater(row?.value ?? {}));
+    const configJson = runtimeOpencodeConfigStore.serialize(next);
+    if (row?.valueJson === configJson) return { config: next, changed: false };
+    const updatedAt = Math.max(Date.now(), (row?.updatedAt ?? 0) + 1);
+    await runtimeOpencodeConfigStore.setSerialized(config, workspaceId, configJson, updatedAt);
+    // Compare persisted bytes rather than row.value: an updater may mutate its input.
+    const previousMcp = runtimeMcpMap(parseRuntimeOpencodeConfig(row?.valueJson ?? "{}"));
+    const nextMcp = runtimeMcpMap(next);
+    const changedMcpNames = [...new Set([...Object.keys(previousMcp), ...Object.keys(nextMcp)])]
+      .filter(name => JSON.stringify(previousMcp[name]) !== JSON.stringify(nextMcp[name]));
+    if (changedMcpNames.length) {
+      let workspaces = runtimeMcpRevisions.get(config);
+      if (!workspaces) {
+        workspaces = new Map();
+        runtimeMcpRevisions.set(config, workspaces);
+      }
+      let revisions = workspaces.get(workspaceId);
+      if (!revisions) {
+        revisions = new Map();
+        workspaces.set(workspaceId, revisions);
+      }
+      for (const name of changedMcpNames) revisions.set(name, updatedAt);
+    }
+    for (const listener of writeListeners) listener(config, workspaceId);
+    return { config: next, changed: true };
+  });
+  runtimeWrites.set(config, result);
+  return result;
+}
+
+export function writeRuntimeOpencodeConfig(
+  config: ServerConfig,
+  workspaceId: string,
+  updater: (current: Omit<RuntimeOpencodeConfig, "managedPolicy">) => Omit<RuntimeOpencodeConfig, "managedPolicy">,
+): Promise<{ config: RuntimeOpencodeConfig; changed: boolean }> {
+  return updateRuntimeConfig(config, workspaceId, (current) => {
+    const { managedPolicy, ...editable } = current;
+    return { ...updater(editable), managedPolicy };
+  });
+}
+
+// Only the verified Den-session boundary may call this writer.
+export function writeManagedDesktopPolicy(config: ServerConfig, policy: DesktopConfig) {
+  const validated = desktopConfigSchema.parse(policy);
+  return updateRuntimeConfig(config, ENGINE_GLOBAL_RUNTIME_CONFIG_ID, (current) => ({ ...current, managedPolicy: validated }));
 }
 
 export function mergeOpencodeConfigs(

@@ -1,5 +1,5 @@
 import { isDeepStrictEqual } from "node:util"
-import { and, desc, eq, inArray, isNull, or } from "@openwork-ee/den-db/drizzle"
+import { and, asc, desc, eq, inArray, isNull, or } from "@openwork-ee/den-db/drizzle"
 import {
   ConnectedAccountTable,
   ConfigObjectAccessGrantTable,
@@ -21,7 +21,8 @@ import {
 import { createDenTypeId, type DenTypeId } from "@openwork-ee/utils/typeid"
 import { db } from "../db.js"
 import { env } from "../env.js"
-import { declaredPluginMcpAuthType, requiredPluginMcpAuthType } from "./external-mcp-auth-policy.js"
+import { declaredPluginMcpAuthType, existingPluginMcpAuthTypeCompatible, requiredPluginMcpAuthType } from "./external-mcp-auth-policy.js"
+import { isExternalMcpSharedCallbackRedirectUri } from "./external-mcp-oauth-contract.js"
 import {
   createExternalMcpIdentityBinding,
   normalizeExternalMcpIdentityUrl,
@@ -71,7 +72,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
-function isSdkRegisteredOAuthClient(extra: Record<string, unknown> | null): boolean {
+export function isSdkRegisteredOAuthClient(extra: Record<string, unknown> | null): boolean {
   const source = extra?.enterpriseMcpRegistrationSource
   return source === "dynamic"
     || source === "client-metadata"
@@ -347,7 +348,10 @@ async function sourcedUsableExternalMcpConnections(input: {
     const requiredAuthType = entry
       ? requiredPluginMcpAuthType({ declaredAuthType: declaredPluginMcpAuthType(entry.config), url: declaredUrl })
       : null
-    if (!input.includeAuthMismatches && requiredAuthType && row.connection.authType !== requiredAuthType) return []
+    if (!input.includeAuthMismatches && !existingPluginMcpAuthTypeCompatible({
+      authType: row.connection.authType,
+      requiredAuthType,
+    })) return []
     return normalizeExternalMcpIdentityUrl(row.connection.url) === normalizeExternalMcpIdentityUrl(declaredUrl)
       ? [row.connection]
       : []
@@ -359,6 +363,7 @@ export async function listExternalMcpConnections(organizationId: OrganizationId)
     .select()
     .from(ExternalMcpConnectionTable)
     .where(eq(ExternalMcpConnectionTable.organizationId, organizationId))
+    .orderBy(asc(ExternalMcpConnectionTable.createdAt), asc(ExternalMcpConnectionTable.id))
 }
 
 export async function getExternalMcpConnection(input: {
@@ -371,6 +376,21 @@ export async function getExternalMcpConnection(input: {
     .where(and(
       eq(ExternalMcpConnectionTable.organizationId, input.organizationId),
       eq(ExternalMcpConnectionTable.id, input.connectionId),
+    ))
+    .limit(1)
+  return rows[0] ?? null
+}
+
+export async function getExternalMcpConnectionByExternalKey(input: {
+  organizationId: OrganizationId
+  externalKey: string
+}): Promise<ExternalMcpConnectionRow | null> {
+  const rows = await db
+    .select()
+    .from(ExternalMcpConnectionTable)
+    .where(and(
+      eq(ExternalMcpConnectionTable.organizationId, input.organizationId),
+      eq(ExternalMcpConnectionTable.externalKey, input.externalKey),
     ))
     .limit(1)
   return rows[0] ?? null
@@ -414,6 +434,42 @@ export async function listActiveExternalMcpConnectionBindings(input: {
     ))
 }
 
+/**
+ * A connection that a plugin created for its own MCP requirement follows that
+ * plugin's lifecycle. Once every plugin bound to it is archived or deleted the
+ * connector is retired: the Connections list must not surface it as an
+ * orphaned, unmanaged row. The binding and credentials stay, so restoring the
+ * plugin brings the connection back. A connection an admin created directly
+ * is never retired here, even when an archived plugin also depends on it.
+ */
+export async function listRetiredPluginOwnedExternalMcpConnectionIds(input: {
+  organizationId: OrganizationId
+  connectionIds: ExternalMcpConnectionId[]
+}): Promise<Set<ExternalMcpConnectionId>> {
+  if (input.connectionIds.length === 0) return new Set()
+  const rows = await db
+    .select({
+      connectionId: PluginMcpRequirementBindingTable.externalMcpConnectionId,
+      connectionOwnedByPlugin: PluginMcpRequirementBindingTable.connectionOwnedByPlugin,
+      pluginDeletedAt: PluginTable.deletedAt,
+      pluginStatus: PluginTable.status,
+    })
+    .from(PluginMcpRequirementBindingTable)
+    .innerJoin(PluginTable, eq(PluginMcpRequirementBindingTable.pluginId, PluginTable.id))
+    .where(and(
+      eq(PluginMcpRequirementBindingTable.organizationId, input.organizationId),
+      inArray(PluginMcpRequirementBindingTable.externalMcpConnectionId, input.connectionIds),
+      eq(PluginTable.organizationId, input.organizationId),
+    ))
+  const ownedByPlugin = new Set<ExternalMcpConnectionId>()
+  const requiredByActivePlugin = new Set<ExternalMcpConnectionId>()
+  for (const row of rows) {
+    if (row.connectionOwnedByPlugin) ownedByPlugin.add(row.connectionId)
+    if (row.pluginStatus === "active" && row.pluginDeletedAt === null) requiredByActivePlugin.add(row.connectionId)
+  }
+  return new Set([...ownedByPlugin].filter((connectionId) => !requiredByActivePlugin.has(connectionId)))
+}
+
 export type ExternalMcpAccessInput = {
   orgWide: boolean
   memberIds: OrgMembershipId[]
@@ -423,6 +479,7 @@ export type ExternalMcpAccessInput = {
 export async function createExternalMcpConnection(input: {
   organizationId: OrganizationId
   name: string
+  externalKey?: string | null
   url: string
   authType: "oauth" | "apikey" | "none"
   kind?: "external_mcp" | "native_provider"
@@ -451,6 +508,7 @@ export async function createExternalMcpConnection(input: {
     id,
     organizationId: input.organizationId,
     name: input.name,
+    externalKey: input.externalKey ?? null,
     url: input.url,
     authType: input.authType,
     kind: input.kind ?? "external_mcp",
@@ -566,6 +624,63 @@ export async function isolateExternalMcpOAuthCallback(input: {
       connectedAt: null,
       updatedAt,
     }
+  })
+}
+
+/**
+ * Callback isolation kept admin-registered clients, so an isolated row can
+ * still send its client's recorded shared redirect while signing a
+ * per-connection callback mode that the shared route rejects. Record the mode
+ * the registered redirect already uses. The redirect, client, credentials,
+ * grants, and bindings are unchanged; transactions signed with the stale mode
+ * keep failing closed.
+ */
+export async function adoptRegisteredSharedExternalMcpOAuthCallback(input: {
+  organizationId: OrganizationId
+  connectionId: ExternalMcpConnectionId
+}): Promise<ExternalMcpConnectionRow | null> {
+  return db.transaction(async (tx) => {
+    const rows = await tx
+      .select()
+      .from(ExternalMcpConnectionTable)
+      .where(and(
+        eq(ExternalMcpConnectionTable.organizationId, input.organizationId),
+        eq(ExternalMcpConnectionTable.id, input.connectionId),
+      ))
+      .limit(1)
+      .for("update")
+    const connection = rows[0]
+    if (!connection || connection.authType !== "oauth" || !connection.oauthConfiguration) return null
+    if (connection.oauthConfiguration.callbackMode === "shared-v1") return null
+
+    const clients = await tx
+      .select({ extra: OrgOAuthClientTable.extra })
+      .from(OrgOAuthClientTable)
+      .where(and(
+        eq(OrgOAuthClientTable.organizationId, input.organizationId),
+        eq(OrgOAuthClientTable.providerId, input.connectionId),
+      ))
+      .limit(1)
+    const clientExtra = normalizeOAuthClientExtra(clients[0]?.extra)
+    const registeredRedirectUri = clientExtra?.registeredRedirectUri
+    if (
+      clientExtra?.enterpriseMcpRegistrationSource !== "pre-registered"
+      || typeof registeredRedirectUri !== "string"
+      || !isExternalMcpSharedCallbackRedirectUri(registeredRedirectUri)
+    ) {
+      return null
+    }
+
+    const oauthConfiguration: ExternalMcpOAuthConfiguration = { ...connection.oauthConfiguration, callbackMode: "shared-v1" }
+    const updatedAt = new Date(Math.max(Date.now(), connection.updatedAt.getTime() + 1))
+    await tx
+      .update(ExternalMcpConnectionTable)
+      .set({ oauthConfiguration, updatedAt })
+      .where(and(
+        eq(ExternalMcpConnectionTable.organizationId, input.organizationId),
+        eq(ExternalMcpConnectionTable.id, input.connectionId),
+      ))
+    return { ...connection, oauthConfiguration, updatedAt }
   })
 }
 

@@ -10,7 +10,6 @@ const workflowPaths = [
   ".github/workflows/ci-enterprise-mcp-mock.yml",
   ".github/workflows/den-db-check.yml",
   ".github/workflows/ci-i18n.yml",
-  ".github/workflows/spec-impact.yml",
 ]
 const expectedConcurrency = [
   "concurrency:",

@@ -34,10 +34,11 @@ import {
   queryValidator,
   type OrganizationContextVariables,
 } from "../../middleware/index.js"
-import { invalidRequestSchema, jsonResponse, notFoundSchema, unauthorizedSchema } from "../../openapi.js"
+import { invalidRequestSchema, jsonResponse, notFoundSchema, textResponse, unauthorizedSchema } from "../../openapi.js"
 import { automationService, type AutomationService } from "../../automations/service.js"
 import { automationRunnerAudienceFromRequest, automationRunnerAuth } from "../../automations/runner-auth.js"
 import { env } from "../../env.js"
+import { OpenWorkWebAccessRequiredError } from "../../openwork-web-runtime-access.js"
 import { databaseRemoteSessionCommandStore } from "../../remote-sessions/commands.js"
 import {
   RUNNER_KEEPALIVE_INTERVAL_MS,
@@ -52,9 +53,13 @@ const paginationSchema = z.object({
   cursor: z.string().min(1).max(160).optional(),
   limit: z.coerce.number().int().min(1).max(100).optional(),
 })
-const runListSchema = z.object({ items: z.array(automationRunSchema), nextCursor: z.string().nullable() })
-const runResponseSchema = z.object({ run: automationRunSchema })
+const runListSchema = z.object({ items: z.array(automationRunSchema), nextCursor: z.string().nullable() }).meta({ ref: "AutomationRunList" })
+const runResponseSchema = z.object({ run: automationRunSchema }).meta({ ref: "AutomationRunResponse" })
 const runnerClaimResponseSchema = z.object({ assignment: automationDesktopRunnerAssignmentSchema.nullable() })
+const openWorkWebAccessRequiredSchema = z.object({
+  error: z.literal("openwork_web_access_required"),
+  message: z.string(),
+}).meta({ ref: "AutomationOpenWorkWebAccessRequiredError" })
 type McpDescribeRouteOptions = DescribeRouteOptions & { "x-mcp": true }
 const describeMcpRoute = (options: McpDescribeRouteOptions) => describeRoute(options)
 // Runner-credential routes must never surface as MCP tools; an MCP caller with
@@ -78,6 +83,9 @@ function scope(c: {
 }
 
 function failure(error: unknown): { status: 400 | 403 | 404 | 409; body: { error: string; message?: string } } | null {
+  if (error instanceof OpenWorkWebAccessRequiredError) {
+    return { status: 403, body: { error: error.code, message: error.message } }
+  }
   if (!(error instanceof Error)) return null
   if (error.message === "automation_runner_identity_conflict") {
     return { status: 409, body: { error: error.message, message: "This desktop runner identity is already registered to a different organization member." } }
@@ -164,7 +172,11 @@ export function registerAutomationRoutes<T extends { Variables: RouteVariables }
       summary: "Report whether a desktop runner is connected",
       description: "Desktop Automations only run while one of the owner's desktops is connected. "
         + "Management surfaces read this to warn before an occurrence is due rather than after it was missed.",
-      responses: { 200: jsonResponse("Desktop runner presence.", automationDesktopRunnerPresenceSchema) },
+      responses: {
+        200: jsonResponse("Desktop runner presence.", automationDesktopRunnerPresenceSchema),
+        401: jsonResponse("Sign-in required.", unauthorizedSchema),
+        404: jsonResponse("Organization not found.", notFoundSchema),
+      },
     }),
     orgMemberRoute(),
     async (c) => c.json(await service.desktopRunnerPresence(scope(c))),
@@ -179,7 +191,30 @@ export function registerAutomationRoutes<T extends { Variables: RouteVariables }
     return (await service.isActiveRunnerOwner(identity)) ? identity : null
   }
 
-  app.get("/v1/automation-runners/events", async (c) => {
+  // Runner protocol routes are spoken only by the signed-in desktop runner.
+  // They are tagged Internal so the published snapshot excludes them while the
+  // served document keeps them for debugging.
+  const runnerErrorSchema = z.object({ error: z.string() })
+  const runnerRoute = (input: { summary: string; description?: string; responses: DescribeRouteOptions["responses"] }) => describeRoute({
+    tags: ["Internal"],
+    security: [{ automationRunnerToken: [] }],
+    summary: input.summary,
+    description: input.description,
+    responses: {
+      ...input.responses,
+      401: jsonResponse("The runner token was missing, expired, or its owner is no longer an active member.", runnerErrorSchema),
+    },
+  })
+  const runnerConflictResponse = jsonResponse("The run lease was lost or the request conflicts with the run's current state.", runnerErrorSchema)
+
+  app.get(
+    "/v1/automation-runners/events",
+    runnerRoute({
+      summary: "Stream Automation runner notifications",
+      description: "Server-sent events stream that tells a desktop runner when work or cancellations are available. Send Last-Event-ID to resume from a cursor.",
+      responses: { 200: textResponse("Server-sent event stream (text/event-stream).") },
+    }),
+    async (c) => {
     const identity = await authenticateRunner(c)
     if (!identity) return c.json({ error: "runner_unauthorized" }, 401)
     const requestedCursor = Number(c.req.header("Last-Event-ID") ?? "0")
@@ -227,9 +262,17 @@ export function registerAutomationRoutes<T extends { Variables: RouteVariables }
         ))
       }
     })
-  })
+    },
+  )
 
-  app.get("/v1/automation-runner/work", async (c) => {
+  app.get(
+    "/v1/automation-runner/work",
+    runnerRoute({
+      summary: "Discover Automation runner work",
+      description: "Returns the runs and remote-session commands currently assignable to this runner.",
+      responses: { 200: jsonResponse("Available work items.", automationRunnerWorkResponseSchema) },
+    }),
+    async (c) => {
     const identity = await authenticateRunner(c)
     if (!identity) return c.json({ error: "runner_unauthorized" }, 401)
     // Automation run items keep their long-standing wire shape untouched;
@@ -252,9 +295,21 @@ export function registerAutomationRoutes<T extends { Variables: RouteVariables }
       }
     }
     return c.json(automationRunnerWorkResponseSchema.parse({ items }))
-  })
+    },
+  )
 
-  app.post("/v1/remote-session-commands/:id/claim", paramValidator(idParamsSchema), async (c) => {
+  app.post(
+    "/v1/remote-session-commands/:id/claim",
+    runnerRoute({
+      summary: "Claim a remote-session command",
+      responses: {
+        200: jsonResponse("The claimed command assignment.", remoteSessionCommandClaimResponseSchema),
+        403: jsonResponse("The runner did not register the remote-session capability.", runnerErrorSchema),
+        409: runnerConflictResponse,
+      },
+    }),
+    paramValidator(idParamsSchema),
+    async (c) => {
     const identity = await authenticateRunner(c)
     if (!identity) return c.json({ error: "runner_unauthorized" }, 401)
     if (!identity.capabilities.includes(REMOTE_SESSION_DESKTOP_RUNNER_CAPABILITY)) {
@@ -278,10 +333,19 @@ export function registerAutomationRoutes<T extends { Variables: RouteVariables }
         expiresAt: command.expiresAt,
       },
     }))
-  })
+    },
+  )
 
   app.post(
     "/v1/remote-session-commands/:id/complete",
+    runnerRoute({
+      summary: "Complete a remote-session command",
+      responses: {
+        200: jsonResponse("The completed command.", remoteSessionCommandCompleteResponseSchema),
+        403: jsonResponse("The runner did not register the remote-session capability.", runnerErrorSchema),
+        409: runnerConflictResponse,
+      },
+    }),
     paramValidator(idParamsSchema), jsonValidator(remoteSessionCommandCompleteRequestSchema),
     async (c) => {
       const identity = await authenticateRunner(c)
@@ -306,24 +370,52 @@ export function registerAutomationRoutes<T extends { Variables: RouteVariables }
     },
   )
 
-  app.post("/v1/automation-runs/:id/claim", paramValidator(automationRunParamsSchema), async (c) => {
+  app.post(
+    "/v1/automation-runs/:id/claim",
+    runnerRoute({
+      summary: "Claim an Automation run",
+      responses: { 200: jsonResponse("The claimed run assignment, or null when the run is no longer claimable.", runnerClaimResponseSchema) },
+    }),
+    paramValidator(automationRunParamsSchema),
+    async (c) => {
     const identity = await authenticateRunner(c)
     if (!identity) return c.json({ error: "runner_unauthorized" }, 401)
     const assignment = await service.claimDesktopRunner(identity, c.req.valid("param").id)
     return c.json(runnerClaimResponseSchema.parse({ assignment }))
-  })
+    },
+  )
 
-  app.post("/v1/automation-runs/:id/heartbeat", paramValidator(automationRunParamsSchema), jsonValidator(automationRunnerHeartbeatRequestSchema), async (c) => {
+  app.post(
+    "/v1/automation-runs/:id/heartbeat",
+    runnerRoute({
+      summary: "Extend an Automation run lease",
+      responses: {
+        200: jsonResponse("The lease was extended.", z.object({ ok: z.literal(true) })),
+        409: runnerConflictResponse,
+      },
+    }),
+    paramValidator(automationRunParamsSchema),
+    jsonValidator(automationRunnerHeartbeatRequestSchema),
+    async (c) => {
     const identity = await authenticateRunner(c)
     if (!identity) return c.json({ error: "runner_unauthorized" }, 401)
     const heartbeat = await service.heartbeatDesktopRunner(identity, c.req.valid("param").id, c.req.valid("json").attempt)
     return heartbeat
       ? c.json(automationRunnerHeartbeatResponseSchema.parse(heartbeat))
       : c.json({ error: "runner_lease_lost" }, 409)
-  })
+    },
+  )
 
   app.post(
     "/v1/automation-runs/:id/events",
+    runnerRoute({
+      summary: "Append an Automation run event",
+      responses: {
+        200: jsonResponse("The recorded event.", z.object({ event: z.object({}).passthrough() })),
+        409: runnerConflictResponse,
+        500: jsonResponse("The event could not be recorded.", runnerErrorSchema),
+      },
+    }),
     paramValidator(automationRunParamsSchema), jsonValidator(automationRunnerEventRequestSchema),
     async (c) => {
       const identity = await authenticateRunner(c)
@@ -348,6 +440,14 @@ export function registerAutomationRoutes<T extends { Variables: RouteVariables }
 
   app.post(
     "/v1/automation-runs/:id/complete",
+    runnerRoute({
+      summary: "Complete an Automation run",
+      responses: {
+        200: jsonResponse("The completed run.", runResponseSchema),
+        409: runnerConflictResponse,
+        500: jsonResponse("The completion could not be recorded; the runner should retry.", runnerErrorSchema),
+      },
+    }),
     paramValidator(automationRunParamsSchema), jsonValidator(automationDesktopRunnerResultSchema),
     async (c) => {
       const identity = await authenticateRunner(c)
@@ -394,6 +494,7 @@ export function registerAutomationRoutes<T extends { Variables: RouteVariables }
         201: jsonResponse("Active Automation created.", automationDetailSchema),
         400: jsonResponse("Invalid request.", invalidRequestSchema),
         401: jsonResponse("Sign-in required.", unauthorizedSchema),
+        403: jsonResponse("OpenWork Web access is required.", openWorkWebAccessRequiredSchema),
         409: jsonResponse("Cloud runtime or model access is unavailable.", invalidRequestSchema),
       },
     }),
@@ -419,6 +520,7 @@ export function registerAutomationRoutes<T extends { Variables: RouteVariables }
         201: jsonResponse("Active Cloud Automation created.", automationDetailSchema),
         400: jsonResponse("Invalid request.", invalidRequestSchema),
         401: jsonResponse("Sign-in required.", unauthorizedSchema),
+        403: jsonResponse("OpenWork Web access is required.", openWorkWebAccessRequiredSchema),
         409: jsonResponse("Cloud runtime or model access is unavailable.", invalidRequestSchema),
       },
     }),
@@ -454,7 +556,11 @@ export function registerAutomationRoutes<T extends { Variables: RouteVariables }
       tags: ["Automations"], operationId: "updateAutomation", "x-mcp": true,
       summary: "Update an Automation",
       description: `${routeDescription} Every behavior-changing edit creates an immutable revision and applies it to future runs immediately.`,
-      responses: { 200: jsonResponse("Automation updated.", automationDetailSchema), 400: jsonResponse("Invalid request.", invalidRequestSchema) },
+      responses: {
+        200: jsonResponse("Automation updated.", automationDetailSchema),
+        400: jsonResponse("Invalid request.", invalidRequestSchema),
+        403: jsonResponse("OpenWork Web access is required for Cloud Automations.", openWorkWebAccessRequiredSchema),
+      },
     }),
     orgMemberRoute(), paramValidator(idParamsSchema), jsonValidator(updateAutomationSchema),
     async (c) => {
@@ -479,7 +585,13 @@ export function registerAutomationRoutes<T extends { Variables: RouteVariables }
       tags: ["Automations"], operationId, "x-mcp": true,
       summary: action === "activate" ? "Activate an Automation" : "Deactivate an Automation",
       description: routeDescription,
-      responses: { 200: jsonResponse("Automation state returned.", automationDetailSchema), 404: jsonResponse("Not found.", notFoundSchema) },
+      responses: {
+        200: jsonResponse("Automation state returned.", automationDetailSchema),
+        ...(action === "activate" ? {
+          403: jsonResponse("OpenWork Web access is required to activate a Cloud Automation.", openWorkWebAccessRequiredSchema),
+        } : {}),
+        404: jsonResponse("Not found.", notFoundSchema),
+      },
     }),
     orgMemberRoute(), paramValidator(idParamsSchema),
     async (c) => {
@@ -502,7 +614,11 @@ export function registerAutomationRoutes<T extends { Variables: RouteVariables }
     describeMcpRoute({
       tags: ["Automations"], operationId: "runAutomationNow", "x-mcp": true,
       summary: "Run an Automation now", description: routeDescription,
-      responses: { 202: jsonResponse("Run queued.", runResponseSchema), 404: jsonResponse("Not found.", notFoundSchema) },
+      responses: {
+        202: jsonResponse("Run queued.", runResponseSchema),
+        403: jsonResponse("OpenWork Web access is required to run a Cloud Automation.", openWorkWebAccessRequiredSchema),
+        404: jsonResponse("Not found.", notFoundSchema),
+      },
     }),
     orgMemberRoute(), paramValidator(idParamsSchema),
     async (c) => {
@@ -525,7 +641,12 @@ export function registerAutomationRoutes<T extends { Variables: RouteVariables }
     describeMcpRoute({
       tags: ["Automations"], operationId: "listAutomationRuns", "x-mcp": true,
       summary: "List Automation runs", description: routeDescription,
-      responses: { 200: jsonResponse("Run history returned.", runListSchema) },
+      responses: {
+        200: jsonResponse("Run history returned.", runListSchema),
+        400: jsonResponse("Invalid request.", invalidRequestSchema),
+        401: jsonResponse("Sign-in required.", unauthorizedSchema),
+        404: jsonResponse("Organization not found.", notFoundSchema),
+      },
     }),
     orgMemberRoute(), paramValidator(idParamsSchema), queryValidator(paginationSchema),
     async (c) => c.json(await service.listRuns(scope(c), c.req.valid("param").id, c.req.valid("query"))),

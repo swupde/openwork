@@ -4,6 +4,7 @@ import { access, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/p
 import { homedir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { allocateFreePort, allocateFreePorts, listTargets, waitForCdp } from "@openwork/cdp";
+import type { SurfaceExit } from "@openwork/cdp";
 import {
   desktopBootstrapPath,
   globalOpencodeConfigDir,
@@ -13,6 +14,7 @@ import {
   openworkServerDataDir,
 } from "@openwork/paths";
 import { ensureDenStack } from "./den-stack.ts";
+import { resolveEvalEngineValue } from "./eval-engine.ts";
 import type { ChildProcess } from "node:child_process";
 import type { DisposableHost, SurfaceHandle, ElectronSurfaceOptions, ChromeSurfaceOptions, DenServiceOptions, DenServiceHandle, ShareLinks } from "./types.ts";
 
@@ -69,6 +71,7 @@ interface ElectronSurfaceEnvOptions {
 interface SpawnedDetached {
   child: ChildProcess;
   pid: number;
+  exit: Promise<SurfaceExit>;
 }
 
 interface SpawnDetachedOptions {
@@ -311,7 +314,10 @@ function spawnDetached(command: string, args: string[], { cwd, env, logPath }: S
   });
   child.unref();
   if (!child.pid) throw new Error(`Could not spawn ${command}.`);
-  return { child, pid: child.pid };
+  const exit = new Promise<SurfaceExit>((resolveExit) => {
+    child.once("exit", (code, signal) => resolveExit({ code, signal }));
+  });
+  return { child, pid: child.pid, exit };
 }
 
 function chromeArgs(cdpPort: number, profileDir: string, startUrl: string, headless: boolean): string[] {
@@ -491,6 +497,7 @@ export function electronSurfaceEnv(
     OPENWORK_DESKTOP_DISABLE_WORKSPACE_RECOVERY: "1",
     OPENWORK_DEV_MODE: "1",
     OPENWORK_ENV_STORE: paths.envStorePath,
+    ...(resolveEvalEngineValue(process.env.OPENWORK_EVAL_ENGINE) === "v2" ? { OPENWORK_ENGINE_V2_PREVIEW: "1" } : {}),
     OPENCODE_CONFIG_DIR: paths.opencodeConfigDir,
     VITE_DISABLE_OPENWORK_MODELS: "1",
     OPENWORK_ELECTRON_APP_IDENTIFIER: options.appIdentifier,
@@ -865,7 +872,8 @@ async function ensureDisplay(repoRoot: string, env: NodeJS.ProcessEnv, log: (mes
           throw new Error(`OPENWORK_EVAL_ELECTRON_BINARY does not exist: ${packagedBinary}`);
         });
         log(`Starting local Electron surface ${name} from packaged binary ${packagedBinary} (CDP :${cdpPort})...`);
-        spawned = spawnDetached(packagedBinary, [], { cwd: options.repoRoot, env, logPath });
+        // An installed artifact must not resolve assets from the checkout's cwd.
+        spawned = spawnDetached(packagedBinary, [], { cwd: profileRoot, env, logPath });
       } else {
         log(`Starting local Electron surface ${name} (Vite :${port}, CDP :${cdpPort})...`);
         spawned = spawnDetached(pnpmCommand(), [opts.devCommand ?? "dev:electron"], { cwd: options.repoRoot, env, logPath });
@@ -889,6 +897,7 @@ async function ensureDisplay(repoRoot: string, env: NodeJS.ProcessEnv, log: (mes
         pid: spawned.pid,
         profileDir: profileRoot,
         meta: { vitePort: String(port), cdpPort: String(cdpPort), log: logPath, profileRoot, profileOwner: callerOwnedProfile ? "caller" : "host" },
+        exit: spawned.exit,
       };
       spawnedSurfaces.add(handle);
       return handle;

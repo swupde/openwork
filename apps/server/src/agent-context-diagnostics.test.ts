@@ -549,11 +549,11 @@ describe("agent context diagnostics analyzer", () => {
         usableByCurrentModel: true,
       } as ConnectSnapshot["cloudHealth"],
       workspace: { resolution: "resolved", id: "ws_test", directory: "/tmp/ws_test" },
-      googleWorkspace: { legacyConfigured: true },
     } satisfies ConnectSnapshot;
 
     expect(expectedConnectBranch(snapshot)).toBe("cloud-active");
     expect(expectedConnectBranch({ ...snapshot, cloudHealth: null })).toBe("extensions-only");
+    expect(expectedConnectBranch({ ...snapshot, connectCatalogEnabled: true, cloudHealth: null })).toBe("cloud-disconnected");
     expect(expectedConnectBranch({
       ...snapshot,
       workspace: { ...snapshot.workspace, resolution: "unknown" },
@@ -1253,7 +1253,7 @@ describe("agent context diagnostics analyzer", () => {
       dependencies: {
         fetchImpl: catalogFetch(["search_capabilities", "execute_capability"], []),
         inspectEffectiveEngine: effectiveEngineInspection(diagnosticRuntimeConfig(), {
-          prompt: "search_capabilities execute_capability Memory Bank",
+          prompt: "search_capabilities execute_capability ## OpenWork Artifacts",
         }),
       },
     });
@@ -1264,7 +1264,7 @@ describe("agent context diagnostics analyzer", () => {
       details: {
         searchCapabilities: true,
         executeCapability: true,
-        memoryBank: true,
+        artifacts: true,
         canonicalPromptDigestMatch: false,
       },
     });
@@ -2027,6 +2027,8 @@ describe("agent context diagnostics route", () => {
 
     expect(response.status).toBe(200);
     const report = agentContextDiagnosticsReportSchema.parse(await response.json());
+    expect(report.connect).not.toHaveProperty("legacyGoogleWorkspaceConfigured");
+    expect(checkById(report, "connect-steering-scope").details).not.toHaveProperty("legacyGoogleWorkspaceConfigured");
     expect(checkById(report, "engine-mcp-sync")).toMatchObject({
       status: "passed",
       code: "managed_mcp_registration_states_healthy",

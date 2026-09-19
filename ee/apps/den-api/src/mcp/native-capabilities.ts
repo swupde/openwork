@@ -1,18 +1,19 @@
 import type { DenTypeId } from "@openwork-ee/utils/typeid"
 import type { Hono } from "hono"
-import { listNativeProviderUsableEntries, type NativeProviderConnectionEntry } from "../capability-sources/native-provider-connections.js"
+import { listNativeProviderUsableEntries, nativeProviderConnectionPolicyError, type NativeProviderConnectionEntry } from "../capability-sources/native-provider-connections.js"
 import type { McpPrincipal } from "./auth.js"
 import type { AgentToolContentPart } from "./tool-content.js"
 import {
   getJsonRequestBodySchema,
   getParameters,
+  getQueryParameterSchema,
   hasJsonRequestBody,
   pathParameterNamesFromTemplate,
   type McpToolOperation,
 } from "./catalog.js"
 import { buildExternalConnectionStatus, type ExternalCapabilityMatch, type McpMemberIdentity } from "./external-capabilities.js"
 import { invokeMcpOperation, normalizeToolBody, normalizeToolRecord } from "./invoke.js"
-import { compareCapabilityMatches, querySchemaFor, scoreText, tokenize, type CapabilityMatch } from "./search.js"
+import { compareCapabilityMatches, scoreText, tokenize, type CapabilityMatch } from "./search.js"
 import {
   codemodeScriptPath,
   resolveCodemodeConnectionNamespaceContext,
@@ -37,7 +38,6 @@ export function parseNativeCapabilityName(name: string): { connectionId: string;
 }
 
 export type NativeCapabilityMatch = CapabilityMatch & {
-  inputSchema?: McpToolOperation["inputSchema"]
   kind?: ExternalCapabilityMatch["kind"]
   status?: ExternalCapabilityMatch["status"]
   hint?: string
@@ -74,7 +74,7 @@ function capabilityMatch(
   scriptNamespace?: string,
 ): NativeCapabilityMatch {
   const bodySchema = getJsonRequestBodySchema(operation.operation)
-  const queryParameters = getParameters(operation.operation, "query")
+  const querySchema = getQueryParameterSchema(operation.operation)
   return {
     name: buildNativeCapabilityName(connection.id, operation.name),
     method: operation.method,
@@ -82,17 +82,17 @@ function capabilityMatch(
     score,
     summary: `[${connection.name}] ${operationSummary(operation)}`,
     pathParams: pathParameterNamesFromTemplate(operation.path),
-    queryParams: queryParameters
+    queryParams: getParameters(operation.operation, "query")
       .flatMap((parameter) => typeof parameter.name === "string" ? [parameter.name] : []),
-    ...(queryParameters.length === 0 ? {} : { querySchema: querySchemaFor(queryParameters) }),
     hasBody: hasJsonRequestBody(operation.operation),
-    inputSchema: operation.inputSchema,
     ...(bodySchema === undefined ? {} : { bodySchema }),
+    ...(querySchema === undefined ? {} : { querySchema }),
+    ...(operation.outputSchema === undefined ? {} : { outputSchema: operation.outputSchema }),
     ...(scriptNamespace ? { scriptPath: codemodeScriptPath(scriptNamespace, operation.name) } : {}),
   }
 }
 
-function connectionStatusMatch(
+export function connectionStatusMatch(
   connection: NativeProviderConnectionEntry,
   score: number,
 ): NativeCapabilityMatch {
@@ -206,6 +206,10 @@ export async function executeNativeCapability(input: {
     catalog: input.catalog,
   })
   if (!resolved) {
+    const policyError = await nativeProviderConnectionPolicyError(input.organizationId)
+    if (policyError) {
+      return { isError: true, content: [{ type: "text", text: JSON.stringify({ error: policyError.kind, message: policyError.message }) }] }
+    }
     return {
       isError: true,
       content: [{

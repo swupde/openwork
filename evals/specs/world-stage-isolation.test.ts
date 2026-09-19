@@ -27,6 +27,18 @@ async function probe(url: string): Promise<number | "rejected"> {
   }
 }
 
+// A live stage must answer; a single 2s attempt on a loaded CI runner is not
+// proof that it does not. Rejection is asserted single-shot only after
+// `eventually` has already observed the process gone.
+async function probeUntilOk(url: string, label: string): Promise<number | "rejected"> {
+  return eventually(() => probe(url), {
+    within: 10_000,
+    intervalMs: 250,
+    label,
+    until: (status) => status === 200,
+  });
+}
+
 test("staged worlds run side by side without touching each other", async ({ evidence }) => {
   const root = await mkdtemp(join(tmpdir(), "openwork-world-stage-isolation-"));
   const worldsDirectory = join(root, "worlds");
@@ -108,14 +120,22 @@ if (import.meta.main) await runRecipe(world);
     assert.equal(isProcessAlive(stageA.pid), true);
     assert.equal(isProcessAlive(stageB.pid), true);
     assert.notEqual(stageA.outputs.url, stageB.outputs.url);
-    assert.equal(await probe(stageA.outputs.url), 200);
-    assert.equal(await probe(stageB.outputs.url), 200);
+    assert.equal(await probeUntilOk(stageA.outputs.url, "stage a answers"), 200);
+    assert.equal(await probeUntilOk(stageB.outputs.url, "stage b answers"), 200);
     const stageAAfterBoth = await readScriptWorldSnapshot(stageAPath);
     const stageBAfterBoth = await readScriptWorldSnapshot(stageBPath);
     assert.ok(stageAAfterBoth);
     assert.ok(stageBAfterBoth);
     assert.equal(stageAAfterBoth.pid, stageA.pid);
     assert.equal(stageBAfterBoth.pid, stageB.pid);
+    assert.equal((await run(["up", fixturePath, "--detach", "--stage", "a"])).code, 0);
+    const changedStage = await run(["up", fixturePath, "--detach", "--stage", "a", "--", "--ref", "changed-stage-ref"]);
+    assert.equal(changedStage.code, 1);
+    assert.match(changedStage.lines.join("\n"), /invocation changed/);
+    assert.equal((await readScriptWorldSnapshot(stageAPath))?.pid, stageA.pid);
+    assert.equal((await readScriptWorldSnapshot(stageBPath))?.pid, stageB.pid);
+    assert.equal(isProcessAlive(stageA.pid), true);
+    assert.equal(isProcessAlive(stageB.pid), true);
     evidence.recordAssertionEvidence(
       "Staged launches have isolated receipts and runtimes",
       "Stages a and b launched with distinct receipt paths, live pids, and responding URLs; parsing both after both launches proved neither receipt overwrote the other.",
@@ -131,7 +151,7 @@ if (import.meta.main) await runRecipe(world);
       label: "stage a stops while stage b remains available",
     });
     assert.equal(await probe(stageA.outputs.url), "rejected");
-    assert.equal(await probe(stageB.outputs.url), 200);
+    assert.equal(await probeUntilOk(stageB.outputs.url, "stage b still answers after stage a is down"), 200);
     assert.equal(await exists(stageAPath), false);
     const stageBAfterDownA = await readScriptWorldSnapshot(stageBPath);
     assert.ok(stageBAfterDownA);

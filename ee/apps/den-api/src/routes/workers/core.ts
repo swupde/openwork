@@ -1,14 +1,17 @@
-import { desc, eq } from "@openwork-ee/den-db/drizzle"
+import { eq } from "@openwork-ee/den-db/drizzle"
 import { WorkerTable, WorkerTokenTable } from "@openwork-ee/den-db/schema"
 import { createDenTypeId, normalizeDenTypeId } from "@openwork-ee/utils/typeid"
 import type { Hono } from "hono"
 import { describeRoute } from "hono-openapi"
 import { z } from "zod"
 import { db } from "../../db.js"
+import { nextCursorSchema } from "../../list-pagination.js"
 import { jsonValidator, orgMemberRoute, paramValidator, queryValidator } from "../../middleware/index.js"
 import { denTypeIdSchema, emptyResponse, forbiddenSchema, invalidRequestSchema, jsonResponse, notFoundSchema, unauthorizedSchema } from "../../openapi.js"
+import { getOpenWorkWebRuntimeAccess, openWorkWebAccessRequiredPayload } from "../../openwork-web-runtime-access.js"
 import { getOrganizationLimitStatus } from "../../organization-limits.js"
 import { getRequiredUserEmail } from "../../user.js"
+import { listWorkersPage } from "../../workers/list.js"
 import type { WorkerRouteVariables } from "./shared.js"
 import {
   continueCloudProvisioning,
@@ -32,6 +35,9 @@ const workerInstanceSchema = z.object({
   provider: z.string(),
   region: z.string().nullable(),
   url: z.string().nullable(),
+  endpointKind: z.enum(["signed-expiring", "stable", "den-tunnel"]).describe(
+    "How the instance endpoint behaves. Anything other than stable means only Den's lifecycle route is durable.",
+  ),
   status: z.string(),
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
@@ -59,6 +65,7 @@ const workerListResponseSchema = z.object({
   workers: z.array(z.object({
     instance: workerInstanceSchema,
   }).merge(workerSchema)),
+  nextCursor: nextCursorSchema,
 }).meta({ ref: "WorkerListResponse" })
 
 const workerResponseSchema = z.object({
@@ -125,6 +132,11 @@ const paymentRequiredSchema = z.object({
   message: z.string(),
 }).meta({ ref: "WorkerPaymentRequiredError" })
 
+const openWorkWebAccessRequiredSchema = z.object({
+  error: z.literal("openwork_web_access_required"),
+  message: z.string(),
+}).meta({ ref: "WorkerOpenWorkWebAccessRequiredError" })
+
 const userEmailRequiredSchema = z.object({
   error: z.literal("user_email_required"),
 }).meta({ ref: "WorkerUserEmailRequiredError" })
@@ -143,7 +155,8 @@ export function registerWorkerCoreRoutes<T extends { Variables: WorkerRouteVaria
     describeRoute({
       tags: ["Workers"],
       summary: "List workers",
-      description: "Lists the workers that belong to the caller's active organization, including each worker's latest known instance state.",
+      description: "Lists the workers that belong to the caller's active organization, newest first, including each worker's latest known instance state. "
+        + "Pass nextCursor from the previous page as cursor to continue; nextCursor is null on the last page.",
       responses: {
         200: jsonResponse("Workers returned successfully.", workerListResponseSchema),
         400: jsonResponse("The worker list query parameters were invalid.", invalidRequestSchema),
@@ -158,15 +171,10 @@ export function registerWorkerCoreRoutes<T extends { Variables: WorkerRouteVaria
     const query = c.req.valid("query")
 
     if (!orgId) {
-      return c.json({ workers: [] })
+      return c.json({ workers: [], nextCursor: null })
     }
 
-    const rows = await db
-      .select()
-      .from(WorkerTable)
-      .where(eq(WorkerTable.org_id, orgId))
-      .orderBy(desc(WorkerTable.created_at))
-      .limit(query.limit)
+    const { items: rows, nextCursor } = await listWorkersPage({ orgId, limit: query.limit, cursor: query.cursor })
 
     const workers = await Promise.all(
       rows.map(async (row) => {
@@ -178,7 +186,7 @@ export function registerWorkerCoreRoutes<T extends { Variables: WorkerRouteVaria
       }),
     )
 
-    return c.json({ workers })
+    return c.json({ workers, nextCursor })
     },
   )
 
@@ -194,6 +202,7 @@ export function registerWorkerCoreRoutes<T extends { Variables: WorkerRouteVaria
         400: jsonResponse("The worker creation payload was invalid.", z.union([invalidRequestSchema, organizationUnavailableSchema, workspacePathRequiredSchema, userEmailRequiredSchema])),
         401: jsonResponse("The caller must be signed in to create workers.", unauthorizedSchema),
         402: jsonResponse("The caller needs an active cloud plan before launching a cloud worker.", paymentRequiredSchema),
+        403: jsonResponse("OpenWork Web access is required to launch a cloud worker.", openWorkWebAccessRequiredSchema),
         409: jsonResponse("The organization has reached its worker limit.", orgLimitReachedSchema),
       },
     }),
@@ -213,6 +222,10 @@ export function registerWorkerCoreRoutes<T extends { Variables: WorkerRouteVaria
     }
 
     if (input.destination === "cloud") {
+      const webAccess = await getOpenWorkWebRuntimeAccess(orgId)
+      if (!webAccess.hasAccess) {
+        return c.json(openWorkWebAccessRequiredPayload(), 403)
+      }
       const email = getRequiredUserEmail(user)
       if (!email) {
         return c.json({ error: "user_email_required" }, 400)
@@ -446,6 +459,7 @@ export function registerWorkerCoreRoutes<T extends { Variables: WorkerRouteVaria
         200: jsonResponse("Worker connection tokens returned successfully.", workerTokensResponseSchema),
         400: jsonResponse("The worker token path parameters were invalid.", invalidRequestSchema),
         401: jsonResponse("The caller must be signed in to request worker tokens.", unauthorizedSchema),
+        403: jsonResponse("OpenWork Web access is required to use cloud worker tokens.", openWorkWebAccessRequiredSchema),
         404: jsonResponse("The worker could not be found.", notFoundSchema),
         409: jsonResponse("The worker is not ready to return connection tokens yet.", workerRuntimeUnavailableSchema),
       },

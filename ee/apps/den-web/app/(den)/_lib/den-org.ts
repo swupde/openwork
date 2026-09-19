@@ -1,3 +1,5 @@
+import { parseDeploymentCapabilities, type DeploymentCapabilities } from "@openwork/types/den/deployment-capabilities";
+
 export type DenOrgSummary = {
   id: string;
   name: string;
@@ -18,6 +20,8 @@ export type DenOrgMember = {
   userId: string | null;
   inviteId: string | null;
   role: string;
+  effectiveRole: string;
+  adminTeams: { id: string; name: string }[];
   createdAt: string | null;
   joinedAt: string | null;
   isOwner: boolean;
@@ -46,6 +50,7 @@ export type DenOrgTeam = {
   updatedAt: string | null;
   memberIds: string[];
   managedByScim: boolean;
+  grantsOrganizationAdmin: boolean;
 };
 
 export type DenCurrentMemberTeam = {
@@ -217,6 +222,8 @@ export type DenOrgContext = {
     role: string;
     createdAt: string | null;
     isOwner: boolean;
+    directRole: string;
+    adminTeams: { id: string; name: string }[];
   };
   members: DenOrgMember[];
   invitations: DenOrgInvitation[];
@@ -226,6 +233,7 @@ export type DenOrgContext = {
   entitlements: DenOrgEntitlements;
   authMethods: DenOrgAuthMethods;
   capabilities: DenOrgCapabilities;
+  deploymentCapabilities: DeploymentCapabilities;
 };
 
 export type DenOrgAuthMethods = {
@@ -242,6 +250,8 @@ export type DenOrgEntitlements = {
 
 /** Server-advertised and per-org capabilities; optional fields default to off. */
 export type DenOrgCapabilities = {
+  /** Platform-admin opt-in for the Gateway dashboard only; never a runtime inference gate. */
+  gatewayDashboard: boolean;
   orgManagedDashboards: boolean;
   installLinks: boolean;
   mcpConnections: boolean;
@@ -298,6 +308,13 @@ function asIsoString(value: unknown): string | null {
 
 function asBoolean(value: unknown): boolean {
   return value === true;
+}
+
+function parseAdminTeams(value: unknown): { id: string; name: string }[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((team) => isRecord(team) && typeof team.id === "string" && typeof team.name === "string"
+    ? [{ id: team.id, name: team.name }]
+    : []);
 }
 
 function asString(value: unknown): string | null {
@@ -499,6 +516,14 @@ export function getMarketplaceOnboardingRoute(_orgSlug?: string | null): string 
   return `${getOrgDashboardRoute(_orgSlug)}/onboarding`;
 }
 
+export function getOnboardingToolsRoute(orgSlug?: string | null): string {
+  return `${getMarketplaceOnboardingRoute(orgSlug)}/tools`;
+}
+
+export function getOnboardingPeopleRoute(orgSlug?: string | null): string {
+  return `${getMarketplaceOnboardingRoute(orgSlug)}/people`;
+}
+
 export function getJoinOrgRoute(invitationId: string): string {
   return `/join-org?invite=${encodeURIComponent(invitationId)}`;
 }
@@ -509,6 +534,10 @@ export function getWorkspaceClaimRoute(token: string): string {
 
 export function getAnalyticsRoute(orgSlug?: string | null): string {
   return `${getOrgDashboardRoute(orgSlug)}/analytics`;
+}
+
+export function getModelsAnalyticsRoute(orgSlug?: string | null): string {
+  return `${getAnalyticsRoute(orgSlug)}/models`;
 }
 
 export function getManageMembersRoute(orgSlug?: string | null): string {
@@ -528,7 +557,7 @@ export function getBackgroundAgentsRoute(orgSlug?: string | null): string {
 }
 
 export function getWorkflowRunsRoute(orgSlug?: string | null): string {
-  return `${getOrgDashboardRoute(orgSlug)}/workflow-runs`;
+  return `${getAnalyticsRoute(orgSlug)}/workflow-runs`;
 }
 
 export function getAutomationsRoute(orgSlug?: string | null): string {
@@ -581,6 +610,22 @@ export function getEditLlmProviderRoute(orgSlug: string | null | undefined, llmP
 
 export function getNewLlmProviderRoute(orgSlug?: string | null): string {
   return `${getLlmProvidersRoute(orgSlug)}/new`;
+}
+
+export function getGatewayProvidersRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/gateway-providers`;
+}
+
+export function getGatewayProviderRoute(orgSlug: string | null | undefined, inferenceProviderId: string): string {
+  return `${getGatewayProvidersRoute(orgSlug)}/${encodeURIComponent(inferenceProviderId)}`;
+}
+
+export function getEditGatewayProviderRoute(orgSlug: string | null | undefined, inferenceProviderId: string): string {
+  return `${getGatewayProviderRoute(orgSlug, inferenceProviderId)}/edit`;
+}
+
+export function getNewGatewayProviderRoute(orgSlug?: string | null): string {
+  return `${getGatewayProvidersRoute(orgSlug)}/new`;
 }
 
 export function getBillingRoute(orgSlug?: string | null): string {
@@ -651,12 +696,30 @@ export function getIntegrationsRoute(orgSlug?: string | null): string {
   return `${getOrgDashboardRoute(orgSlug)}/integrations`;
 }
 
+export function getPluginSourcesRoute(orgSlug?: string | null): string {
+  return `${getPluginsRoute(orgSlug)}?view=sources`;
+}
+
 export function getGithubIntegrationRoute(orgSlug?: string | null): string {
   return `${getIntegrationsRoute(orgSlug)}/github`;
 }
 
 export function getMcpConnectionsRoute(orgSlug?: string | null): string {
   return `${getOrgDashboardRoute(orgSlug)}/mcp-connections`;
+}
+
+export function getConfiguredMcpConnectionsRoute(orgSlug?: string | null, connectionId?: string | null): string {
+  const base = `${getMcpConnectionsRoute(orgSlug)}/configured`;
+  return connectionId ? `${base}?connectionId=${encodeURIComponent(connectionId)}` : base;
+}
+
+/**
+ * Detail page for one connector. `connectorId` is a configured connection id
+ * or, for connectors nobody has added yet, the catalog id (`gmail`, `notion`,
+ * `microsoft-365`) so the page can explain the connector and start setup.
+ */
+export function getMcpConnectionRoute(orgSlug: string | null | undefined, connectorId: string): string {
+  return `${getMcpConnectionsRoute(orgSlug)}/${encodeURIComponent(connectorId)}`;
 }
 
 export function getYourConnectionsRoute(orgSlug?: string | null): string {
@@ -776,6 +839,8 @@ export function parseOrgContextPayload(payload: unknown): DenOrgContext | null {
             userId,
             inviteId: asString(entry.inviteId),
             role,
+            effectiveRole: asString(entry.effectiveRole) ?? role,
+            adminTeams: parseAdminTeams(entry.adminTeams),
             createdAt: asIsoString(entry.createdAt),
             joinedAt: asIsoString(entry.joinedAt),
             isOwner: asBoolean(entry.isOwner),
@@ -862,6 +927,7 @@ export function parseOrgContextPayload(payload: unknown): DenOrgContext | null {
             updatedAt: asIsoString(entry.updatedAt),
             memberIds,
             managedByScim: asBoolean(entry.managedByScim),
+            grantsOrganizationAdmin: asBoolean(entry.grantsOrganizationAdmin),
           } satisfies DenOrgTeam;
         })
         .filter((entry): entry is DenOrgTeam => entry !== null)
@@ -916,6 +982,8 @@ export function parseOrgContextPayload(payload: unknown): DenOrgContext | null {
       id: currentMemberId,
       userId: currentMemberUserId,
       role: currentMemberRole,
+      directRole: asString(currentMember.directRole) ?? currentMemberRole,
+      adminTeams: parseAdminTeams(currentMember.adminTeams),
       createdAt: asIsoString(currentMember.createdAt),
       isOwner: asBoolean(currentMember.isOwner),
     },
@@ -927,6 +995,7 @@ export function parseOrgContextPayload(payload: unknown): DenOrgContext | null {
     entitlements: parseOrgEntitlements(payload.entitlements),
     authMethods: parseOrgAuthMethods(payload.authMethods),
     capabilities: parseOrgCapabilities(payload.capabilities),
+    deploymentCapabilities: parseDeploymentCapabilities(payload.deploymentCapabilities),
   };
 }
 
@@ -943,11 +1012,12 @@ function parseOrgAuthMethods(value: unknown): DenOrgAuthMethods {
 
 function parseOrgCapabilities(value: unknown): DenOrgCapabilities {
   if (!isRecord(value)) {
-    return { orgManagedDashboards: false, installLinks: false, mcpConnections: false, workflows: true, openworkWeb: false, cloud: false };
+    return { gatewayDashboard: false, orgManagedDashboards: false, installLinks: false, mcpConnections: false, workflows: true, openworkWeb: false, cloud: false };
   }
 
   return {
     orgManagedDashboards: value.orgManagedDashboards === true,
+    gatewayDashboard: value.gatewayDashboard === true,
     installLinks: value.installLinks === true,
     mcpConnections: value.mcpConnections === true,
     // Workflows are enabled everywhere on current servers; only an explicit

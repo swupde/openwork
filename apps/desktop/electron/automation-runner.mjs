@@ -73,7 +73,13 @@ function createWorkspaceSessionClient(local, workspaceId, fetchImpl) {
     baseUrl: local.baseUrl,
     workspaceId,
     token: local.token,
-    fetch: fetchImpl,
+    // Automation run receipts own recovery; desktop restart must not independently
+    // resume an occurrence that its scheduler may already have settled or retried.
+    fetch: (input, init) => {
+      const headers = new Headers(init?.headers)
+      headers.set("x-openwork-task-recovery", "off")
+      return fetchImpl(input, { ...init, headers })
+    },
     requestTimeoutMs: 0,
   })
 }
@@ -181,14 +187,15 @@ export async function executeDesktopAutomation(assignment, options) {
       // suspends mid-request can leave this socket half-open with no error,
       // which would make the assignment timeout unreachable: bound each poll
       // by the remaining execution budget so the deadline always fires.
+      const timeoutSignal = AbortSignal.timeout(Math.max(1, deadlineAt - Date.now()))
       let snapshot
       try {
         snapshot = await client.getThreadSnapshot(sessionId, {
-          signal: AbortSignal.any([options.signal, AbortSignal.timeout(Math.max(1, deadlineAt - Date.now()))]),
+          signal: AbortSignal.any([options.signal, timeoutSignal]),
           limit: 200,
         })
       } catch (error) {
-        if (!options.signal.aborted && Date.now() >= deadlineAt) throw new Error("Desktop Automation execution timed out")
+        if (!options.signal.aborted && (timeoutSignal.aborted || Date.now() >= deadlineAt)) throw new Error("Desktop Automation execution timed out")
         throw error
       }
       const output = assistantResult(snapshot)

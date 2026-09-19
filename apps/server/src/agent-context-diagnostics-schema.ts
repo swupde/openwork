@@ -8,7 +8,7 @@ import type {
 
 // Keep runtime validation local: Electron imports the compiled server with Node,
 // while the shared types workspace intentionally exports source for app builds.
-export const AGENT_CONTEXT_DIAGNOSTICS_SCHEMA_VERSION = 1 as const;
+export const AGENT_CONTEXT_DIAGNOSTICS_SCHEMA_VERSION = 2 as const;
 
 export const AGENT_CONTEXT_DIAGNOSTIC_CHECK_IDS = [
   "request-safety",
@@ -390,7 +390,7 @@ const promptEvidenceSchema = z.object({
   markers: z.object({
     searchCapabilities: z.boolean(),
     executeCapability: z.boolean(),
-    memoryBank: z.boolean(),
+    artifacts: z.boolean(),
   }).strict(),
 }).strict();
 
@@ -435,7 +435,6 @@ const mcpEvidenceSchema = z.object({
 const connectEvidenceSchema = z.object({
   stateStatus: z.enum(["available", "missing", "invalid", "unreadable"]),
   connectEnabled: z.boolean(),
-  legacyGoogleWorkspaceConfigured: z.boolean(),
   expectedBranch: z.enum(["cloud-active", "cloud-disconnected", "extensions-only"]),
   globalCloudMcpPresent: z.boolean(),
   selectedWorkspaceCloudMcpPresent: z.boolean(),

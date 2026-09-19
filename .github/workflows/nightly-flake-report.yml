@@ -3,7 +3,7 @@
 # the report to the run summary and artifacts, and fails when any spec is
 # flaky or below the pass-rate threshold so the failure-alert workflow files
 # a developer-facing issue.
-name: Nightly Flake Report
+name: Test reliability
 
 on:
   schedule:
@@ -82,19 +82,6 @@ jobs:
           set -euo pipefail
           node scripts/flake-report.mjs report --project pr --threshold "$FLAKE_THRESHOLD"
           cat results/flake/pr/flake-report.md >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Publish scenario coverage matrix
-        shell: bash
-        working-directory: evals
-        run: |
-          set -euo pipefail
-          node scripts/spec-coverage-matrix.mjs --out results/flake/spec-coverage-matrix.md
-          {
-            echo ""
-            head -3 results/flake/spec-coverage-matrix.md
-            echo ""
-            echo "Full matrix in the run artifacts."
-          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload flake report artifacts
         if: always()

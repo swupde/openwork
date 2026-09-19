@@ -44,6 +44,7 @@ const CODE_COPY_ICON = `<svg data-openwork-code-copy-icon="" xmlns="http://www.w
 const CODE_COPIED_ICON = `<svg data-openwork-code-copy-check-icon="" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="h-3.5 w-3.5" aria-hidden="true" hidden><path d="M20 6 9 17l-5-5"/></svg>`;
 const CODE_WRAP_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="h-3.5 w-3.5" aria-hidden="true"><path d="M3 6h18M3 12h15a3 3 0 1 1 0 6h-3"/><path d="m12 18-3 3 3 3"/></svg>`;
 const INLINE_CODE_FILE_EXTENSIONS = new Set([
+  "mp4", "webm", "mov", "m4v", "ogv",
   "astro", "bash", "c", "cc", "cpp", "cs", "css", "dart", "docx", "ex", "exs", "gif", "go", "graphql",
   "h", "hpp", "htm", "html", "java", "jpeg", "jpg", "js", "json", "jsonc", "jsx", "key", "kt", "kts",
   "lua", "markdown", "md", "mdx", "mmd", "mjs", "cjs", "odp", "ods", "pdf", "php", "png", "pot", "potx",
@@ -248,6 +249,9 @@ function sanitizeMarkdownHtml(value: string) {
     // (and copy-as-TeX) half of every formula is stripped.
     ADD_TAGS: ["annotation", "semantics"],
     ADD_ATTR: [
+      "controls",
+      "playsinline",
+      "preload",
       "checked",
       "class",
       "data-openwork-math-error",
@@ -321,7 +325,20 @@ function markdownProfileForPresentation(presentation: MarkdownPresentation): Mar
   };
 }
 
+function renderVideo(href: string, label: string) {
+  if (!/\.(?:mp4|webm|mov|m4v|ogv)(?:[?#].*)?$/i.test(href)) return null;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(href) && !/^(?:https?|file):/i.test(href) && !/^[A-Za-z]:[\\/]/.test(href)) return null;
+  const remote = /^https?:/i.test(href);
+  const source = remote ? ` src="${escapeAttribute(safeHref(href))}"` : "";
+  const fileLink = remote
+    ? `href="${escapeAttribute(safeHref(href))}" target="_blank" rel="noopener noreferrer"`
+    : `href="#" data-openwork-inline-code-path="${escapeAttribute(href)}"`;
+  return `<span class="my-4 inline-block w-full max-w-lg align-top"><video data-openwork-video-path="${escapeAttribute(href)}"${source} controls playsinline preload="metadata" aria-label="${escapeAttribute(label)}" class="block max-h-80 w-full rounded-lg border border-border/70 bg-black"></video><span data-openwork-video-error="" hidden class="text-sm text-muted-foreground">Video preview unavailable. Open the file to play it.</span><a ${fileLink} class="text-sm text-indigo-10">${escapeHtml(label)}</a></span>`;
+}
+
 function renderLink(profile: MarkdownProfile, href: string, title: string | null | undefined, text: string) {
+  const video = profile.linkPresentation === "chat" ? renderVideo(href, href) : null;
+  if (video) return video;
   const safe = escapeAttribute(safeHref(href));
   const titleAttr = title ? ` title="${escapeAttribute(title)}"` : "";
 
@@ -348,6 +365,8 @@ function renderLink(profile: MarkdownProfile, href: string, title: string | null
 }
 
 function renderImage(profile: MarkdownProfile, href: string, title: string | null | undefined, text: string) {
+  const video = profile.linkPresentation === "chat" ? renderVideo(href, href) : null;
+  if (video) return video;
   const safe = escapeAttribute(safeHref(href));
   const titleAttr = title ? ` title="${escapeAttribute(title)}"` : "";
 
@@ -398,6 +417,8 @@ function createMarkedOptions(profile: MarkdownProfile, presentation: MarkdownPre
       },
       codespan({ text }) {
         const path = profile.linkPresentation === "chat" ? inlineCodeArtifactPath(text) : null;
+        const video = path ? renderVideo(path, path) : null;
+        if (video) return video;
         const pathAttributes = path
           ? ` data-openwork-inline-code-path="${escapeAttribute(path)}" role="button" tabindex="0" aria-label="Open ${escapeAttribute(path)}"`
           : "";
@@ -529,6 +550,101 @@ export function renderMarkdownHtml(text: string, presentation: MarkdownPresentat
 
   const { markdownParser } = parsersForPresentation(presentation);
   return sanitizeMarkdownHtml(markdownParser.parse(text, { async: false }));
+}
+
+/**
+ * `dangerouslySetInnerHTML` payload for one top-level markdown block. The same
+ * object is returned for as long as that block's source is unchanged, so React
+ * leaves its DOM alone while later blocks keep streaming in.
+ */
+export type MarkdownBlockHtml = { readonly __html: string };
+
+export type StreamingMarkdownRenderer = {
+  /** Sanitized HTML for every top-level block of `text`, in document order. */
+  render: (text: string) => MarkdownBlockHtml[];
+  /** Drop the retained tokens once the message has settled. */
+  reset: () => void;
+};
+
+type StreamingMarkdownState = {
+  source: string;
+  tokens: Token[];
+  blocks: MarkdownBlockHtml[];
+};
+
+/**
+ * Blocks re-lexed on every append: the one still growing plus its predecessor,
+ * because a growing block can retroactively reshape the block before it (lazy
+ * list continuation, a setext underline, a table delimiter row).
+ */
+const STREAMING_RELEX_TAIL = 2;
+
+function hasReferenceDefinition(tokens: Token[]) {
+  return tokens.some((token) => token.type === "def");
+}
+
+/**
+ * Incremental markdown renderer for a message that is still streaming. A full
+ * `renderMarkdownHtml` re-lexes, re-parses, and re-sanitizes the whole answer
+ * for every token that arrives, so each frame costs as much as the text so far.
+ * This keeps the previous frame's top-level tokens and re-lexes only the tail
+ * of an appended source; settled blocks reuse their previous HTML payload.
+ *
+ * Reference-style link definitions resolve across blocks, so a source that
+ * contains one always takes the full lex.
+ */
+export function createStreamingMarkdownRenderer(presentation: MarkdownPresentation = "chat"): StreamingMarkdownRenderer {
+  const { markdownParser } = parsersForPresentation(presentation);
+  let state: StreamingMarkdownState | null = null;
+
+  const renderBlock = (token: Token): MarkdownBlockHtml => ({
+    __html: sanitizeMarkdownHtml(markdownParser.parser([token])),
+  });
+
+  const renderAll = (source: string, previous: StreamingMarkdownState | null): StreamingMarkdownState => {
+    const tokens = markdownParser.lexer(source);
+    const reusable = previous && !hasReferenceDefinition(tokens) && !hasReferenceDefinition(previous.tokens)
+      ? previous
+      : null;
+    const blocks = tokens.map((token, index) => {
+      const priorToken = reusable?.tokens[index];
+      const priorBlock = reusable?.blocks[index];
+      return priorToken && priorBlock && priorToken.raw === token.raw ? priorBlock : renderBlock(token);
+    });
+    return { source, tokens, blocks };
+  };
+
+  const renderAppended = (source: string, previous: StreamingMarkdownState): StreamingMarkdownState | null => {
+    const keep = previous.tokens.length - STREAMING_RELEX_TAIL;
+    if (keep <= 0 || hasReferenceDefinition(previous.tokens)) return null;
+
+    let offset = 0;
+    for (const token of previous.tokens.slice(0, keep)) offset += token.raw.length;
+    const tail = markdownParser.lexer(source.slice(offset));
+    if (hasReferenceDefinition(tail)) return null;
+
+    return {
+      source,
+      tokens: [...previous.tokens.slice(0, keep), ...tail],
+      blocks: [...previous.blocks.slice(0, keep), ...tail.map(renderBlock)],
+    };
+  };
+
+  return {
+    render(text) {
+      // Marked normalizes line endings before lexing; mirror it so token raw
+      // lengths index into `source`.
+      const source = text.replace(/\r\n|\r/g, "\n");
+      if (state?.source === source) return state.blocks;
+
+      const appended = state && source.startsWith(state.source) ? renderAppended(source, state) : null;
+      state = appended ?? renderAll(source, state);
+      return state.blocks;
+    },
+    reset() {
+      state = null;
+    },
+  };
 }
 
 export async function renderHighlightedMarkdownHtml(text: string, presentation: MarkdownPresentation = "chat") {

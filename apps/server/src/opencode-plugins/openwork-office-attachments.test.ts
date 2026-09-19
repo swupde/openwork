@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -201,7 +201,7 @@ describe("OpenWorkOfficeAttachments", () => {
       expect(pptxText).toContain(`sha256: ${sha256(pptx)}`);
       expect(JSON.stringify(messages)).not.toContain(docx.toString("base64"));
       expect(JSON.stringify(messages)).not.toContain('"type":"file"');
-      const executionRoot = runtimeWorkspaceFilesRoot(runtimeRoot, root);
+      const executionRoot = await realpath(runtimeWorkspaceFilesRoot(runtimeRoot, root));
       expect(pathFromText(docxText).startsWith(executionRoot)).toBe(true);
       expect(pathFromText(pptxText).startsWith(executionRoot)).toBe(true);
       await expect(readFile(pathFromText(docxText))).resolves.toEqual(docx);
@@ -210,7 +210,7 @@ describe("OpenWorkOfficeAttachments", () => {
     });
   });
 
-  test("extracts XLSX structure, values, formulas, styles, merged cells, and materializes exact bytes", async () => {
+  test("previews XLSX sheets as a grid with formulas, number formats, merged cells, a tool pointer, and materializes exact bytes", async () => {
     await withWorkspace(async (root) => {
       const xlsx = xlsxFixture();
       const messages = await transform(root, [{
@@ -225,14 +225,14 @@ describe("OpenWorkOfficeAttachments", () => {
       expect(text).toContain(`sha256: ${sha256(xlsx)}`);
       expect(text).toContain("xlsx_workbook:");
       expect(text).toContain("sheet_count: 1");
-      expect(text).toContain("name: \"Summary\"");
-      expect(text).toContain("merged_ranges: \"A1:D1\"");
-      expect(text).toContain("cell: \"A1\"");
-      expect(text).toContain(`displayed_value: "${XLSX_SENTINEL}"`);
-      expect(text).toContain("cell: \"C2\"");
-      expect(text).toContain("raw_value: \"1742.42\"");
-      expect(text).toContain("number_format: \"$#,##0.00\"");
-      expect(text).toContain("formula: \"SUM(C2:C3)\"");
+      expect(text).toContain("sheet \"Summary\" (1 of 1): dimension A1:D3; 6 cells in rows 1-3, columns A-D; 1 formula; merged A1:D1");
+      expect(text).toContain("| # | A | B | C | D |");
+      expect(text).toContain(`| 1 | ${XLSX_SENTINEL} |  |  |  |`);
+      expect(text).toContain("| 2 | Northstar Revenue | EMEA | 1742.42 | 3484.84 |");
+      expect(text).toContain("| 3 |  |  | 1742.42 |  |");
+      expect(text).toContain("formulas: D2: =SUM(C2:C3) → 3484.84");
+      expect(text).toContain("number_formats: \"$#,##0.00\" (C2, D2, C3)");
+      expect(text).toContain(`next_step: the read tool cannot open .xlsx; use spreadsheet_inspect and spreadsheet_read with path "${pathFromText(text)}"`);
       expect(JSON.stringify(messages)).not.toContain(xlsx.toString("base64"));
       expect(JSON.stringify(messages)).not.toContain('"type":"file"');
       await expect(readFile(pathFromText(text))).resolves.toEqual(xlsx);
@@ -255,8 +255,8 @@ describe("OpenWorkOfficeAttachments", () => {
       const xlsxText = textOf(xlsxPart);
 
       expect(docxText).toContain("Alpha & Beta <tag> &lt;once&gt; nested bold tail");
-      expect(xlsxText).toContain('displayed_value: "Sheet & <cell> &lt;once&gt;nested"');
-      expect(xlsxText).toContain('raw_value: "1742"');
+      expect(xlsxText).toContain("| 1 | Sheet & <cell> &lt;once&gt;nested |  |  |  |");
+      expect(xlsxText).toContain("| 2 | Northstar Revenue | EMEA | 1742 | 3484.84 |");
       expect(docxText).not.toContain("SCRIPT_SENTINEL");
       expect(docxText).not.toContain("STYLE_SENTINEL");
       expect(xlsxText).not.toContain("SCRIPT_SENTINEL");
@@ -346,11 +346,45 @@ describe("OpenWorkOfficeAttachments", () => {
         await symlink(outside, join(root, "linked-outside"), "dir");
         const messages = await transform(root, [{ role: "user", parts: [{ type: "file", filename: "QuarterlyBrief.docx", mediaType: DOCX_MIME, url: pathToFileURL(join(root, "linked-outside", "QuarterlyBrief.docx")).toString() }] }]);
         const text = textOf(messageParts(messages[0])[0]);
-        expect(text).toContain("points outside OpenWork-approved storage");
+        expect(text).toContain("passes through a symbolic link");
         expect(text).toContain("sha256: unavailable");
       } finally {
         await rm(outside, { recursive: true, force: true });
       }
+    });
+  });
+
+  test("never materializes attachment bytes through a symlinked inbox folder", async () => {
+    await withWorkspace(async (root, runtimeRoot) => {
+      const outside = await mkdtemp(join(tmpdir(), "openwork-office-inbox-outside-"));
+      try {
+        const executionRoot = runtimeWorkspaceFilesRoot(runtimeRoot, root);
+        await mkdir(executionRoot, { recursive: true });
+        await symlink(outside, join(executionRoot, "inbox"), "dir");
+        const docx = docxFixture();
+        const messages = await transform(root, [{ role: "user", parts: [{ type: "file", filename: "QuarterlyBrief.docx", mediaType: DOCX_MIME, url: dataUrl(DOCX_MIME, docx) }] }]);
+        const text = textOf(messageParts(messages[0])[0]);
+        expect(text).toContain("is a symbolic link, which is not allowed");
+        expect(text).toContain("execution_path: unavailable");
+        expect(text).not.toContain(DOCX_SENTINEL);
+        await expect(readdir(outside)).resolves.toEqual([]);
+      } finally {
+        await rm(outside, { recursive: true, force: true });
+      }
+    });
+  });
+
+  test("materializes into the real inbox folder and reuses identical bytes", async () => {
+    await withWorkspace(async (root, runtimeRoot) => {
+      const docx = docxFixture();
+      const part = { type: "file", filename: "QuarterlyBrief.docx", mediaType: DOCX_MIME, url: dataUrl(DOCX_MIME, docx) };
+      const first = pathFromText(textOf(messageParts((await transform(root, [{ role: "user", parts: [part] }]))[0])[0]));
+      const second = pathFromText(textOf(messageParts((await transform(root, [{ role: "user", parts: [part] }]))[0])[0]));
+      expect(second).toBe(first);
+      const inbox = await realpath(join(runtimeWorkspaceFilesRoot(runtimeRoot, root), "inbox", "chat-attachments"));
+      expect(first).toBe(join(inbox, `${sha256(docx).slice(0, 16)}-QuarterlyBrief.docx`));
+      await expect(readdir(inbox)).resolves.toEqual([`${sha256(docx).slice(0, 16)}-QuarterlyBrief.docx`]);
+      await expect(readFile(first)).resolves.toEqual(docx);
     });
   });
 
@@ -390,7 +424,7 @@ describe("OpenWorkOfficeAttachments", () => {
       const text = textOf(messageParts(messages[0])[0]);
 
       expect(text).toContain(DOCX_SENTINEL);
-      expect(pathFromText(text).startsWith(executionRoot)).toBe(true);
+      expect(pathFromText(text).startsWith(await realpath(executionRoot))).toBe(true);
       await expect(readFile(pathFromText(text))).resolves.toEqual(docx);
     });
   });

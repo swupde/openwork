@@ -1,5 +1,5 @@
 import { createDenTypeId } from "@openwork-ee/utils/typeid"
-import { afterAll, beforeAll, describe, expect, test } from "bun:test"
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test"
 
 function seedRequiredEnv(): void {
   process.env.DATABASE_URL = process.env.DATABASE_URL ?? "mysql://root:password@127.0.0.1:3306/openwork_test_pr7"
@@ -86,7 +86,7 @@ function context(offsetMs = 30_000) {
 }
 
 describe("Den enterprise MCP OAuth persistence adapter", () => {
-  test("records reconnect-required health when a provider rejects a saved credential", async () => {
+  test("preserves a newer credential and logs rejection only for the revision that was read", async () => {
     const rejected = await createExternalMcpConnection({
       organizationId,
       name: "Enterprise MCP rejected credential",
@@ -104,16 +104,81 @@ describe("Den enterprise MCP OAuth persistence adapter", () => {
       .where(drizzle.eq(schema.ExternalMcpConnectionTable.id, rejected.id))
       .limit(1))[0]
     if (!current) throw new Error("Expected the rejected credential connection.")
-    const persistence = new DenEnterpriseMcpOAuthPersistence(current)
+    const { ExternalMcpDiagnosticTracker, createExternalMcpDiagnosticFetch } = await import("../src/capability-sources/external-mcp-diagnostics.js")
+    const { appLogger } = await import("../src/observability/logger.js")
+    const tracker = new ExternalMcpDiagnosticTracker("invalidation-test-reference")
+    const persistence = new DenEnterpriseMcpOAuthPersistence(current, undefined, tracker)
+    const rejectionContext = { ...context(), connectionId: current.id }
+    const loaded = await persistence.credentials.load(rejectionContext)
+    if (!loaded) throw new Error("Expected the saved credential")
+    const newerUpdatedAt = new Date(current.updatedAt.getTime() + 1_000)
+    await db.update(schema.ExternalMcpConnectionTable).set({
+      accessToken: "newer-access-secret",
+      refreshToken: "newer-refresh-secret",
+      updatedAt: newerUpdatedAt,
+    }).where(drizzle.eq(schema.ExternalMcpConnectionTable.id, current.id))
+    await createExternalMcpDiagnosticFetch({
+      endpoint: current.url,
+      tracker,
+      fetch: async () => Response.json({ error: "invalid_grant", access_token: "provider-access-secret", refresh_token: "provider-refresh-secret" }, { status: 400 }),
+    })("https://identity.example.test/token", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ grant_type: "refresh_token" }) })
+    const logged = spyOn(appLogger, "warn").mockImplementation(() => {})
 
-    await persistence.credentials.invalidate({
-      context: {
-        connectionId: current.id,
-        commitExpiresAt: Date.now() + 30_000,
-        signal: new AbortController().signal,
-      },
-      reason: "provider-rejected",
-    })
+    try {
+      await expect(persistence.credentials.invalidate({
+        context: { ...rejectionContext, commitExpiresAt: Date.now() - 1 },
+        reason: "provider-rejected",
+      })).rejects.toThrow("deadline expired")
+      expect(logged).not.toHaveBeenCalled()
+      await persistence.credentials.invalidate({
+        context: rejectionContext,
+        reason: "provider-rejected",
+      })
+      expect(logged).toHaveBeenCalledTimes(1)
+      expect(logged.mock.calls[0]).toEqual([
+        "external_mcp_credential_invalidation_skipped",
+        expect.objectContaining({
+          connection_id: current.id,
+          organization_id: organizationId,
+          org_membership_id: null,
+          reason: "provider-rejected",
+          loaded_revision: loaded.revision,
+          current_revision: `${current.id}:${newerUpdatedAt.getTime()}`,
+          revision_changed: true,
+          had_access: true,
+          had_refresh: true,
+          skip_reason: "revision-changed",
+          diagnostic: expect.objectContaining({ httpStatus: 400, providerErrorMessage: expect.stringContaining("invalid_grant") }),
+        }),
+      ])
+      expect(JSON.stringify(logged.mock.calls)).not.toMatch(/newer-access-secret|newer-refresh-secret|provider-access-secret|provider-refresh-secret/)
+      const preserved = await persistence.credentials.load(rejectionContext)
+      expect(preserved?.tokens.access_token).toBe("newer-access-secret")
+      expect(preserved?.tokens.refresh_token).toBe("newer-refresh-secret")
+      const withoutRead = new DenEnterpriseMcpOAuthPersistence(current, undefined, tracker)
+      await withoutRead.credentials.invalidate({ context: rejectionContext, reason: "post-authorization-validation-failed" })
+      expect(logged.mock.calls[1]).toEqual([
+        "external_mcp_credential_invalidation_skipped",
+        expect.objectContaining({ skip_reason: "no-loaded-revision", reason: "post-authorization-validation-failed" }),
+      ])
+      expect((await persistence.credentials.load(rejectionContext))?.tokens.access_token).toBe("newer-access-secret")
+      logged.mockClear()
+      logged.mockImplementationOnce(() => { throw new Error("Synthetic log sink failure") })
+      await persistence.credentials.invalidate({ context: rejectionContext, reason: "provider-rejected" })
+      expect(logged).toHaveBeenCalledTimes(1)
+      expect(logged.mock.calls[0]).toEqual([
+        "external_mcp_credential_invalidated",
+        expect.objectContaining({
+          loaded_revision: preserved?.revision,
+          current_revision: preserved?.revision,
+          revision_changed: false,
+          had_access: true,
+          had_refresh: true,
+        }),
+      ])
+    } finally {
+      logged.mockRestore()
+    }
 
     const after = (await db.select()
       .from(schema.ExternalMcpConnectionTable)
@@ -489,6 +554,74 @@ describe("Den enterprise MCP OAuth persistence adapter", () => {
       .where(drizzle.eq(schema.OrgOAuthClientTable.providerId, oldIdentity.id))
     expect(clients).toEqual([])
   })
+
+  for (const credentialMode of ["shared", "per_member"] satisfies Array<"shared" | "per_member">) {
+    test(`${credentialMode} scope persistence preserves omission, replaces explicit grants, and isolates other members`, async () => {
+      const scopedConnection = await createExternalMcpConnection({
+        organizationId,
+        name: "OAuth granted scope lifecycle",
+        url: "https://mcp.example.test/scopes",
+        authType: "oauth",
+        credentialMode,
+        oauthConfiguration: { version: 1, authorizationServerIssuer: null, requestedScopes: ["requested.write"] },
+        createdByOrgMembershipId: memberId,
+        access: { orgWide: true, memberIds: [], teamIds: [] },
+      })
+      const otherAccountId = createDenTypeId("connectedAccount")
+      await db.insert(schema.ConnectedAccountTable).values({
+        id: otherAccountId,
+        organizationId,
+        orgMembershipId: createDenTypeId("member"),
+        providerId: scopedConnection.id,
+        scopes: ["other.read"],
+      })
+      const persistence = new DenEnterpriseMcpOAuthPersistence(scopedConnection,
+        credentialMode === "per_member" ? { orgMembershipId: memberId } : undefined)
+      const scopedContext = { ...context(), connectionId: scopedConnection.id }
+      const registration = await persistence.clientRegistrations.save({
+        context: scopedContext, clientInformation: { client_id: "scope-client" }, source: "dynamic",
+      })
+      const scope = Array.from({ length: 128 }, (_, index) => `https://scope.example.test/resource/${index}/Read`).join(" ")
+      const authorize = async (grantedScope: string | undefined) => {
+        const id = `scope-state-${Date.now()}`
+        await persistence.authorizations.begin({
+          context: scopedContext, id, codeVerifier: "s".repeat(43), expiresAt: Date.now() + 600_000,
+          clientRegistrationRevision: registration.revision,
+        })
+        const pending = await persistence.authorizations.load({ context: scopedContext, id })
+        if (!pending) throw new Error("Expected the scope authorization")
+        await persistence.credentials.save({
+          context: scopedContext, tokens: { access_token: "scope-access", token_type: "Bearer", scope: grantedScope },
+          source: "authorization-code", authorization: pending.handle, clientRegistrationRevision: registration.revision,
+        })
+      }
+      await authorize(scope)
+      expect((await persistence.credentials.load(scopedContext))?.tokens.scope).toBe(scope)
+      for (const returnedScope of [undefined, "Records.Read", "", undefined]) {
+        const before = await persistence.credentials.load(scopedContext)
+        await persistence.credentials.save({
+          context: scopedContext, tokens: { access_token: "scope-refreshed", token_type: "Bearer", scope: returnedScope },
+          source: "refresh", expectedCredentialRevision: before?.revision,
+        })
+        expect((await persistence.credentials.load(scopedContext))?.tokens.scope).toBe(returnedScope ?? before?.tokens.scope)
+        await expect(persistence.credentials.save({
+          context: scopedContext, tokens: { access_token: "stale-access", token_type: "Bearer", scope: "stale.write" },
+          source: "refresh", expectedCredentialRevision: before?.revision,
+        })).rejects.toMatchObject({ code: "MCP_OAUTH_CREDENTIAL_CHANGED" })
+        expect((await persistence.credentials.load(scopedContext))?.tokens.scope).toBe(returnedScope ?? before?.tokens.scope)
+      }
+      await authorize(undefined)
+      expect((await persistence.credentials.load(scopedContext))?.tokens.scope).toBeUndefined()
+      const [other] = await db.select({ scopes: schema.ConnectedAccountTable.scopes }).from(schema.ConnectedAccountTable)
+        .where(drizzle.eq(schema.ConnectedAccountTable.id, otherAccountId))
+      const { normalizeConnectedAccountScopes } = await import("../src/capability-sources/oauth-credentials.js")
+      expect(normalizeConnectedAccountScopes(other?.scopes)).toEqual(["other.read"])
+      const [shared] = await db.select().from(schema.ExternalMcpConnectionTable)
+        .where(drizzle.eq(schema.ExternalMcpConnectionTable.id, scopedConnection.id))
+      expect(shared?.oauthConfiguration?.requestedScopes).toEqual(["requested.write"])
+      if (credentialMode === "per_member") expect(shared?.scope).toBeNull()
+    })
+  }
 
   test("advances a per-member connectedAt only after a fresh authorization callback commits", async () => {
     const perMemberConnection = await createExternalMcpConnection({
