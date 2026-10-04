@@ -84,6 +84,7 @@ const transactionDb = {
       result = result.slice(0, maximum)
       if (table === ConfigObjectTable) return result.map((configObject) => ({ configObject, plugin: rows(PluginTable)[0], marketplace: null }))
       if (table === ConfigObjectAccessGrantTable) return result.map((row) => ({ ...row, resourceId: row.configObjectId }))
+      if (table === ConfigObjectVersionTable && projection?.payload) return result.map((row) => ({ payload: row.normalizedPayloadJson }))
       if (table === WorkflowRunTable && projection?.receipt) return result.map((receipt) => ({ receipt, automationTrigger: null }))
       return result
     }
