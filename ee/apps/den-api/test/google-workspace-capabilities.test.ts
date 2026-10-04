@@ -2322,7 +2322,7 @@ test("existing MCP search and execute path enforces Drive scope and bounds model
     path: { fileId: "doc_1" },
   })
   const modelText = mcpText(textResult)
-  expect(modelText).toContain("[truncated]")
+  expect(modelText).toMatch(/\[truncated: showing \d+ of 25000 characters\./)
   expect(modelText).not.toContain("d".repeat(20_001))
   expect(Buffer.byteLength(modelText, "utf8")).toBeLessThan(22_000)
 
@@ -2333,7 +2333,7 @@ test("existing MCP search and execute path enforces Drive scope and bounds model
     path: { messageId: "msg_1" },
   })
   const gmailModelText = mcpText(gmailTextResult)
-  expect(gmailModelText).toContain("[truncated]")
+  expect(gmailModelText).toMatch(/\[truncated: showing \d+ of 25000 characters\./)
   expect(gmailModelText).not.toContain("g".repeat(20_001))
   expect(Buffer.byteLength(gmailModelText, "utf8")).toBeLessThan(22_000)
 
