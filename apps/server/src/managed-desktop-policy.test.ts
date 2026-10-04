@@ -23,12 +23,17 @@ if (process.env.OPENWORK_MANAGED_POLICY_TEST_CHILD !== "1") {
   const delay = mock((ms: number) => { waiting.resolve(ms); return release.promise; });
   const externalFetch = mock(async (_url: string, _init?: RequestInit) => Response.json(policy));
   const parse = mock((_value: unknown) => policy);
-  const write = mock(async (_config: ServerConfig, _policy: unknown) => ({ changed: false }));
+  let persisted: { managedPolicy?: typeof policy } = {};
+  const write = mock(async (_config: ServerConfig, nextPolicy: unknown) => {
+    persisted = { managedPolicy: nextPolicy as typeof policy };
+    return { changed: false };
+  });
+  const clear = mock(async () => { persisted = {}; return { changed: true }; });
   mock.module("node:timers/promises", () => ({ setTimeout: delay }));
   mock.module("./server-fetch.js", () => ({ externalFetch }));
-  mock.module("@openwork/types/den/desktop-policies-runtime", () => ({ desktopConfigSchema: { parse } }));
+  mock.module("@openwork/types/den/desktop-policies-runtime", () => ({ DESKTOP_POLICY_ENFORCEMENT_ENABLED: true, desktopConfigSchema: { parse } }));
   mock.module("./runtime-opencode-config-store.js", () => ({
-    readGlobalRuntimeOpencodeConfig: async () => ({}), writeManagedDesktopPolicy: write,
+    readGlobalRuntimeOpencodeConfig: async () => persisted, writeManagedDesktopPolicy: write, clearManagedDesktopPolicy: clear,
     runtimeProviderMap: () => ({}),
   }));
   mock.module("./workspace-kv-store.js", () => ({
@@ -51,9 +56,34 @@ if (process.env.OPENWORK_MANAGED_POLICY_TEST_CHILD !== "1") {
     externalFetch.mockReset().mockImplementation(async () => Response.json(policy));
     parse.mockReset().mockImplementation(() => policy);
     write.mockClear();
+    clear.mockClear();
+    persisted = {};
     service = managedDesktopPolicy({ ...config });
   });
   afterEach(() => { release.resolve(); });
+
+  test("sign-out retains managed restrictions until another identity is verified", async () => {
+    await service.setSession(session);
+    await service.clearSession();
+    expect(clear).not.toHaveBeenCalled();
+    expect(persisted.managedPolicy).toEqual(policy);
+    await expect(service.current()).rejects.toMatchObject({ code: "policy_unavailable", status: 403 });
+    await expect(service.assert("sync")).rejects.toMatchObject({ code: "policy_unavailable", status: 403 });
+    await service.setSession({ ...session, token: "new-token" });
+    await expect(service.assert("sync")).resolves.toBeUndefined();
+  });
+
+  test("a fresh service cannot bypass a persisted managed policy without sign-in", async () => {
+    persisted = { managedPolicy: policy };
+    await expect(service.current()).rejects.toMatchObject({ code: "policy_unavailable", status: 403 });
+    await expect(service.assert("sync")).rejects.toMatchObject({ code: "policy_unavailable", status: 403 });
+    expect(externalFetch).not.toHaveBeenCalled();
+  });
+
+  test("an unmanaged local runtime remains usable without sign-in", async () => {
+    await expect(service.current()).resolves.toBeNull();
+    await expect(service.assert("sync")).resolves.toBeUndefined();
+  });
 
   test("503 waits for the explicit 200ms release before the second read succeeds", async () => {
     externalFetch.mockImplementationOnce(async () => new Response(null, { status: 503 }));

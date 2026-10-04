@@ -9,7 +9,7 @@ description: Test is red, typecheck failed, CI job failed, flaky, timed out, was
 
 - Record the exact command, commit SHA, exit code, and passed/failed/skipped
   counts. Quote the first actionable failure; do not summarize it away.
-- Classify the check: testkit spec, unit suite, typecheck, build, lint, or CI job.
+- Classify the check: testkit spec, typecheck, build, lint, or CI job.
 
 ## Run a clean control
 
@@ -52,5 +52,6 @@ git worktree remove /tmp/openwork-dev-control
 - Leaked state pollutes organizations; delete leftover connectors between runs.
 
 For a testkit failure, read the test run's last unvalidated artifacts before touching
-code. Publish useful red test evidence with `publish-evidence`; it remains human audit,
-not a passing verdict.
+code. Name the verdict as CI posted it: `Passed` only when every claim has an
+observable assertion; a skip or a pending `looks()` judgment is `Incomplete`,
+never `Passed`. Red evidence is useful evidence; never soften or omit it.

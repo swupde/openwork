@@ -1,6 +1,7 @@
 import type { FilePartInput, TextPartInput } from "@opencode-ai/sdk/v2/client";
 
 import type { ComposerAttachment } from "../../../../app/types";
+import { attachmentNoteText } from "../../../../app/lib/v2-prompt-context";
 import { compressImageFile } from "./image-compression";
 import { toFileUrl } from "./prompt-file-parts";
 
@@ -289,6 +290,11 @@ export function buildChatAttachmentInboxPath(input: { sessionId: string; filenam
   return `chat-attachments/${session}/${prefix}${filename}`;
 }
 
+/** True for a file the person attached to a message, as opposed to a workspace file they mentioned. */
+export function isChatAttachmentUrl(url: string) {
+  return url.startsWith("file://") && /\/(?:\.opencode\/openwork|workspace-files\/[^/]+)\/inbox\/chat-attachments\//.test(url);
+}
+
 function uploadErrorMessage(filename: string, error: unknown) {
   const detail = error instanceof Error ? error.message : String(error || "Unknown upload error");
   return `Failed to copy attachment "${filename}" into OpenWork execution storage: ${detail}`;
@@ -303,13 +309,9 @@ function attachmentPathNotePart(uploaded: UploadedChatAttachment[]): TextPartInp
     metadata: {
       openworkAttachments: uploaded
         .filter((item) => modelFacingAttachmentMime(item.mime) === null)
-        .map((item) => ({ filename: item.filename, mime: item.mime, url: item.url })),
+        .map((item) => ({ filename: item.filename, mime: item.mime, url: item.url, bytes: item.bytes })),
     },
-    text: [
-      "Attached files were copied into OpenWork's app-managed execution storage for tool access:",
-      ...uploaded.map((item) => `- ${item.filename}: ${item.executionPath} (${item.url})`),
-      "Use these paths with Read/Bash/MCP/Docling when a tool needs the file bytes.",
-    ].join("\n"),
+    text: attachmentNoteText(uploaded),
   };
 }
 
@@ -346,6 +348,7 @@ export type WorkspaceAttachmentParts = {
   note: TextPartInput;
   /** One entry per attachment, in order; `null` when the model gets no file part. */
   files: Array<FilePartInput | null>;
+  workspaceFiles?: Array<{ filename: string; mime: string; url: string }>;
 };
 
 export async function composerAttachmentsToWorkspaceFileParts(input: {
@@ -353,6 +356,7 @@ export async function composerAttachmentsToWorkspaceFileParts(input: {
   endpoint: ChatAttachmentWorkspaceEndpoint;
   sessionId: string;
   createId?: () => string;
+  preserveWorkspaceFiles?: boolean;
 }): Promise<WorkspaceAttachmentParts | null> {
   if (input.attachments.length === 0) return null;
 
@@ -413,6 +417,7 @@ export async function composerAttachmentsToWorkspaceFileParts(input: {
   return {
     note: attachmentPathNotePart(uploaded),
     files: await Promise.all(uploaded.map(uploadedAttachmentFilePart)),
+    ...(input.preserveWorkspaceFiles ? { workspaceFiles: uploaded.map(({ filename, mime, url }) => ({ filename, mime, url })) } : {}),
   };
 }
 

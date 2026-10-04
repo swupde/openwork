@@ -25,6 +25,18 @@ const packageDir = join(dirname(fileURLToPath(import.meta.url)), "..")
 const migrationsFolder = join(packageDir, "drizzle")
 const mysqlUrl = process.env.DEN_DB_MYSQL_TEST_URL?.trim()
 
+// These fixtures own a private database and have no application writers.
+async function bootstrapIsolatedFixture() {
+  const previous = process.env.DEN_DB_0097_WRITERS_STOPPED
+  process.env.DEN_DB_0097_WRITERS_STOPPED = "1"
+  try {
+    await bootstrapDenDb()
+  } finally {
+    if (previous === undefined) delete process.env.DEN_DB_0097_WRITERS_STOPPED
+    else process.env.DEN_DB_0097_WRITERS_STOPPED = previous
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null
 }
@@ -327,75 +339,49 @@ function exportTableNames(statements: string[]) {
     .sort()
 }
 
-// Columns that migrations ADD to tables the migration chain does not create
-// (those tables are seeded from the current export before replay, so the
-// seeded CREATE TABLE must not already contain the columns the replay adds).
-// worker: added by 0002 and 0084. oauth*: added by 0056.
-const SEED_COLUMN_STRIPS: Record<string, string[]> = {
-  worker: [
-    "last_heartbeat_at",
-    "last_active_at",
-    "cloud_failure_code",
-    "cloud_failure_stage",
-    "cloud_failure_reference",
-    "cloud_failure_at",
-  ],
-  oauthClient: [
-    "backchannel_logout_uri",
-    "backchannel_logout_session_required",
-    "jwks",
-    "jwks_uri",
-    "dpop_bound_access_tokens",
-  ],
-  oauthAccessToken: [
-    "authorization_code_id",
-    "resources",
-    "requested_user_info_claims",
-    "revoked",
-    "confirmation",
-  ],
-  oauthRefreshToken: [
-    "authorization_code_id",
-    "resources",
-    "requested_user_info_claims",
-    "rotated_at",
-    "rotation_replay_response",
-    "rotation_replay_expires_at",
-    "confirmation",
-  ],
-  oauthConsent: ["resources", "requested_user_info_claims"],
+// The migration chain starts after the original auth/system schema. Seed
+// those tables from the export, omitting additions owned by the replay.
+async function migrationSeedAdditions() {
+  const columns: Record<string, string[]> = {}
+  const constraints: Record<string, string[]> = {}
+  for (const entry of await readdir(migrationsFolder)) {
+    if (!entry.endsWith(".sql")) continue
+    const sql = await readFile(join(migrationsFolder, entry), "utf8")
+    for (const match of sql.matchAll(/ALTER\s+TABLE\s+`([^`]+)`\s+ADD\s+(?:COLUMN\s+)?`([^`]+)`/gi)) {
+      ;(columns[match[1]] ??= []).push(match[2])
+    }
+    for (const match of sql.matchAll(/ALTER\s+TABLE\s+`([^`]+)`\s+ADD\s+CONSTRAINT\s+`([^`]+)`/gi)) {
+      ;(constraints[match[1]] ??= []).push(match[2])
+    }
+  }
+  return { columns, constraints }
 }
+
+const seedAdditions = await migrationSeedAdditions()
 
 function statementForSeed(statement: string) {
   const tableName = createTableName(statement)
-  const strips = tableName ? SEED_COLUMN_STRIPS[tableName] : undefined
-  if (!strips) {
-    return statement
-  }
-
-  let seeded = statement
-  for (const column of strips) {
-    seeded = seeded.replace(new RegExp(`\\n\\s*\`${column}\` [^,\\n]+,`, "i"), "")
-  }
-  return seeded
+  if (!tableName) return statement
+  const columns = seedAdditions.columns[tableName] ?? []
+  const constraints = seedAdditions.constraints[tableName] ?? []
+  return statement.split("\n").filter((line) => {
+    const column = /^\s*`([^`]+)` /.exec(line)?.[1]
+    const constraint = /^\s*CONSTRAINT\s+`([^`]+)`/.exec(line)?.[1]
+    return !(column && columns.includes(column)) && !(constraint && constraints.includes(constraint))
+  }).join("\n").replace(/,\s*\)$/, "\n)")
 }
 
-test("worker seed strips every column added by committed migrations", async () => {
-  const migrationEntries = (await readdir(migrationsFolder))
-    .filter((entry) => entry.endsWith(".sql"))
-  const addedWorkerColumns: string[] = []
+test("audit seed leaves new columns and unique constraints to their migration", () => {
+  const seeded = statementForSeed("CREATE TABLE `audit_event` (\n `id` varchar(64),\n `operation_id` varchar(64),\n `sequence` bigint unsigned,\n CONSTRAINT `audit_event_org_sequence` UNIQUE(`org_id`,`sequence`)\n)")
+  assert.match(seeded, /`id` varchar/)
+  assert.doesNotMatch(seeded, /operation_id|sequence/)
+})
 
-  for (const entry of migrationEntries) {
-    const sql = await readFile(join(migrationsFolder, entry), "utf8")
-    for (const match of sql.matchAll(/ALTER\s+TABLE\s+`worker`\s+ADD\s+`([^`]+)`/gi)) {
-      addedWorkerColumns.push(match[1])
-    }
-  }
-
-  assert.deepEqual(
-    addedWorkerColumns.filter((column) => !SEED_COLUMN_STRIPS.worker.includes(column)),
-    [],
-  )
+test("worker seed retains original columns and leaves heartbeat additions to replay", () => {
+  const seeded = statementForSeed("CREATE TABLE `worker` (\n `id` varchar(64),\n `last_heartbeat_at` timestamp(3),\n `last_active_at` timestamp(3),\n `name` varchar(255)\n)")
+  assert.match(seeded, /`id` varchar/)
+  assert.match(seeded, /`name` varchar/)
+  assert.doesNotMatch(seeded, /last_heartbeat_at|last_active_at/)
 })
 
 function seedShouldSkipIndex(statement: string) {
@@ -410,8 +396,8 @@ async function seedNonMigrationOwnedTables(
 ) {
   // The committed migrations start after the original auth/system schema. They do not
   // create the export tables in nonMigrationOwnedTables, so those tables are seeded
-  // before replay. The worker table is seeded from export with the two columns that
-  // 0002 adds removed, letting the full migration chain replay deterministically.
+  // before replay. Migration-owned column and constraint additions are removed
+  // from the seed so every committed migration executes its actual DDL.
   for (const statement of exportStatements) {
     const tableName = createTableName(statement)
     if (tableName && nonMigrationOwnedTables.has(tableName)) {
@@ -727,7 +713,7 @@ test("bootstrap repairs a legacy pre-oauth schema that was falsely marked curren
     }
 
     process.env.DATABASE_URL = databaseUrlFor(mysqlUrl, database)
-    await bootstrapDenDb()
+    await bootstrapIsolatedFixture()
 
     const oauthResource = await queryRecords(connection, "SHOW TABLES LIKE 'oauthResource'")
     assert.equal(oauthResource.length, 1, "bootstrap must apply the missing OAuth migration instead of trusting a false baseline")
@@ -765,7 +751,7 @@ test("bootstrap applies migrations added after a healthy existing ledger", { ski
     await migrate(drizzle(connection), { migrationsFolder: through0078Folder })
 
     process.env.DATABASE_URL = databaseUrlFor(mysqlUrl, database)
-    await bootstrapDenDb()
+    await bootstrapIsolatedFixture()
 
     const credentialMode = await queryRecords(connection, "SHOW COLUMNS FROM `llm_provider` LIKE 'credential_mode'")
     assert.equal(credentialMode.length, 1, "bootstrap must execute 0079 instead of recording it as an applied baseline")
@@ -808,7 +794,7 @@ test("bootstrap repairs the post-OAuth false-baseline schema", { skip: !mysqlUrl
     }
 
     process.env.DATABASE_URL = databaseUrlFor(mysqlUrl, database)
-    await bootstrapDenDb()
+    await bootstrapIsolatedFixture()
 
     const credentialMode = await queryRecords(connection, "SHOW COLUMNS FROM `llm_provider` LIKE 'credential_mode'")
     const workflowRun = await queryRecords(connection, "SHOW TABLES LIKE 'workflow_run'")

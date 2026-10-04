@@ -1,6 +1,7 @@
 name: Den DB Check
 
 on:
+  workflow_dispatch:
   pull_request:
     paths:
       - ".github/workflows/den-db-check.yml"

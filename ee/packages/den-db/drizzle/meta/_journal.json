@@ -715,6 +715,146 @@
       "when": 1789840546329,
       "tag": "0102_connected_account_pending",
       "breakpoints": true
+    },
+    {
+      "idx": 103,
+      "version": "5",
+      "when": 1789840546330,
+      "tag": "0103_gateway_usage_limits",
+      "breakpoints": true
+    },
+    {
+      "idx": 104,
+      "version": "5",
+      "when": 1789840546331,
+      "tag": "0104_gateway_usage_replay_quarantine",
+      "breakpoints": true
+    },
+    {
+      "idx": 105,
+      "version": "5",
+      "when": 1789840546332,
+      "tag": "0105_gateway_usage_reset_pagination",
+      "breakpoints": true
+    },
+    {
+      "idx": 106,
+      "version": "5",
+      "when": 1789840546333,
+      "tag": "0106_gateway_incremental_usage",
+      "breakpoints": true
+    },
+    {
+      "idx": 107,
+      "version": "5",
+      "when": 1789840546334,
+      "tag": "0107_gateway_usage_lifecycle",
+      "breakpoints": true
+    },
+    {
+      "idx": 108,
+      "version": "5",
+      "when": 1789840546335,
+      "tag": "0108_gateway_usage_durable_capture",
+      "breakpoints": true
+    },
+    {
+      "idx": 109,
+      "version": "5",
+      "when": 1789840546336,
+      "tag": "0109_gateway_usage_organization_assignments",
+      "breakpoints": true
+    },
+    {
+      "idx": 110,
+      "version": "5",
+      "when": 1790127413187,
+      "tag": "0110_organization_web_origins",
+      "breakpoints": true
+    },
+    {
+      "idx": 111,
+      "version": "5",
+      "when": 1790207299296,
+      "tag": "0111_early_hiroim",
+      "breakpoints": true
+    },
+    {
+      "idx": 112,
+      "version": "5",
+      "when": 1790405726705,
+      "tag": "0112_device_authorization",
+      "breakpoints": true
+    },
+    {
+      "idx": 113,
+      "version": "5",
+      "when": 1790407468548,
+      "tag": "0113_claimable_workspaces",
+      "breakpoints": true
+    },
+    {
+      "idx": 114,
+      "version": "5",
+      "when": 1790454359250,
+      "tag": "0114_setup_agent_member",
+      "breakpoints": true
+    },
+    {
+      "idx": 115,
+      "version": "5",
+      "when": 1790605372888,
+      "tag": "0115_audit_operation_capture",
+      "breakpoints": true
+    },
+    {
+      "idx": 116,
+      "version": "5",
+      "when": 1790785674344,
+      "tag": "0116_slack_assistant",
+      "breakpoints": true
+    },
+    {
+      "idx": 117,
+      "version": "5",
+      "when": 1790791135950,
+      "tag": "0117_free_auto_and_provider_pins",
+      "breakpoints": true
+    },
+    {
+      "idx": 118,
+      "version": "5",
+      "when": 1790803693966,
+      "tag": "0118_slack_assistant_model",
+      "breakpoints": true
+    },
+    {
+      "idx": 119,
+      "version": "5",
+      "when": 1790968115525,
+      "tag": "0119_slack_assistant_progress_updates",
+      "breakpoints": true
+    },
+    {
+      "idx": 120,
+      "version": "5",
+      "when": 1790975539582,
+      "tag": "0120_remote_session_progress",
+      "breakpoints": true
+    },
+    {
+      "idx": 121,
+      "version": "5",
+      "when": 1790977843475,
+      "tag": "0121_remote_session_requests",
+      "breakpoints": true
+    },
+    {
+      "idx": 122,
+      "version": "5",
+      "when": 1790980102568,
+      "tag": "0122_slack_desktop_handoff",
+      "breakpoints": true
     }
   ]
 }

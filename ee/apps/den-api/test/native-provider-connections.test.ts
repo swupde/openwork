@@ -1,6 +1,9 @@
 import { createDenTypeId, type DenTypeId } from "@openwork-ee/utils/typeid"
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
 
+const PUBLIC_API_BASE = "https://native-api.example.test/api/den"
+const GOOGLE_CALLBACK_URL = `${PUBLIC_API_BASE}/v1/oauth-providers/google-workspace/connect/callback`
+
 const IDENTITY_SCOPES = [
   "openid",
   "https://www.googleapis.com/auth/userinfo.email",
@@ -49,6 +52,8 @@ function seedRequiredEnv() {
   process.env.BETTER_AUTH_SECRET = process.env.BETTER_AUTH_SECRET ?? "local-dev-secret-not-for-production-use!!"
   process.env.BETTER_AUTH_URL = process.env.BETTER_AUTH_URL ?? "http://127.0.0.1:8790"
   process.env.CORS_ORIGINS = process.env.CORS_ORIGINS ?? "http://127.0.0.1:8790"
+  // Callback identity comes from reviewed deployment configuration, not the request host.
+  process.env.DEN_API_PUBLIC_URL = PUBLIC_API_BASE
   process.env.DEN_GOOGLE_OAUTH_AUTHORIZE_URL = `${fakeOAuthServer.url.origin}/authorize`
   process.env.DEN_GOOGLE_OAUTH_TOKEN_URL = `${fakeOAuthServer.url.origin}/token`
   process.env.DEN_GOOGLE_OAUTH_USERINFO_URL = `${fakeOAuthServer.url.origin}/userinfo`
@@ -241,6 +246,13 @@ describe("buildNativeProviderEntry", () => {
     expect(mod.buildNativeProviderEntry(provider, { clientConfigured: false, connectedForMe: false })).toBeNull()
   })
 
+  test("configured callback base keeps its prefix and ignores hostile forwarded hosts", () => {
+    const request = new Request("http://den-api.local/v1/oauth-providers/google-workspace/connect/start", {
+      headers: { "x-forwarded-host": "attacker.example", "x-forwarded-proto": "https" },
+    })
+    expect(genericOAuth.resolvePublicApiBaseUrl(request, PUBLIC_API_BASE)).toBe(PUBLIC_API_BASE)
+  })
+
   test("a configured provider renders as a per-member, connectable entry", () => {
     const provider = registry.getNativeOAuthProvider("google-workspace")!
     expect(mod.buildNativeProviderEntry(provider, { clientConfigured: true, connectedForMe: false })).toEqual({
@@ -249,6 +261,9 @@ describe("buildNativeProviderEntry", () => {
       url: "https://workspace.google.com",
       authType: "oauth",
       credentialMode: "per_member",
+      exposeDirectly: false,
+      nativeProviderKey: "google-workspace",
+      requiredBy: [],
       connected: true,
       connectedAt: null,
       connectedForMe: false,
@@ -476,7 +491,7 @@ describe("buildNativeProviderEntry", () => {
         throw new Error("Native connector connect/start did not return an authorize URL")
       }
       const authorizeUrl = new URL(startBody.authorizeUrl)
-      expect(authorizeUrl.searchParams.get("redirect_uri")).toBe("http://den-api.local/v1/oauth-providers/google-workspace/connect/callback")
+      expect(authorizeUrl.searchParams.get("redirect_uri")).toBe(GOOGLE_CALLBACK_URL)
       const state = authorizeUrl.searchParams.get("state")
       if (!state) throw new Error("Native connector authorize URL omitted state")
       const verified = genericOAuth.verifyOAuthStateToken({ token: state, secret: process.env.BETTER_AUTH_SECRET ?? "" })
@@ -541,7 +556,7 @@ describe("buildNativeProviderEntry", () => {
       throw new Error("Legacy Google alias did not return an authorize URL")
     }
     const authorizeUrl = new URL(body.authorizeUrl)
-    expect(authorizeUrl.searchParams.get("redirect_uri")).toBe("http://den-api.local/v1/oauth-providers/google-workspace/connect/callback")
+    expect(authorizeUrl.searchParams.get("redirect_uri")).toBe(GOOGLE_CALLBACK_URL)
     const state = authorizeUrl.searchParams.get("state")
     if (!state) throw new Error("Legacy Google alias omitted state")
     expect(genericOAuth.verifyOAuthStateToken({ token: state, secret: process.env.BETTER_AUTH_SECRET ?? "" })).toMatchObject({
@@ -621,7 +636,7 @@ describe("buildNativeProviderEntry", () => {
     }
   })
 
-  test("external connection list rows omit native reconnect fields", async () => {
+  test("external connection rows report credential reconnect state without native scope drift", async () => {
     const seeded = await seedMember("ExternalRows")
     const connection = await createExternalMcpConnection({
       organizationId: seeded.organizationId,
@@ -649,7 +664,14 @@ describe("buildNativeProviderEntry", () => {
     if (!isRecord(row)) {
       throw new Error("External connection row was missing.")
     }
-    expect(Object.hasOwn(row, "needsReconnect")).toBe(false)
+    expect(row).toMatchObject({
+      nativeProviderKey: null,
+      needsReconnect: false,
+      credentialHealth: "unknown",
+      credentialHealthReason: null,
+      issuerReviewRequired: false,
+      reconnectActionOwner: null,
+    })
     expect(Object.hasOwn(row, "missingFeatures")).toBe(false)
   })
 })

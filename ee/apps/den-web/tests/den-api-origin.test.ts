@@ -109,7 +109,7 @@ describe("Den API browser origin", () => {
 });
 
 const consentPages = [
-  { name: "consent authorization", page: McpConsentPage, route: "consent", button: "Authorize", path: "/api/auth/oauth2/consent" },
+  { name: "consent authorization", page: McpConsentPage, route: "consent", button: "Authorize this app", path: "/api/auth/oauth2/consent" },
   { name: "consent denial", page: McpConsentPage, route: "consent", button: "Deny", path: "/api/auth/oauth2/consent" },
   { name: "organization selection", page: McpSelectOrganizationPage, route: "select-organization", button: null, path: "/v1/me/orgs" },
 ];
@@ -145,14 +145,28 @@ test.each(consentPages)("fresh $name waits for runtime configuration and keeps t
     }
 
     expect(fetchRequest).not.toHaveBeenCalled();
-    expect(loadConfig).toHaveBeenCalledTimes(1);
+    expect(loadConfig).toHaveBeenCalled();
     await act(async () => { resolveConfig({ ...runtime.EMPTY_RUNTIME_CONFIG, denApiUrl: apiOrigin }); });
 
-    expect(fetchRequest).toHaveBeenCalledTimes(1);
-    expect(fetchRequest).toHaveBeenCalledWith(path.startsWith("/api/auth/") ? path : `/api/browser${path}`, expect.objectContaining({
+    const expectedEndpoint = path.startsWith("/api/auth/") ? path : `/api/browser${path}`;
+    const intendedRequests = fetchRequest.mock.calls.filter(([endpoint]) => endpoint === expectedEndpoint);
+    expect(intendedRequests).toHaveLength(1);
+    expect(intendedRequests[0]?.[1]).toEqual(expect.objectContaining({
       credentials: "include",
       method: button ? "POST" : "GET",
     }));
+    if (button) {
+      expect(JSON.parse(String(intendedRequests[0]?.[1]?.body))).toEqual(expect.objectContaining({
+        accept: button !== "Deny",
+        scope: "mcp:read",
+      }));
+    }
+    // Client identity and workspace context also load after runtime discovery.
+    // Every browser request must retain the web-host session boundary.
+    for (const [endpoint, init] of fetchRequest.mock.calls) {
+      expect(String(endpoint)).toMatch(/^\/api\/(auth|browser)\//);
+      expect(init?.credentials).toBe("include");
+    }
   } finally {
     await act(async () => { root.unmount(); });
     fetchRequest.mockRestore();

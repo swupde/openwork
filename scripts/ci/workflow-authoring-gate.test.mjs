@@ -22,7 +22,8 @@ for (const lane of ["full", "snapshot", "docs"]) {
           BUILD_RESULT: lane === "full" ? "success" : "skipped",
           SNAPSHOT_RESULT: lane === "snapshot" ? "success" : "skipped",
           DOCS_RESULT: lane === "docs" ? "success" : "skipped",
-          AUTHORING_RESULT: authoring },
+          AUTHORING_RESULT: authoring,
+          DEN_CONTRACT: "false", DEN_CONTRACT_RESULT: "skipped" },
         encoding: "utf8",
       })
       assert.equal(result.status, authoring === (lane === "full" ? "success" : "skipped") ? 0 : 1, result.stderr)

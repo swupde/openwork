@@ -510,7 +510,6 @@ test("video upload preserves a display card without a model-facing binary part",
     attachments: [attachmentFor(new File([new Uint8Array([0, 1, 2, 3])], "recording.MOV"))],
     endpoint,
     sessionId: "ses_video",
-    workspaceRoot: "/workspace",
     createId: () => "video",
   });
   if (!parts) throw new Error("Expected uploaded attachment");
@@ -521,7 +520,7 @@ test("video upload preserves a display card without a model-facing binary part",
     filename: "recording.MOV",
     mediaType: "video/quicktime",
     url: "file:///runtime/workspace-files/workspace-key/inbox/chat-attachments/ses_video/video-recording.MOV",
-    providerMetadata: { opencode: { partId: "note:attachment:0" } },
+    providerMetadata: { opencode: { partId: "note:attachment:0", bytes: 4 } },
   }]);
   expect(attachmentNoteToUIParts({ ...note, ignored: true })).toEqual([]);
   expect(attachmentNoteToUIParts({ ...note, synthetic: false })).toEqual([]);

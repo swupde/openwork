@@ -117,6 +117,8 @@ export async function executeWorkflow(input: {
     }
   }
 
+  // Preserve this installation's authorization boundary: unattended and live
+  // refreshes may not acquire write authority merely through a product upgrade.
   const built = await input.buildTools().catch(() => ({ tools: {}, manifest: [] }))
   const unsafe = input.automationRunId
     ? firstUnattendedUnsafeCapability(built, parsed.payload.requiredCapabilities)
