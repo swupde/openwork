@@ -25,7 +25,7 @@
     "test:admin-scale": "bun test test/admin-scale-performance.test.ts",
     "test:authoring": "for spec in agent-codemode-script codemode-tools codemode-readonly-policy codemode-script-object mcp-catalog-output-schema workflow-authoring-receipts workflow-authoring-shared-retention workflow-authoring-save workflow-authoring-test marketplace-codemode-live-run artifact-runtime live-workflow-execution; do bun test --conditions development test/$spec.test.ts || exit $?; done",
     "test:gateway-usage": "bun test --conditions development test/gateway-usage.test.ts",
-    "test:fork": "for spec in native-capabilities native-provider-connections google-productivity-management google-workspace-capabilities google-workspace-api enterprise-mcp-oauth-persistence cloud-provider-materialization cloud-provider-materialization-read-retry mcp-catalog-parameter-refs mcp-catalog-output-schema oauth-credential-json-normalization; do bun test --conditions development test/$spec.test.ts || exit $?; done"
+    "test:fork": "test_status=0; for spec in native-capabilities native-provider-connections google-productivity-management google-workspace-capabilities google-workspace-api enterprise-mcp-oauth-persistence cloud-provider-materialization cloud-provider-materialization-read-retry mcp-catalog-parameter-refs mcp-catalog-output-schema oauth-credential-json-normalization; do bun test --conditions development test/$spec.test.ts || test_status=1; done; exit \"$test_status\""
   },
   "dependencies": {
     "@better-auth/api-key": "1.7.0-beta.10",
