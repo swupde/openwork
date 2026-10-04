@@ -25,6 +25,18 @@ const packageDir = join(dirname(fileURLToPath(import.meta.url)), "..")
 const migrationsFolder = join(packageDir, "drizzle")
 const mysqlUrl = process.env.DEN_DB_MYSQL_TEST_URL?.trim()
 
+// These fixtures own a private database and have no application writers.
+async function bootstrapIsolatedFixture() {
+  const previous = process.env.DEN_DB_0097_WRITERS_STOPPED
+  process.env.DEN_DB_0097_WRITERS_STOPPED = "1"
+  try {
+    await bootstrapDenDb()
+  } finally {
+    if (previous === undefined) delete process.env.DEN_DB_0097_WRITERS_STOPPED
+    else process.env.DEN_DB_0097_WRITERS_STOPPED = previous
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null
 }
@@ -727,7 +739,7 @@ test("bootstrap repairs a legacy pre-oauth schema that was falsely marked curren
     }
 
     process.env.DATABASE_URL = databaseUrlFor(mysqlUrl, database)
-    await bootstrapDenDb()
+    await bootstrapIsolatedFixture()
 
     const oauthResource = await queryRecords(connection, "SHOW TABLES LIKE 'oauthResource'")
     assert.equal(oauthResource.length, 1, "bootstrap must apply the missing OAuth migration instead of trusting a false baseline")
@@ -765,7 +777,7 @@ test("bootstrap applies migrations added after a healthy existing ledger", { ski
     await migrate(drizzle(connection), { migrationsFolder: through0078Folder })
 
     process.env.DATABASE_URL = databaseUrlFor(mysqlUrl, database)
-    await bootstrapDenDb()
+    await bootstrapIsolatedFixture()
 
     const credentialMode = await queryRecords(connection, "SHOW COLUMNS FROM `llm_provider` LIKE 'credential_mode'")
     assert.equal(credentialMode.length, 1, "bootstrap must execute 0079 instead of recording it as an applied baseline")
@@ -808,7 +820,7 @@ test("bootstrap repairs the post-OAuth false-baseline schema", { skip: !mysqlUrl
     }
 
     process.env.DATABASE_URL = databaseUrlFor(mysqlUrl, database)
-    await bootstrapDenDb()
+    await bootstrapIsolatedFixture()
 
     const credentialMode = await queryRecords(connection, "SHOW COLUMNS FROM `llm_provider` LIKE 'credential_mode'")
     const workflowRun = await queryRecords(connection, "SHOW TABLES LIKE 'workflow_run'")

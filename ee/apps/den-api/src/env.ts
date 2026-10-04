@@ -8,6 +8,7 @@ import { normalizeConfiguredPublicApiBaseUrl } from "./request-url.js"
 import { resolveDenServiceVersion } from "./service-version.js"
 import { denApiAppVersion } from "./version.js"
 import { z } from "zod"
+import { readFreeInferenceConfig } from "@openwork/types/den/inference"
 
 export const DEFAULT_DEN_DIAGNOSTICS_ORIGIN = "https://diagnostic.openworklabs.com"
 
@@ -104,6 +105,9 @@ const EnvSchema = z.object({
   CLOUD_IDLE_STOP_MINUTES: z.string().optional(),
   CLOUD_IDLE_LOOP_SECONDS: z.string().optional(),
   CLOUD_IDLE_STOP_BATCH_SIZE: z.string().optional(),
+  CLOUD_ACTIVITY_PROBE_TIMEOUT_MS: z.string().optional(),
+  CLOUD_UNREACHABLE_GRACE_MS: z.string().optional(),
+  CLOUD_STOP_FLUSH_TIMEOUT_MS: z.string().optional(),
   PROVISIONER_MODE: z.enum(["stub", "render", "daytona"]).optional(),
   // Preferred name for the sandbox host that runs OpenWork Cloud instances;
   // PROVISIONER_MODE remains accepted as an alias.
@@ -112,11 +116,17 @@ const EnvSchema = z.object({
   WORKER_ACTIVITY_BASE_URL: z.string().optional(),
   DEN_AUTOMATIONS_ENABLED: z.string().optional(),
   DEN_DASHBOARDS_ENABLED: z.string().optional(),
+  // Default-on deployment kill switches; the per-org auditLogs capability stays opt-in.
+  DEN_AUDIT_CAPTURE_ENABLED: z.enum(["true", "false"]).default("true"),
+  DEN_AUDIT_VISIBILITY_ENABLED: z.enum(["true", "false"]).default("true"),
+  // Explicit installation entitlement, separate from feature availability and capture preference.
+  DEN_AUDIT_SELF_HOSTED_ENABLED: z.enum(["true", "false"]).default("false"),
   DEN_OPENWORK_WEB_ENABLED: z.string().optional(),
   DEN_AUTOMATIONS_RUNTIME_ENABLED: z.string().optional(),
   DEN_AUTOMATIONS_POLL_INTERVAL_MS: z.string().optional(),
   DEN_AUTOMATIONS_BATCH_SIZE: z.string().optional(),
   DEN_AUTOMATIONS_MAX_CONCURRENCY: z.string().optional(),
+  DEN_HEADLESS_AUTOMATIONS_MAX_CONCURRENCY: z.string().optional(),
   DEN_AUTOMATIONS_LEASE_MS: z.string().optional(),
   DEN_AUTOMATIONS_RUN_TIMEOUT_MS: z.string().optional(),
   DEN_AUTOMATIONS_RUNNER_CLAIM_DEADLINE_MS: z.string().optional(),
@@ -148,6 +158,7 @@ const EnvSchema = z.object({
   DEN_CONNECT_LINK_KEY_ID: z.string().max(64).optional(),
   DEN_MCP_CONNECTIONS_GATING_ENABLED: z.string().optional(),
   DEN_GENERATED_ARTIFACT_VIEWS_ENABLED: z.string().optional(),
+  DEN_APP_MCP_SERVERS_ENABLED: z.string().optional(),
   SCIM_MAINTENANCE_INTERVAL_MS: z.string().optional(),
   POLAR_FEATURE_GATE_ENABLED: z.string().optional(),
   POLAR_API_BASE: z.string().optional(),
@@ -535,6 +546,12 @@ const mcpConnectionsGatingEnabled =
 const generatedArtifactViewsEnabled =
   (parsed.DEN_GENERATED_ARTIFACT_VIEWS_ENABLED ?? "false").trim().toLowerCase() === "true"
 
+// Apps built through Connect are served as their own MCP servers, and older
+// Workflow-bound views become read-only. On by default, including when set
+// empty; false, 0, off, or no (or any other value) restores the previous
+// behavior: no App servers, writable Workflow-bound views.
+const appMcpServersEnabled = parseBooleanFlag(optionalString(parsed.DEN_APP_MCP_SERVERS_ENABLED) ?? "true")
+
 // Desktop availability stays fail-closed, while an entirely unconfigured
 // server preserves the published-client runtime. An explicit availability
 // value also supplies the runtime default, so DEN_AUTOMATIONS_ENABLED=false is
@@ -694,6 +711,7 @@ export const env = {
   connectLink,
   mcpConnectionsGatingEnabled,
   generatedArtifactViewsEnabled,
+  appMcpServersEnabled,
   scimMaintenanceIntervalMs: Number(parsed.SCIM_MAINTENANCE_INTERVAL_MS ?? "300000"),
   requireEmailVerification,
   passwordBreachScreeningEnabled,
@@ -797,6 +815,15 @@ export const env = {
   cloudIdleStopMs: Number(parsed.CLOUD_IDLE_STOP_MINUTES ?? "30") * 60_000,
   cloudIdleLoopIntervalMs: Number(parsed.CLOUD_IDLE_LOOP_SECONDS ?? "60") * 1000,
   cloudIdleStopBatchSize: Number(parsed.CLOUD_IDLE_STOP_BATCH_SIZE ?? "10"),
+  // Den asks a running instance whether it is busy before stopping or
+  // restarting it. A busy instance can be slow, so this is longer than the
+  // 2.5 second signed-preview health probe.
+  cloudActivityProbeTimeoutMs: Number(parsed.CLOUD_ACTIVITY_PROBE_TIMEOUT_MS ?? "10000"),
+  // How long a running instance must answer nothing at all before Den treats
+  // it as dead and restarts it; a slow health probe alone never restarts.
+  cloudUnreachableGraceMs: Number(parsed.CLOUD_UNREACHABLE_GRACE_MS ?? "60000"),
+  // Bound for the best-effort checkpoint flush before Den stops a running instance.
+  cloudStopFlushTimeoutMs: Number(parsed.CLOUD_STOP_FLUSH_TIMEOUT_MS ?? "20000"),
   workerUrlTemplate: parsed.WORKER_URL_TEMPLATE,
   workerActivityBaseUrl:
     optionalString(parsed.WORKER_ACTIVITY_BASE_URL) ??
@@ -807,6 +834,9 @@ export const env = {
     pollIntervalMs: automationTuning(parsed.DEN_AUTOMATIONS_POLL_INTERVAL_MS, 15_000),
     batchSize: automationTuning(parsed.DEN_AUTOMATIONS_BATCH_SIZE, 25),
     maxConcurrency: automationTuning(parsed.DEN_AUTOMATIONS_MAX_CONCURRENCY, 4),
+    // Headless runs hold no computer, only a turn on the shared runner, so
+    // they get their own, larger pool instead of the OpenWork Web slots.
+    headlessMaxConcurrency: automationTuning(parsed.DEN_HEADLESS_AUTOMATIONS_MAX_CONCURRENCY, 16),
     leaseMs: automationTuning(parsed.DEN_AUTOMATIONS_LEASE_MS, 60_000),
     runTimeoutMs: automationTuning(parsed.DEN_AUTOMATIONS_RUN_TIMEOUT_MS, 900_000),
     // How long a desktop occurrence stays claimable. A desktop is a laptop
@@ -817,8 +847,12 @@ export const env = {
     runnerClaimDeadlineMs: automationTuning(parsed.DEN_AUTOMATIONS_RUNNER_CLAIM_DEADLINE_MS, 900_000),
   },
   dashboardsEnabled,
+  auditCaptureEnabled: parsed.DEN_AUDIT_CAPTURE_ENABLED === "true",
+  auditVisibilityEnabled: parsed.DEN_AUDIT_VISIBILITY_ENABLED === "true",
+  auditSelfHostedEnabled: parsed.DEN_AUDIT_SELF_HOSTED_ENABLED === "true",
   corsHandledByEdge,
   openworkWebEnabled,
+  inferenceFree: readFreeInferenceConfig(process.env),
   inferenceProxyBaseUrl: optionalString(parsed.GATEWAY_PROXY_BASE_URL) ?? "http://127.0.0.1:8791",
   // Keep known public Models destinations even when Gateway management is off.
   modelsPublicBaseUrl: gatewayDeployment.modelsPublicBaseUrl ?? optionalString(parsed.GATEWAY_PROXY_BASE_URL) ?? "http://127.0.0.1:8791",

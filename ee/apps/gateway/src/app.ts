@@ -10,6 +10,7 @@ import { db } from "./db.js";
 import { env } from "./env.js";
 import { inferenceAccessLogger, sentryInferenceReporter } from "./inference-reporting.js";
 import { registerProxyRoutes } from "./proxy.js";
+import { registerAnonymousInferenceRoutes } from "./free/index.js";
 import { registerRollupRoutes, runRollups } from "./rollups.js";
 import { registerWebhookRoutes } from "./webhooks.js";
 
@@ -52,7 +53,7 @@ if (env.corsOrigins.length > 0) {
         "X-Openwork-Gateway-Grant-Id",
       ],
       allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-      exposeHeaders: ["X-OpenWork-Request-Id", "Retry-After"],
+      exposeHeaders: ["X-OpenWork-Request-Id", "X-OpenWork-Error-Code", "X-OpenWork-Usage-State", "Retry-After"],
       maxAge: 600,
     }),
   );
@@ -79,6 +80,7 @@ if (shouldServeLocalModelCatalog) {
   });
 }
 
+registerAnonymousInferenceRoutes(app);
 registerProxyRoutes(app);
 registerWebhookRoutes(app);
 registerRollupRoutes(app, { adminToken: env.adminToken, runRollups });

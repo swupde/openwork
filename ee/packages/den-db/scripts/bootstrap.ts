@@ -1,10 +1,3 @@
-/**
- * Production install/upgrade entrypoint for Den databases.
- *
- * Empty databases are initialized from the build-time current-schema snapshot,
- * then committed migrations are recorded as the baseline. Existing databases
- * without a migration ledger are baselined before the normal migration pass.
- */
 import "../src/load-env.ts"
 import { readFileSync } from "node:fs"
 import path from "node:path"
@@ -16,6 +9,10 @@ import mysql from "mysql2/promise"
 import { parseMySqlConnectionConfig } from "../src/mysql-config.ts"
 import { ensureSchemaRepairs } from "../src/schema-repairs.ts"
 import { createExecutor, type Executor } from "./db-executor.ts"
+import { migrateWith0097Compatibility } from "./migration-0097-compat.ts"
+import { rejectMatrix } from "./migration-0097-schema.ts"
+
+export { migrateWith0097Compatibility }
 
 const MIGRATIONS_TABLE = "__drizzle_migrations"
 const LEGACY_PRE_OAUTH_BASELINE_TAG = "0055_thick_chamber"
@@ -341,38 +338,44 @@ async function runCommittedMigrations() {
   const connection = await mysql.createConnection(mysqlConnectionConfigFromEnv())
   try {
     const db = drizzle(connection)
-    await migrate(db, { migrationsFolder })
+    await migrateWith0097Compatibility({
+      async query(statement, args = []) {
+        const [rows] = await connection.query<mysql.RowDataPacket[]>(statement, args)
+        return Array.isArray(rows) ? rows : []
+      },
+    }, migrationsFolder, async (migrationsFolder) => {
+      await migrate(db, { migrationsFolder })
+    }, console.log, { writersStoppedFor0097: process.env.DEN_DB_0097_WRITERS_STOPPED === "1" })
   } finally {
     await connection.end()
+  }
+}
+
+export async function initializeDenDb(executor: Executor) {
+  const tables = await listTables(executor)
+  const applicationTables = tables.filter((table) => table !== MIGRATIONS_TABLE)
+
+  if (applicationTables.length === 0) {
+    if (tables.includes(MIGRATIONS_TABLE) && (await executor.query(`SELECT 1 FROM \`${MIGRATIONS_TABLE}\` LIMIT 1`)).length) {
+      rejectMatrix("migration receipts exist but application tables are missing")
+    }
+    console.log("[den-db] empty database detected; applying current schema snapshot")
+    await applyCurrentSchema(executor)
+    await baselineCommittedMigrations(executor)
+  } else if (!tables.includes(MIGRATIONS_TABLE)) {
+    rejectMatrix("existing schema has no migration ledger; refusing to stamp unverified 0097")
+  } else if (!tables.includes("oauthResource")) {
+    await repairMissingOauthSchema(executor)
+    await reconcilePostOauthBaseline(executor)
+  } else {
+    await repairFalsePostOauthBaseline(executor)
   }
 }
 
 export async function bootstrapDenDb() {
   const executor = await createExecutor()
   try {
-    const tables = await listTables(executor)
-    const applicationTables = tables.filter((table) => table !== MIGRATIONS_TABLE)
-
-    if (applicationTables.length === 0) {
-      console.log("[den-db] empty database detected; applying current schema snapshot")
-      await applyCurrentSchema(executor)
-      await baselineCommittedMigrations(executor)
-    } else if (!tables.includes(MIGRATIONS_TABLE)) {
-      if (tables.includes("oauthResource")) {
-        console.log("[den-db] existing current schema without migration ledger detected; recording baseline")
-        await baselineCommittedMigrations(executor)
-      } else {
-        console.log("[den-db] legacy pre-OAuth schema without migration ledger detected; recording its safe baseline")
-        await baselineCommittedMigrations(executor, migrationMillis(LEGACY_PRE_OAUTH_BASELINE_TAG))
-      }
-    } else {
-      if (!tables.includes("oauthResource")) {
-        await repairMissingOauthSchema(executor)
-        await reconcilePostOauthBaseline(executor)
-      } else {
-        await repairFalsePostOauthBaseline(executor)
-      }
-    }
+    await initializeDenDb(executor)
   } finally {
     await executor.close()
   }
