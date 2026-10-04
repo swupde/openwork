@@ -98,8 +98,12 @@ class ManagedDesktopPolicy {
     this.generation++;
     this.installed = undefined;
     this.lastKnown = undefined;
-    const cleared = await clearManagedDesktopPolicy(this.config);
-    if (cleared.changed) this.onChange?.();
+    // Signing out must not turn a managed runtime into an unrestricted one.
+    // Keep its last restrictions until a new identity has verified its policy.
+    if (!DESKTOP_POLICY_ENFORCEMENT_ENABLED) {
+      const cleared = await clearManagedDesktopPolicy(this.config);
+      if (cleared.changed) this.onChange?.();
+    }
   }
   current(): Promise<DesktopConfig | null> {
     if (this.fetching?.generation === this.generation) return this.fetching.promise;
@@ -165,10 +169,12 @@ class ManagedDesktopPolicy {
     const session = this.session;
     const generation = this.generation;
     if (!session) {
-      await readGlobalRuntimeOpencodeConfig(this.config);
+      const persisted = await readGlobalRuntimeOpencodeConfig(this.config);
       // A local-only read cannot grant access after a managed identity arrives.
       this.identityChanged(generation);
-      // A cached policy is not device enrollment: enforcement follows the session.
+      if (DESKTOP_POLICY_ENFORCEMENT_ENABLED && persisted.managedPolicy) {
+        throw new ApiError(403, "policy_unavailable", "Sign in to verify your organization's policy before continuing.");
+      }
       return null;
     }
     let policy: DesktopConfig;

@@ -177,3 +177,23 @@ protect deployment-specific behavior. `test:fork` runs these alongside the
 new upstream boot and core journeys; retained migration and authoring gates
 continue to run in CI. This is source integration documentation, not evidence
 of publication or deployment.
+
+
+Upstream v0.18.56 broadens live and unattended Workflow execution to all
+capabilities the runner can access. This fork retains the prior first-party,
+read-only restriction for unattended automation, live Workflow refreshes, and
+live authoring tests. The upgrade does not authorize new background writes.
+Interactive execution retains its existing permission checks. Reconsidering
+that boundary is a separate explicit deployment decision; the retained
+`codemode-tools`, `codemode-readonly-policy`, `workflow-authoring-test`, and
+`live-workflow-execution` tests protect it.
+
+Configured desktop policies also remain enforced through
+`DESKTOP_POLICY_ENFORCEMENT_ENABLED=true`; the upstream default-off change
+would otherwise discard configured capability restrictions. Re-evaluate these
+fork guards only through an explicit authorization-policy change with matching
+negative tests, not as a side effect of a future version import.
+
+Cached managed restrictions survive sign-out and restart until a fresh verified
+identity establishes the applicable policy; credentials and identity still clear
+on sign-out. Unmanaged local profiles remain unaffected.

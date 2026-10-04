@@ -133,18 +133,18 @@ export const SEARCH_CAPABILITIES_ANNOTATIONS: ToolAnnotations = {
 
 export function searchCapabilitiesDescription(appServersEnabled: boolean): string {
   return [
-          "Search connection actions, saved Workflows, and skills by keyword.",
-          appServersEnabled
-            ? "Builder tools such as create_skill, prepare_app, and create_app are outside this search; call them directly. Use prepare_app then create_app for new apps, dashboards, and interactive views; older Workflow-bound views are read-only."
-            : "Direct MCP tools such as create_skill and save_artifact_view are outside this search; call an available direct tool itself. For an app, dashboard, or artifact view of Workflow results, use save_artifact_view and follow its prerequisites.",
-          "Search covers native Google Workspace capabilities (Gmail, Calendar, Drive, Gmail drafts), org-connected external MCPs, and namespaced OpenWork Admin tools for allowlisted platform admins.",
-          "Accessible Workflows appear as marketplace matches with kind workflow and execute through execute_capability like every other exact search result.",
-          "Search once with one precise query and execute an exact returned capability. Reuse exact names already supplied by the skill catalog or this task; search again only when no usable match was returned or execution reports unknown_capability.",
-          appServersEnabled
-            ? "Native API matches include a connector-namespaced name, pathParams, queryParams, querySchema, hasBody, and bodySchema. External MCP matches include argumentsSchema, schemaDigest, and invocation.argumentsField. A match with kind mcp_app is a standard MCP App launch capability, either an App built in OpenWork (its own MCP server at the match path) or an App from a connected MCP server; execute it normally and the OpenWork host will render its advertised ui:// resource."
-            : "Native API matches include a connector-namespaced name, pathParams, queryParams, querySchema, hasBody, and bodySchema. External MCP matches include argumentsSchema, schemaDigest, and invocation.argumentsField. A match with kind mcp_app is a standard MCP App launch capability from a connected MCP server; execute it normally and the OpenWork host will render its advertised ui:// resource.",
-          "Built-in and marketplace skill matches return SKILL.md content when executed; list_skills and get_skill are the direct, keyword-free way to reach skills.",
-        ].join(" ")
+    "Search connection actions, saved Workflows, and skills by keyword.",
+    appServersEnabled
+      ? "Builder tools such as create_skill, prepare_app, and create_app are outside this search; call them directly. Use prepare_app then create_app for new apps, dashboards, and interactive views; older Workflow-bound views are read-only."
+      : "Direct MCP tools such as create_skill and save_artifact_view are outside this search; call an available direct tool itself. For an app, dashboard, or artifact view of Workflow results, use save_artifact_view and follow its prerequisites.",
+    "Search covers native Google Workspace capabilities (Gmail, Calendar, Drive, Gmail drafts), org-connected external MCPs, and namespaced OpenWork Admin tools for allowlisted platform admins.",
+    "Accessible Workflows appear as marketplace matches with kind workflow and execute through execute_capability like every other exact search result.",
+    "Search once with one precise query and execute an exact returned capability. Reuse exact names already supplied by the skill catalog or this task; search again only when no usable match was returned or execution reports unknown_capability.",
+    appServersEnabled
+      ? "Native API matches include a connector-namespaced name, pathParams, queryParams, querySchema, hasBody, and bodySchema. External MCP matches include argumentsSchema, schemaDigest, and invocation.argumentsField. A match with kind mcp_app is a standard MCP App launch capability, either an App built in OpenWork (its own MCP server at the match path) or an App from a connected MCP server; execute it normally and the OpenWork host will render its advertised ui:// resource."
+      : "Native API matches include a connector-namespaced name, pathParams, queryParams, querySchema, hasBody, and bodySchema. External MCP matches include argumentsSchema, schemaDigest, and invocation.argumentsField. A match with kind mcp_app is a standard MCP App launch capability from a connected MCP server; execute it normally and the OpenWork host will render its advertised ui:// resource.",
+    "Built-in and marketplace skill matches return SKILL.md content when executed; list_skills and get_skill are the direct, keyword-free way to reach skills.",
+  ].join(" ")
 }
 export const SEARCH_CAPABILITIES_DESCRIPTION = searchCapabilitiesDescription(true)
 export const EXECUTE_CAPABILITY_ANNOTATIONS: ToolAnnotations = {

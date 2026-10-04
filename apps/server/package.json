@@ -19,7 +19,7 @@
     "start": "bun dist/cli.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "prepublishOnly": "pnpm build:npm-bundle",
-    "test:fork": "bun --conditions=development test --isolate src/connect-skill-catalog.test.ts src/embedded-lifecycle.test.ts src/inbox-upload-approval.e2e.test.ts src/opencode-plugins/openwork-office-attachments.test.ts src/openwork-runtime-config.test.ts"
+    "test:fork": "bun --conditions=development test --isolate src/connect-skill-catalog.test.ts src/embedded-lifecycle.test.ts src/inbox-upload-approval.e2e.test.ts src/opencode-plugins/openwork-office-attachments.test.ts src/openwork-runtime-config.test.ts src/managed-desktop-policy.test.ts"
   },
   "files": [
     "bin",

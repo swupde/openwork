@@ -6,18 +6,9 @@ keywords: ["desktop policy", "desktop policies", "team access", "app permissions
 
 Desktop policies are rules you set in OpenWork Cloud for the OpenWork desktop app. They apply to members after they sign in to your organization. You can set a default for everyone, give specific members or teams their own policy, and choose what each team can do from the team's **Access** tab.
 
-<Warning>
-**Most desktop policy controls are paused while they are redesigned.** You can still create and save policies and team access settings in Cloud, but the desktop app doesn't apply most of them yet.
-
-The desktop app applies these today:
-
-- **Model access**: whether members can add their own AI providers. Set it in **AI Gateway › AI Providers › Who can use models**. Choose **Only models you provide** to limit members to your organization's models. The **Custom providers** switch in a policy and **Add AI providers** on a team's **Access** tab also affect model access.
-- **Organization prompt suggestions**: see [Team prompt cards](/cloud/share-with-your-team/team-prompt-cards).
-- **Required sign-in**: this depends on how your organization's desktop app is installed, not on a policy.
-- **Allowed Desktop Versions**: set it in **Settings › General**.
-
-Everything else is saved but not applied. This includes the other switches (including **Welcome Page**), **Restricted** mode, computer-command rules, approved websites and other browsing limits, and blocking uploads and form submissions. Don't rely on these to block anything today.
-</Warning>
+<Note>
+This fork retains enforcement of configured desktop policies, including command and browser restrictions. Upstream v0.18.56 suspends most desktop controls; that suspension is not adopted here. Den continues to manage policy assignments and resource access. A server update does not change an already-installed desktop build.
+</Note>
 
 ## Who can manage policies
 
@@ -27,7 +18,7 @@ Everything else is saved but not applied. This includes the other switches (incl
 
 ## What policies control
 
-Each switch in the policy editor is designed to control one part of the desktop app. Apart from **Custom providers**, they don't take effect yet.
+Each switch in the policy editor controls one part of the desktop app. The desktop app does not currently read **Welcome Page**.
 
 - **Custom providers**: adding and using models your organization didn't set up in OpenWork Cloud.
 - **Enable OpenCode Zen Models**: using the built-in models from OpenCode.
@@ -38,7 +29,7 @@ Each switch in the policy editor is designed to control one part of the desktop 
 - **Alpha updates**: choosing to get experimental Alpha updates.
 - **Welcome Page**: showing the Getting Started page to new users.
 
-The **Commands & browser** section will control:
+The **Commands & browser** section controls:
 
 - **Run OS commands** and **Blocked command patterns**: whether the agent can run commands on the computer, or which commands it can't run.
 - **Restrict browsing to approved sites** and **Approved websites**: which websites the built-in browser can open.
@@ -71,11 +62,11 @@ A few things to know:
 
 Because switches combine across policies, **Restricted** only locks members down when you apply it to the default policy. A targeted policy in **Restricted** mode doesn't take anything away from other policies.
 
-Today, the only part of **Restricted** that takes effect is that it turns off **Custom providers**.
+This fork applies the configured restrictions when the member signs in to the organization.
 
 ## Approved websites
 
-Approved websites are designed to limit the built-in browser to sites you choose. This control is paused and doesn't block anything yet.
+Approved websites limit the built-in browser to sites you choose.
 
 To set approved websites for a team:
 
@@ -110,14 +101,14 @@ Each team has an **Access** tab where you choose what its members can do. To ope
 
 Click **Preview member experience** to see a summary of what members of the team will be able to do. When you're done, click **Review changes**, check the list, and click **Save permissions**.
 
-Allowing something here doesn't override a block from another team or from your organization. Of these options, only **Add AI providers** takes effect today, as part of model access.
+Allowing something here doesn't override a block from another team or from your organization. This fork retains enforcement of these configured permissions.
 
-Members can see their permissions in the desktop app under **Settings › Account › App permissions**. The list is read-only. It shows what the app applies right now, so paused controls show as **Allowed**.
+Members can see their permissions in the desktop app under **Settings › Account › App permissions**. The list is read-only. It shows the effective permissions applied by the app.
 
 The **Plugins & connections** list lower on the same tab shows which plugins and connections the team can use. That list is separate from desktop policies and works today.
 
 <Accordion title="Technical details">
-**Enforcement switch.** Enforcement is controlled by `DESKTOP_POLICY_ENFORCEMENT_ENABLED` in `packages/types/src/den/desktop-policies.ts`, currently `false`. Den still stores and resolves every policy. Before the desktop app uses the config, `desktopCapabilityConfig()` removes `execution` and every policy key except `allowCustomProviders` and `showWelcomePage`. Prompt suggestions and `allowedDesktopVersions` pass through. The desktop app does not currently read `showWelcomePage`. Model access never blocks startup, sign-in, or chat: the app uses the last known setting, and allows providers when no setting is known.
+**Enforcement switch.** Enforcement is controlled by `DESKTOP_POLICY_ENFORCEMENT_ENABLED` in `packages/types/src/den/desktop-policies.ts`, set to `true` in this fork to preserve existing restrictions. `desktopCapabilityConfig()` retains the full control-plane configuration. With an active managed session, policy verification failures block protected actions. Required sign-in and allowed desktop versions remain separate controls.
 
 **Model access storage.** **Only models you provide** is stored as `allowCustomProviders: false` in the default desktop policy. **Admins may still add their own keys on their device** is stored as a policy for the admin role.
 

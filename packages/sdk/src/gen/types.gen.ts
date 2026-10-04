@@ -2024,6 +2024,15 @@ export type GoogleWorkspaceCalendarEvent = {
   meetLink: string | null;
 };
 
+export type GoogleWorkspaceCalendarAgendaResponse = {
+  ok: true;
+  date: string;
+  timeZone: string;
+  timeMin: string;
+  timeMax: string;
+  events: Array<GoogleWorkspaceCalendarEvent>;
+};
+
 export type GoogleWorkspaceCalendarEventsResponse = {
   ok: true;
   events: Array<GoogleWorkspaceCalendarEvent>;
@@ -2090,6 +2099,59 @@ export type GoogleWorkspaceUpdateCalendarEventBody = {
    */
   createMeetLink: true;
 };
+
+export type GoogleWorkspaceNativeFileResponse = {
+  ok: true;
+  file: GoogleWorkspaceDriveFileSummary;
+};
+
+export type GoogleWorkspaceNativeFileCreateBody =
+  | {
+      type: "document";
+      name: string;
+      folderId?: string;
+      text: string;
+    }
+  | {
+      type: "spreadsheet";
+      name: string;
+      folderId?: string;
+      sheetName?: string;
+      values: Array<Array<string | number | boolean | null>>;
+    }
+  | {
+      type: "presentation";
+      name: string;
+      folderId?: string;
+      slides: Array<{
+        title: string;
+        body: string;
+      }>;
+    };
+
+export type GoogleWorkspaceNativeFileUpdateBody =
+  | {
+      type: "document";
+      name?: string;
+      folderId?: string;
+      text: string;
+    }
+  | {
+      type: "spreadsheet";
+      name?: string;
+      folderId?: string;
+      sheetName?: string;
+      values: Array<Array<string | number | boolean | null>>;
+    }
+  | {
+      type: "presentation";
+      name?: string;
+      folderId?: string;
+      slides: Array<{
+        title: string;
+        body: string;
+      }>;
+    };
 
 export type GoogleWorkspaceDriveFilesResponse = {
   ok: true;
@@ -19830,6 +19892,55 @@ export type GetV1CapabilitiesGoogleWorkspaceGmailAttachmentByMessageIdByAttachme
 export type GetV1CapabilitiesGoogleWorkspaceGmailAttachmentByMessageIdByAttachmentIdResponse =
   GetV1CapabilitiesGoogleWorkspaceGmailAttachmentByMessageIdByAttachmentIdResponses[keyof GetV1CapabilitiesGoogleWorkspaceGmailAttachmentByMessageIdByAttachmentIdResponses];
 
+export type GetV1CapabilitiesGoogleWorkspaceCalendarAgendaData = {
+  body?: never;
+  path?: never;
+  query?: {
+    day?: "today" | "tomorrow" | string;
+    /**
+     * Optional IANA time zone override. Omit it to use the calling member's primary Google Calendar time zone.
+     */
+    timeZone?: string;
+    /**
+     * Maximum events to return, capped at 100.
+     */
+    maxResults?: number;
+  };
+  url: "/v1/capabilities/google-workspace/calendar-agenda";
+};
+
+export type GetV1CapabilitiesGoogleWorkspaceCalendarAgendaErrors = {
+  /**
+   * The local date or time zone was invalid.
+   */
+  400: InvalidRequestError;
+  /**
+   * The caller must be signed in.
+   */
+  401: UnauthorizedError;
+  /**
+   * The calling member has not connected their Google account or is missing permission.
+   */
+  409: GoogleWorkspaceNeedsConnectionError;
+  /**
+   * Google rejected the request.
+   */
+  502: GoogleWorkspaceUpstreamError;
+};
+
+export type GetV1CapabilitiesGoogleWorkspaceCalendarAgendaError =
+  GetV1CapabilitiesGoogleWorkspaceCalendarAgendaErrors[keyof GetV1CapabilitiesGoogleWorkspaceCalendarAgendaErrors];
+
+export type GetV1CapabilitiesGoogleWorkspaceCalendarAgendaResponses = {
+  /**
+   * Google Calendar agenda returned.
+   */
+  200: GoogleWorkspaceCalendarAgendaResponse;
+};
+
+export type GetV1CapabilitiesGoogleWorkspaceCalendarAgendaResponse =
+  GetV1CapabilitiesGoogleWorkspaceCalendarAgendaResponses[keyof GetV1CapabilitiesGoogleWorkspaceCalendarAgendaResponses];
+
 export type GetV1CapabilitiesGoogleWorkspaceCalendarEventsData = {
   body?: never;
   path?: never;
@@ -19952,6 +20063,89 @@ export type PatchV1CapabilitiesGoogleWorkspaceCalendarEventByEventIdResponses = 
 
 export type PatchV1CapabilitiesGoogleWorkspaceCalendarEventByEventIdResponse =
   PatchV1CapabilitiesGoogleWorkspaceCalendarEventByEventIdResponses[keyof PatchV1CapabilitiesGoogleWorkspaceCalendarEventByEventIdResponses];
+
+export type PostV1CapabilitiesGoogleWorkspaceNativeFilesData = {
+  body: GoogleWorkspaceNativeFileCreateBody;
+  path?: never;
+  query?: never;
+  url: "/v1/capabilities/google-workspace/native-files";
+};
+
+export type PostV1CapabilitiesGoogleWorkspaceNativeFilesErrors = {
+  /**
+   * The native file request was invalid.
+   */
+  400: InvalidRequestError;
+  /**
+   * The caller must be signed in.
+   */
+  401: UnauthorizedError;
+  /**
+   * The calling member has not connected their Google account or is missing permission.
+   */
+  409: GoogleWorkspaceNeedsConnectionError;
+  /**
+   * Google rejected the request.
+   */
+  502: GoogleWorkspaceUpstreamError;
+};
+
+export type PostV1CapabilitiesGoogleWorkspaceNativeFilesError =
+  PostV1CapabilitiesGoogleWorkspaceNativeFilesErrors[keyof PostV1CapabilitiesGoogleWorkspaceNativeFilesErrors];
+
+export type PostV1CapabilitiesGoogleWorkspaceNativeFilesResponses = {
+  /**
+   * Native Google file created.
+   */
+  200: GoogleWorkspaceNativeFileResponse;
+};
+
+export type PostV1CapabilitiesGoogleWorkspaceNativeFilesResponse =
+  PostV1CapabilitiesGoogleWorkspaceNativeFilesResponses[keyof PostV1CapabilitiesGoogleWorkspaceNativeFilesResponses];
+
+export type PatchV1CapabilitiesGoogleWorkspaceNativeFileByFileIdData = {
+  body: GoogleWorkspaceNativeFileUpdateBody;
+  path: {
+    /**
+     * Existing Google Docs, Sheets, or Slides file id.
+     */
+    fileId: string;
+  };
+  query?: never;
+  url: "/v1/capabilities/google-workspace/native-file/{fileId}";
+};
+
+export type PatchV1CapabilitiesGoogleWorkspaceNativeFileByFileIdErrors = {
+  /**
+   * The native file request was invalid.
+   */
+  400: InvalidRequestError;
+  /**
+   * The caller must be signed in.
+   */
+  401: UnauthorizedError;
+  /**
+   * The calling member has not connected their Google account or is missing permission.
+   */
+  409: GoogleWorkspaceNeedsConnectionError;
+  /**
+   * Google rejected the request.
+   */
+  502: GoogleWorkspaceUpstreamError;
+};
+
+export type PatchV1CapabilitiesGoogleWorkspaceNativeFileByFileIdError =
+  PatchV1CapabilitiesGoogleWorkspaceNativeFileByFileIdErrors[keyof PatchV1CapabilitiesGoogleWorkspaceNativeFileByFileIdErrors];
+
+export type PatchV1CapabilitiesGoogleWorkspaceNativeFileByFileIdResponses = {
+  /**
+   * Native Google file updated.
+   */
+  200: GoogleWorkspaceNativeFileResponse;
+};
+
+export type PatchV1CapabilitiesGoogleWorkspaceNativeFileByFileIdResponse =
+  PatchV1CapabilitiesGoogleWorkspaceNativeFileByFileIdResponses[keyof PatchV1CapabilitiesGoogleWorkspaceNativeFileByFileIdResponses];
 
 export type GetV1CapabilitiesGoogleWorkspaceDriveFilesData = {
   body?: never;

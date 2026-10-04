@@ -1,28 +1,28 @@
 import { z } from "zod";
 
-/** Desktop feature-policy enforcement is suspended pending redesign. This is
+/** This fork retains configured desktop feature-policy enforcement. This is
  * not a Cloud authorization switch: schemas, assignments and resource
  * entitlements remain authoritative in Den. Keep all desktop feature-policy
  * entry points on this flag.
  *
- * Two controls are deliberately NOT behind this flag:
+ * These controls are deliberately NOT behind this flag:
  * - Required sign-in is a property of the build (enterprise and cloud always
  *   require it; a public build can opt in through desktop-bootstrap.json).
  * - `allowedDesktopVersions` is an organization setting, not a desktop policy,
  *   so the projection below keeps it and the updater keeps honouring it.
  * - Model access (below) is the AI Gateway's own setting; it only happens to
  *   be stored in the default desktop policy. */
-export const DESKTOP_POLICY_ENFORCEMENT_ENABLED: boolean = false;
+export const DESKTOP_POLICY_ENFORCEMENT_ENABLED: boolean = true;
 
 /**
  * Model access: the AI Gateway's "Who can use models" setting. "Only models
  * you provide" is stored as `allowCustomProviders: false` in the
  * organization's default desktop policy, and "Admins may still add their own
  * keys" as a policy for the admin role. The desktop and web app enforce this
- * key on its own; every other desktop policy, including `allowZenModel`,
- * stays off with the flag above.
- * Enforcement never blocks startup, sign-in or chat: callers apply the last
- * known setting and allow when none is known (see #5131).
+ * key on its own when full desktop policy enforcement is disabled. This fork
+ * keeps full enforcement, including `allowZenModel`, enabled.
+ * When full enforcement is disabled, model access uses the last known
+ * setting without blocking startup, sign-in or chat (see #5131).
  */
 export const MODEL_ACCESS_POLICY_KEYS = ["allowCustomProviders"] as const;
 

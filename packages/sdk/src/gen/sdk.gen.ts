@@ -199,6 +199,8 @@ import type {
   GetV1BootstrapWorkspaceByBootstrapIdClaimResponses,
   GetV1BrandAssetsByOrganizationIdByKindByVersionErrors,
   GetV1BrandAssetsByOrganizationIdByKindByVersionResponses,
+  GetV1CapabilitiesGoogleWorkspaceCalendarAgendaErrors,
+  GetV1CapabilitiesGoogleWorkspaceCalendarAgendaResponses,
   GetV1CapabilitiesGoogleWorkspaceCalendarEventsErrors,
   GetV1CapabilitiesGoogleWorkspaceCalendarEventsResponses,
   GetV1CapabilitiesGoogleWorkspaceDriveFileByFileIdErrors,
@@ -491,6 +493,8 @@ import type {
   GetWellKnownOpenidConfigurationApiAuthResponses,
   GetWellKnownOpenidConfigurationResponses,
   GoogleWorkspaceCreateCalendarEventBody,
+  GoogleWorkspaceNativeFileCreateBody,
+  GoogleWorkspaceNativeFileUpdateBody,
   GoogleWorkspaceShareDriveFileBody,
   GoogleWorkspaceUpdateCalendarEventBody,
   ListAutomationRunsErrors,
@@ -533,6 +537,8 @@ import type {
   PatchV1AdminOrganizationsByOrganizationIdPlanResponses,
   PatchV1CapabilitiesGoogleWorkspaceCalendarEventByEventIdErrors,
   PatchV1CapabilitiesGoogleWorkspaceCalendarEventByEventIdResponses,
+  PatchV1CapabilitiesGoogleWorkspaceNativeFileByFileIdErrors,
+  PatchV1CapabilitiesGoogleWorkspaceNativeFileByFileIdResponses,
   PatchV1ConnectorInstancesByConnectorInstanceIdErrors,
   PatchV1ConnectorInstancesByConnectorInstanceIdResponses,
   PatchV1ConnectorMappingsByConnectorMappingIdErrors,
@@ -613,6 +619,8 @@ import type {
   PostV1CapabilitiesGoogleWorkspaceDriveFileShareByFileIdResponses,
   PostV1CapabilitiesGoogleWorkspaceGmailDraftsErrors,
   PostV1CapabilitiesGoogleWorkspaceGmailDraftsResponses,
+  PostV1CapabilitiesGoogleWorkspaceNativeFilesErrors,
+  PostV1CapabilitiesGoogleWorkspaceNativeFilesResponses,
   PostV1CapabilitiesMicrosoft365CalendarEventsErrors,
   PostV1CapabilitiesMicrosoft365CalendarEventsResponses,
   PostV1CapabilitiesMicrosoft365MailDraftsErrors,
@@ -8927,6 +8935,42 @@ export class DenClient extends HeyApiClient {
   }
 
   /**
+   * Get the primary Google Calendar agenda for today, tomorrow, or one local date
+   *
+   * Preferred capability for listing the calling member's primary-calendar agenda for today, tomorrow, or one YYYY-MM-DD date. Omit timeZone to use the primary calendar's configured time zone; override it only when the user explicitly asks for another time zone.
+   */
+  public getV1CapabilitiesGoogleWorkspaceCalendarAgenda<ThrowOnError extends boolean = false>(
+    parameters?: {
+      day?: "today" | "tomorrow" | string;
+      timeZone?: string;
+      maxResults?: number;
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "day" },
+            { in: "query", key: "timeZone" },
+            { in: "query", key: "maxResults" },
+          ],
+        },
+      ],
+    );
+    return (options?.client ?? this.client).get<
+      GetV1CapabilitiesGoogleWorkspaceCalendarAgendaResponses,
+      GetV1CapabilitiesGoogleWorkspaceCalendarAgendaErrors,
+      ThrowOnError
+    >({
+      url: "/v1/capabilities/google-workspace/calendar-agenda",
+      ...options,
+      ...params,
+    });
+  }
+
+  /**
    * List Google Calendar events in a time range as the calling member
    *
    * Lists primary-calendar events for the calling member in a requested ISO time range, using their connected Google Workspace account.
@@ -9022,6 +9066,76 @@ export class DenClient extends HeyApiClient {
       ThrowOnError
     >({
       url: "/v1/capabilities/google-workspace/calendar-event/{eventId}",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    });
+  }
+
+  /**
+   * Create a native Google document, spreadsheet, or presentation
+   *
+   * Creates exactly one Google Docs document, Google Sheets spreadsheet, or Google Slides presentation from structured content, optionally moves it into a Drive folder, and returns the real Drive link. Use this only when the user explicitly asks to create or publish the Google file; drafting local content does not call this capability.
+   */
+  public postV1CapabilitiesGoogleWorkspaceNativeFiles<ThrowOnError extends boolean = false>(
+    parameters: {
+      googleWorkspaceNativeFileCreateBody: GoogleWorkspaceNativeFileCreateBody;
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [{ args: [{ key: "googleWorkspaceNativeFileCreateBody", map: "body" }] }],
+    );
+    return (options?.client ?? this.client).post<
+      PostV1CapabilitiesGoogleWorkspaceNativeFilesResponses,
+      PostV1CapabilitiesGoogleWorkspaceNativeFilesErrors,
+      ThrowOnError
+    >({
+      url: "/v1/capabilities/google-workspace/native-files",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    });
+  }
+
+  /**
+   * Replace a native Google document, spreadsheet, or presentation
+   *
+   * Replaces the complete editable content of one existing Google Docs document, Google Sheets spreadsheet, or Google Slides presentation by file id. It can also rename or move the file and returns the real Drive link. Use this only when the user explicitly asks to update that existing Google file.
+   */
+  public patchV1CapabilitiesGoogleWorkspaceNativeFileByFileId<ThrowOnError extends boolean = false>(
+    parameters: {
+      fileId: string;
+      googleWorkspaceNativeFileUpdateBody: GoogleWorkspaceNativeFileUpdateBody;
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "fileId" },
+            { key: "googleWorkspaceNativeFileUpdateBody", map: "body" },
+          ],
+        },
+      ],
+    );
+    return (options?.client ?? this.client).patch<
+      PatchV1CapabilitiesGoogleWorkspaceNativeFileByFileIdResponses,
+      PatchV1CapabilitiesGoogleWorkspaceNativeFileByFileIdErrors,
+      ThrowOnError
+    >({
+      url: "/v1/capabilities/google-workspace/native-file/{fileId}",
       ...options,
       ...params,
       headers: {
