@@ -1,11 +1,8 @@
 import { expect } from "vitest";
 import { mkdir, stat, writeFile } from "node:fs/promises";
 import { join, sep } from "node:path";
-import { denFetch, evalIn } from "@openwork/behaviors";
-import { startMockGoogle } from "@openwork/labs";
-import { app, localMysqlIsRunning, needs, server, test } from "@openwork/testkit";
-import type { DenSession } from "@openwork/behaviors";
-import type { MockGoogleHandle } from "@openwork/labs";
+import { app, browserScript, denFetch, evalIn, localMysqlIsRunning, needs, server, startMockGoogle, test } from "@openwork/testkit";
+import type { DenSession, MockGoogleHandle } from "@openwork/testkit";
 
 const localPlacement = process.env.OPENWORK_EVAL_DAYTONA !== "1"
   && !process.env.OPENWORK_EVAL_DEN_API_URL?.trim();
@@ -96,32 +93,37 @@ test.skipIf(!localPlacement || !mysqlOpen)("uploads and generated artifacts stay
   await using den = await server({ place });
   await using desktop = await app({ den, as: "admin", place });
 
-  const upload = await evalIn(desktop, `(async () => {
-    const info = await window.__OPENWORK_ELECTRON__?.invokeDesktop?.("openworkServerInfo");
-    const baseUrl = String(info?.baseUrl ?? info?.connectUrl ?? "").replace(/\\/+$/, "");
+  const upload = await evalIn(desktop, browserScript(async (workspaceId: string) => {
+    function record(value: unknown): Record<string, unknown> | null {
+      return typeof value === "object" && value !== null && !Array.isArray(value) ? Object.fromEntries(Object.entries(value)) : null;
+    }
+    const info = record(await window.__OPENWORK_ELECTRON__?.invokeDesktop?.("openworkServerInfo"));
+    const baseUrl = String(info?.baseUrl ?? info?.connectUrl ?? "").replace(/\/+$/, "");
     const token = String(info?.ownerToken ?? info?.clientToken ?? "");
     const headers = { authorization: "Bearer " + token };
     const workspacesResponse = await fetch(baseUrl + "/workspaces", { headers });
-    const workspaces = await workspacesResponse.json();
-    const workspace = workspaces.items?.find((item) => item.id === ${JSON.stringify(desktop.workspaceId)});
+    const workspaces = record(await workspacesResponse.json());
+    const workspace = Array.isArray(workspaces?.items)
+      ? workspaces.items.map(record).find((item) => item?.id === workspaceId)
+      : undefined;
     const form = new FormData();
-    form.append("file", new File(["quarter,value\\nQ1,42\\n"], "input.csv", { type: "text/csv" }));
+    form.append("file", new File(["quarter,value\nQ1,42\n"], "input.csv", { type: "text/csv" }));
     form.append("path", "eval/input.csv");
-    const response = await fetch(baseUrl + "/workspace/${encodeURIComponent(desktop.workspaceId)}/inbox", {
+    const response = await fetch(baseUrl + "/workspace/" + encodeURIComponent(workspaceId) + "/inbox", {
       method: "POST",
       headers,
       body: form,
     });
     const body = await response.json();
     const capabilitiesResponse = await fetch(baseUrl + "/capabilities", { headers });
-    const capabilities = await capabilitiesResponse.json();
+    const capabilities = record(await capabilitiesResponse.json());
     return {
       status: response.status,
       body,
       workspacePath: workspace?.path,
-      storage: capabilities.toolProviders?.files?.storage,
+      storage: record(record(capabilities?.toolProviders)?.files)?.storage,
     };
-  })()`, { awaitPromise: true, timeoutMs: 30_000 });
+  }, [desktop.workspaceId]), { awaitPromise: true, timeoutMs: 30_000 });
 
   if (!isRecord(upload) || !isRecord(upload.body)) throw new Error("Execution-storage upload response was invalid.");
   const executionPath = stringValue(upload.body.executionPath, "execution path");
@@ -143,21 +145,26 @@ test.skipIf(!localPlacement || !mysqlOpen)("uploads and generated artifacts stay
     .catch(() => false);
   expect(legacyExecutionDirectoryExists).toBe(false);
 
-  const artifact = await evalIn(desktop, `(async () => {
-    const info = await window.__OPENWORK_ELECTRON__?.invokeDesktop?.("openworkServerInfo");
-    const baseUrl = String(info?.baseUrl ?? info?.connectUrl ?? "").replace(/\\/+$/, "");
+  const artifact = await evalIn(desktop, browserScript(async (workspaceId: string) => {
+    function record(value: unknown): Record<string, unknown> | null {
+      return typeof value === "object" && value !== null && !Array.isArray(value) ? Object.fromEntries(Object.entries(value)) : null;
+    }
+    const info = record(await window.__OPENWORK_ELECTRON__?.invokeDesktop?.("openworkServerInfo"));
+    const baseUrl = String(info?.baseUrl ?? info?.connectUrl ?? "").replace(/\/+$/, "");
     const token = String(info?.ownerToken ?? info?.clientToken ?? "");
     const headers = { authorization: "Bearer " + token };
-    const listResponse = await fetch(baseUrl + "/workspace/${encodeURIComponent(desktop.workspaceId)}/artifacts", { headers });
-    const list = await listResponse.json();
-    const item = list.items?.find((candidate) => candidate.path === "generated/summary.md");
+    const listResponse = await fetch(baseUrl + "/workspace/" + encodeURIComponent(workspaceId) + "/artifacts", { headers });
+    const list = record(await listResponse.json());
+    const item = Array.isArray(list?.items)
+      ? list.items.map(record).find((candidate) => candidate?.path === "generated/summary.md")
+      : undefined;
     if (!item) return { listStatus: listResponse.status, item: null };
     const downloadResponse = await fetch(
-      baseUrl + "/workspace/${encodeURIComponent(desktop.workspaceId)}/artifacts/" + encodeURIComponent(item.id),
+      baseUrl + "/workspace/" + encodeURIComponent(workspaceId) + "/artifacts/" + encodeURIComponent(String(item.id)),
       { headers },
     );
     return { listStatus: listResponse.status, item, downloadStatus: downloadResponse.status, text: await downloadResponse.text() };
-  })()`, { awaitPromise: true, timeoutMs: 30_000 });
+  }, [desktop.workspaceId]), { awaitPromise: true, timeoutMs: 30_000 });
 
   if (!isRecord(artifact) || !isRecord(artifact.item)) throw new Error("Generated artifact was not listed by OpenWork.");
   expect(artifact.listStatus).toBe(200);
