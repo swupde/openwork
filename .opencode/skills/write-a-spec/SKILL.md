@@ -36,8 +36,8 @@ it decides the world you can build.
 Tag `checkpoints` only when a still image cannot show what the reviewer has to
 check: an open stream, a populated workspace to explore, a state that costs
 minutes to reach. The tag moves the spec to a protected lane that uses a
-secret, where fork PRs cannot run. It saves the end state of each tagged test,
-plus every `user.checkpoint("caption")` and every `step(..., { checkpoint: true })`.
+secret, where fork PRs cannot run. It saves each tagged test's world as
+launched for the commit (before the body acts) and its end state, plus every `user.checkpoint("caption")` and every `step(..., { checkpoint: true })`.
 Plain `user.screenshot()` never saves one. Say why in a comment beside the
 tag. Checkpoints cost VM snapshots, so capture the one or two moments a
 reviewer would open, not every step. Run it locally with
@@ -232,6 +232,14 @@ placeholder, or test id. Bound every wait; declare external requirements in
   If the screenshots would not convince you, they will not convince the reviewer.
   Read the captions in `index.html` top to bottom: they should tell the
   before → after story on their own.
+- Your own eye passes what you designed. Run the design review on the same
+  record before pushing and fix its `medium` notes, or say in the PR why the
+  screen is right (`evals/design-review/README.md`; on a PR, the
+  `fix-design-notes` skill reads the notes from the Evidence preview check):
+
+  ```sh
+  pnpm --dir evals design:review -- --test-run latest
+  ```
 - In CI the spec runs on `PR change proof`, one job per spec; the trusted
   publisher aggregates every changed spec's records into one report. Failed,
   skipped, and cancelled runs stay visible as such; nothing substitutes for them.

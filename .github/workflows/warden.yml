@@ -1,7 +1,7 @@
 name: Warden
 
-# Keep these actions aligned with warden.toml. The workflow remains disabled
-# in GitHub until a maintainer explicitly enables it after rollout.
+# Keep these actions aligned with warden.toml. Warden Clearance
+# (warden-clearance.yml) reads this run's warden-summary receipt to approve.
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -17,9 +17,11 @@ concurrency:
 
 jobs:
   warden:
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    if: github.repository == 'different-ai/openwork' && (github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Up to 400 files / 60,000 changed lines (warden.toml); the largest PRs
+    # take well over 20 minutes.
+    timeout-minutes: 60
     steps:
       - name: Start timing
         id: timing
@@ -90,6 +92,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           REPORT_PATH: ${{ runner.temp }}/warden-summary.json
+          FINDINGS_REPORT_PATH: ${{ runner.temp }}/warden-findings.json
         run: node .warden-policy/.github/scripts/warden-report.mjs
 
       - name: Save review measurement
@@ -100,3 +103,14 @@ jobs:
           path: ${{ runner.temp }}/warden-summary.json
           retention-days: 90
           if-no-files-found: warn
+
+      # Security findings only (never confidentiality text) for the PR comment
+      # Warden Clearance posts. Absent when the security review is incomplete.
+      - name: Save security findings for the PR comment
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: warden-findings
+          path: ${{ runner.temp }}/warden-findings.json
+          retention-days: 30
+          if-no-files-found: ignore

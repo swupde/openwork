@@ -95,7 +95,7 @@ jobs:
     # GITHUB_TOKEN). The dispatch run that created the tag owns the release,
     # so the duplicate push run skips here — and with it every job that
     # needs resolve-release.
-    if: github.event.inputs.benchmark_only != 'true' && (github.event_name != 'push' || github.actor != 'diff-warden[bot]')
+    if: github.repository == 'different-ai/openwork' && (github.event.inputs.benchmark_only != 'true' && (github.event_name != 'push' || github.actor != 'diff-warden[bot]'))
     outputs:
       release_tag: ${{ steps.resolve.outputs.release_tag }}
       release_version: ${{ steps.resolve.outputs.release_version }}
@@ -400,7 +400,7 @@ jobs:
 
   resolve-benchmark:
     name: Resolve Benchmark Metadata
-    if: github.event.inputs.benchmark_only == 'true'
+    if: github.repository == 'different-ai/openwork' && (github.event.inputs.benchmark_only == 'true')
     runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       release_tag: ${{ steps.resolve.outputs.release_tag }}
@@ -436,6 +436,7 @@ jobs:
     name: Select Release Context
     needs: [resolve-production, resolve-benchmark]
     if: |
+      github.repository == 'different-ai/openwork' &&
       always() &&
       (needs.resolve-production.result == 'success' || needs.resolve-benchmark.result == 'success')
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -459,7 +460,7 @@ jobs:
     # Benchmark mode intentionally skips resolve-production. Override the
     # implicit success() check so that skipped sibling does not propagate
     # through the selected release context and suppress verification.
-    if: always() && needs.resolve-release.result == 'success'
+    if: github.repository == 'different-ai/openwork' && (always() && needs.resolve-release.result == 'success')
     runs-on: blacksmith-4vcpu-ubuntu-2404
     env:
       RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
@@ -487,6 +488,7 @@ jobs:
     name: Build + publish Electron (${{ matrix.artifact }})
     needs: [resolve-release, verify-release]
     if: |
+      github.repository == 'different-ai/openwork' &&
       always() &&
       needs.resolve-release.result == 'success' &&
       needs.verify-release.result == 'success' &&
@@ -720,8 +722,6 @@ jobs:
           # TARGET tells prepare-sidecar.mjs which architecture's opencode binary
           # to download (critical for cross-arch builds like x64 on arm64 mac).
           TARGET: ${{ matrix.target_triple }}
-          # Only this step derives the release's free Auto tag; no other step sees the master key.
-          DESKTOP_FREE_RELEASE_KEY: ${{ secrets.DESKTOP_FREE_RELEASE_KEY }}
         run: pnpm --filter @openwork/desktop build:electron
 
       - name: Package Electron (macOS, signed + notarized)
@@ -918,6 +918,7 @@ jobs:
     name: Build + publish Electron (${{ matrix.artifact }})
     needs: [resolve-release, verify-release]
     if: |
+      github.repository == 'different-ai/openwork' &&
       always() &&
       needs.resolve-release.result == 'success' &&
       needs.verify-release.result == 'success' &&
@@ -1010,6 +1011,7 @@ jobs:
     # the sandbox snapshot is rebuildable after the fact, while installable
     # desktop artifacts should never be held back by it.
     if: |
+      github.repository == 'different-ai/openwork' &&
       always() &&
       needs.resolve-release.result == 'success' &&
       needs.verify-release.result == 'success' &&
@@ -1080,6 +1082,7 @@ jobs:
     # always() is required: resolve-benchmark is a skipped ancestor on every
     # production release, and the implicit success() would skip this job.
     if: |
+      github.repository == 'different-ai/openwork' &&
       always() &&
       needs.publish-release.result == 'success' &&
       needs.publish-release.outputs.published_stable == 'true'
@@ -1108,6 +1111,7 @@ jobs:
     name: Prepare openwork-server npm package
     needs: [resolve-release, verify-release]
     if: |
+      github.repository == 'different-ai/openwork' &&
       always() &&
       needs.resolve-release.result == 'success' &&
       needs.verify-release.result == 'success' &&
@@ -1211,6 +1215,7 @@ jobs:
     # any transitive dependency was skipped. Without it this matrix never
     # runs and publish-npm silently skips (v0.18.51, v0.18.52).
     if: |
+      github.repository == 'different-ai/openwork' &&
       always() &&
       needs.resolve-release.result == 'success' &&
       needs.prepare-npm.result == 'success' &&
@@ -1270,6 +1275,7 @@ jobs:
     name: Publish openwork-server
     needs: [resolve-release, verify-release, prepare-npm, verify-npm-hosts]
     if: |
+      github.repository == 'different-ai/openwork' &&
       always() &&
       needs.resolve-release.result == 'success' &&
       needs.verify-release.result == 'success' &&
@@ -1351,6 +1357,7 @@ jobs:
     name: Build + Push Daytona Snapshot
     needs: [resolve-release, verify-release, publish-npm]
     if: |
+      github.repository == 'different-ai/openwork' &&
       always() &&
       needs.resolve-release.result == 'success' &&
       needs.verify-release.result == 'success' &&
@@ -1366,6 +1373,7 @@ jobs:
     name: Publish AUR
     needs: [resolve-release, publish-electron-unix, publish-release]
     if: |
+      github.repository == 'different-ai/openwork' &&
       always() &&
       needs.resolve-release.result == 'success' &&
       needs.resolve-release.outputs.benchmark_only != 'true' &&

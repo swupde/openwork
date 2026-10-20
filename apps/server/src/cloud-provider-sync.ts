@@ -698,7 +698,7 @@ function buildProviderConfig(provider: DenProviderConnection): JsonRecord {
   if (api) config.api = api;
   if (isRecord(provider.providerConfig.options)) config.options = provider.providerConfig.options;
   const whitelist = readStringList(provider.providerConfig.whitelist);
-  if (whitelist.length > 0) config.whitelist = whitelist;
+  if (Array.isArray(provider.providerConfig.whitelist)) config.whitelist = whitelist;
   const blacklist = readStringList(provider.providerConfig.blacklist);
   if (blacklist.length > 0) config.blacklist = blacklist;
   return config;
@@ -1438,7 +1438,7 @@ export class CloudProviderSync {
       const hasStoredConfig = await hasOpenworkWorkspaceConfig(this.config, workspace.id);
       const openwork = hasStoredConfig
         ? await readOpenworkWorkspaceConfig(this.config, workspace.id)
-        : workspace.workspaceType !== "remote" && workspace.path.trim().length > 0
+        : workspace.path.trim().length > 0
           ? await readLegacyOpenworkConfig(openworkConfigPath(workspace.path))
           : null;
       if (!openwork) continue;

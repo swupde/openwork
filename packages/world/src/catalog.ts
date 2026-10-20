@@ -51,9 +51,9 @@ const NO_MODELS = "No model credentials are seeded; chat cannot reach a live mod
 /** What each seed prepares. Seeds are named scenarios, not arbitrary fixtures. */
 export const SEED_MEANINGS: Readonly<Record<string, string>> = {
   fresh: "First launch: nothing is created or signed in; where the world has a Den it opens at signup.",
-  team: "A seeded organization owner with Notion and Linear connections available (individual accounts stay unconnected).",
+  team: "A seeded organization owner with demo Slack, Notion, Linear, Google Calendar and Gmail (in-memory Acme Robotics data) plus real Notion and Linear connectors (individual accounts stay unconnected).",
   restricted: "The team seed with Den's canonical restricted desktop policy applied.",
-  workspace: "A seeded owner; with a desktop (preview-full) it is signed in to a workspace without pre-added tools.",
+  workspace: "The team seed; with a desktop (preview-full) it is signed in to a workspace with the demo apps ready.",
   blank: "Exact published release bytes with a completely blank, unseeded profile.",
 };
 
@@ -97,7 +97,7 @@ export const WORLD_GUIDES: Readonly<Record<string, WorldGuide>> = {
     ],
     examples: [
       { intent: "Den signup and onboarding from latest dev", command: `${UP} preview-den --place daytona --stage <stage> --seed fresh ${DETACH}` },
-      { intent: "Seeded team administration (Notion and Linear available)", command: `${UP} preview-den --place daytona --stage <stage> --seed team ${DETACH}` },
+      { intent: "Seeded team administration (demo apps plus real connectors)", command: `${UP} preview-den --place daytona --stage <stage> --seed team ${DETACH}` },
       { intent: "A specific pushed commit", command: `${UP} preview-den --place daytona --stage <stage> --source den=sha:<full-pushed-sha> --seed fresh ${DETACH}` },
     ],
     caveats: ["Den alone: no desktop app. Mail stays in the preview's development outbox."],
@@ -111,11 +111,11 @@ export const WORLD_GUIDES: Readonly<Record<string, WorldGuide>> = {
     ],
     examples: [
       { intent: "Signed-in desktop workspace against its own Den, latest dev", command: `${UP} preview-full --place daytona --stage <stage> --seed workspace ${DETACH}` },
-      { intent: "Team owner desktop with Notion and Linear available", command: `${UP} preview-full --place daytona --stage <stage> --seed team ${DETACH}` },
+      { intent: "Team owner desktop with demo Slack, Notion, Linear, Calendar and Gmail", command: `${UP} preview-full --place daytona --stage <stage> --seed team ${DETACH}` },
       { intent: "Den signup plus a first-launch desktop", command: `${UP} preview-full --place daytona --stage <stage> --seed fresh ${DETACH}` },
       { intent: "A specific pushed commit", command: `${UP} preview-full --place daytona --stage <stage> --source den=sha:<full-pushed-sha> --seed workspace ${DETACH}` },
     ],
-    caveats: [NO_MODELS, "Does not run on Freestyle; use preview-desktop there for a signed-out desktop."],
+    caveats: [NO_MODELS, "Does not run on Freestyle; acme-web there has the same demo apps with a signed-in desktop, and preview-desktop a signed-out one."],
   },
   "preview-app-web": {
     family: "web",
@@ -144,6 +144,30 @@ export const WORLD_GUIDES: Readonly<Record<string, WorldGuide>> = {
       { intent: "Seeded Acme demo stack from latest dev on Daytona", command: `${UP} acme-web --place daytona --stage <stage> ${DETACH}` },
       { intent: "Seeded Acme demo stack on Freestyle", command: `${UP} acme-web --place freestyle --stage <stage> --source ref:dev ${DETACH}` },
       { intent: "Seeded Acme demo stack from this checkout", command: `${UP} acme-web --stage <stage>` },
+    ],
+    caveats: ["Includes the in-memory demo Slack, Notion, Linear, Google Calendar and Gmail on every placement; Alex Chen is the signed-in owner."],
+  },
+  "preview-workbot": {
+    family: "web",
+    components: ["*"],
+    targets: [
+      { target: "local/host", seeds: [], sources: ["local"], defaultSource: LOCAL },
+      { target: "daytona/linux", seeds: [], sources: ["sha", "ref"], defaultSource: DEV },
+      { target: "freestyle/linux", seeds: [], sources: ["sha", "ref"], note: "A source is required: --source ref:dev or sha:<full-pushed-sha>." },
+    ],
+    examples: [
+      { intent: "Workbot, Den and the headless runner from this checkout", command: `${UP} preview-workbot --stage <stage>` },
+      { intent: "Feel Workbot for real: a real model, its own computer and an MCP App (local; keys from env or Infisical)", command: `${UP} preview-workbot --stage <stage> ${DETACH} -- --live` },
+      { intent: "The Calendar in Workbot and the desktop over Workbot's Acme org: seeded Automations, the calendar mock and a signed-in desktop (local)", command: `${UP} preview-workbot --stage <stage> ${DETACH} -- --calendar` },
+      { intent: "Workbot from latest dev on Daytona", command: `${UP} preview-workbot --place daytona --stage <stage> ${DETACH}` },
+      { intent: "Workbot on Freestyle", command: `${UP} preview-workbot --place freestyle --stage <stage> --source ref:dev ${DETACH}` },
+    ],
+    caveats: [
+      "Sign in to Workbot as alex@acme.test (Den's seeded owner); Workbot and headless Automations are on for Acme Robotics.",
+      "Acme Robotics has the in-memory demo Slack, Gmail, Google Calendar, Notion and Linear connected (you are Alex Chen); writes stay in memory until the world stops.",
+      "By default the model is the deterministic Acme upstream (every answer is the same sentence) and the runner's computer is off: no paid keys or Freestyle key enter the world.",
+      "-- --live (local only) uses a real model (ANTHROPIC_API_KEY or Infisical), turns on Workbot's computer when a Freestyle key is available, and seeds the Order calculator MCP App; it leaves the conversation empty so your first open is real.",
+      "Every placement signs in through Den before reporting ready; without --live it also sends a message and checks the runner's answer.",
     ],
   },
 };

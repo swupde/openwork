@@ -1,4 +1,3 @@
-import { ComputerUseControls } from "../domains/session/surface/computer-use-controls";
 /** @jsxImportSource react */
 
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
@@ -40,6 +39,7 @@ import { DevProfiler, DevProfilerOverlay } from "./dev-profiler";
 import { ReactRenderWatchdogOverlay } from "./react-render-watchdog-overlay";
 import { CloudWorkspaceOverlay, CloudWorkspaceStatusProvider } from "./cloud-workspace-overlay";
 import { EngineMigrationOverlay } from "./engine-migration";
+import { MemberApiKeyDialog } from "../domains/connections/member-api-key-dialog";
 import { AppMenuProvider } from "./app-menu";
 import {
   OpenworkControlProvider,
@@ -54,7 +54,11 @@ import { SettingsRoute } from "./settings-route";
 import { ShellConfigProvider } from "./shell-config";
 import { WelcomeRoute } from "./welcome-route";
 import { readOrgSelectionPending } from "../../app/lib/den-sign-in-intent";
-import { signedInRoute } from "./den-signin-routing";
+import {
+  resolveDenSigninRedirect,
+  shouldRenderPreparedRedirect,
+  signedInRoute,
+} from "./den-signin-routing";
 import { StartupScreen } from "./startup-screen";
 import { WebStartupScreen } from "./workspace-startup-status";
 import { isOpenworkGatewayRuntime } from "../../app/lib/gateway-runtime";
@@ -106,48 +110,39 @@ function DenSigninGate({ children }: DenSigninGateProps) {
   const onSignin = path === "/signin" || path.startsWith("/signin/");
   const onOnboarding = path === "/onboarding" || path.startsWith("/onboarding/");
   const hasPreparedBootstrap = Boolean(bootstrap.prepared);
-  const redirectingPreparedWorkspace =
-    denAuth.status !== "checking" &&
-    !requireSignin &&
-    !denAuth.isSignedIn &&
-    hasPreparedBootstrap &&
-    !onOnboarding;
-
-  useEffect(() => {
+  const routeInput = {
     // Wait for the first auth check so we don't bounce the user between
     // `/session` and `/signin` every navigation while we figure out if
     // their cached token is still valid.
-    if (denAuth.status === "checking") return;
+    authChecking: denAuth.status === "checking",
+    isSignedIn: denAuth.isSignedIn,
+    requireSignin,
+    hasPreparedBootstrap,
+    onSignin,
+    onOnboarding,
+    orgSelectionPending: false,
+  };
+  const redirectingPreparedWorkspace = shouldRenderPreparedRedirect(routeInput);
 
-    if (requireSignin) {
-      if (!denAuth.isSignedIn && !onSignin) {
-        navigate("/signin", { replace: true });
-      } else if (denAuth.isSignedIn && onSignin) {
-        navigate(
-          signedInRoute(readDenSettings().activeOrgId, {
-            orgSelectionPending: readOrgSelectionPending().pending,
-          }),
-          { replace: true },
-        );
-      }
-    } else if (onSignin) {
-      navigate("/session", { replace: true });
-    } else if (!denAuth.isSignedIn && hasPreparedBootstrap && !onOnboarding) {
-      navigate("/onboarding", { replace: true });
-    } else if (
-      denAuth.isSignedIn &&
-      !onOnboarding &&
-      readOrgSelectionPending().pending
-    ) {
-      // A desktop-initiated sign-in is still waiting for the user's explicit
-      // organization choice (including after an app relaunch mid-flow); the
-      // onboarding step owns resolving it.
-      navigate("/onboarding", { replace: true });
-    }
-
-    // If on /onboarding but not signed in, bounce to signin or session
-    if (onOnboarding && !denAuth.isSignedIn && !hasPreparedBootstrap) {
-      navigate(requireSignin ? "/signin" : "/session", { replace: true });
+  useEffect(() => {
+    const redirect = resolveDenSigninRedirect({
+      authChecking: denAuth.status === "checking",
+      isSignedIn: denAuth.isSignedIn,
+      requireSignin,
+      hasPreparedBootstrap,
+      onSignin,
+      onOnboarding,
+      orgSelectionPending: denAuth.isSignedIn && readOrgSelectionPending().pending,
+    });
+    if (redirect === "signed-in-home") {
+      navigate(
+        signedInRoute(readDenSettings().activeOrgId, {
+          orgSelectionPending: readOrgSelectionPending().pending,
+        }),
+        { replace: true },
+      );
+    } else if (redirect) {
+      navigate(redirect, { replace: true });
     }
   }, [
     denAuth.isSignedIn,
@@ -453,7 +448,6 @@ export function AppRoot() {
             <DenSigninGate>
               <OpenWorkWebAccessGate>
                 <CloudWorkspaceStatusProvider>
-                  <ComputerUseControls />
                   <Routes>
               <Route
                 path="/signin"
@@ -520,6 +514,7 @@ export function AppRoot() {
                   </DevProfiler>
                 }
               />
+              <Route path="/calendar" element={<DevProfiler id="CalendarRoute"><SessionRoute /></DevProfiler>} />
               <Route path="/activity" element={<DevProfiler id="ActivityRoute"><SessionRoute /></DevProfiler>} />
               <Route path="/apps" element={<DevProfiler id="AppsRoute"><SessionRoute /></DevProfiler>} />
               <Route path="/dashboard/apps/:appId" element={<DevProfiler id="DashboardAppRoute"><SessionRoute /></DevProfiler>} />
@@ -572,6 +567,7 @@ export function AppRoot() {
                   <LoadingOverlay />
                   <CloudWorkspaceOverlay />
                   <EngineMigrationOverlay />
+                  <MemberApiKeyDialog />
                 </CloudWorkspaceStatusProvider>
               </OpenWorkWebAccessGate>
             </DenSigninGate>

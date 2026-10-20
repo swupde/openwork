@@ -253,13 +253,6 @@ export async function startEmbeddedServer(options: EmbeddedServerOptions): Promi
     config.opencodeUsername = managedOpencode.username;
     config.opencodePassword = managedOpencode.password;
     for (const entry of config.workspaces) {
-      if (entry.workspaceType === "remote") {
-        entry.baseUrl ??= managedOpencode.url;
-        entry.opencodeUsername ??= managedOpencode.username;
-        entry.opencodePassword ??= managedOpencode.password;
-        entry.directory ??= entry.path;
-        continue;
-      }
       entry.baseUrl = managedOpencode.url;
       entry.opencodeUsername = managedOpencode.username;
       entry.opencodePassword = managedOpencode.password;

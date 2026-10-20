@@ -1,8 +1,8 @@
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { allocateFreePort } from "@openwork/cdp";
-import { localMysqlIsRunning, localRedisIsRunning, queryDenDatabase, SkipError, type Den, type Place, type Seed } from "@openwork/env";
+import { allocateFreePort, evaluateOnSurface } from "@openwork/cdp";
+import { createAdmin, localMysqlIsRunning, localRedisIsRunning, queryDenDatabase, SkipError, type Den, type Place, type Seed } from "@openwork/env";
 import { defaultDaytonaExec, execInSandbox } from "@openwork/hosts";
 
 const execFileAsync = promisify(execFile);
@@ -51,6 +51,9 @@ function identifier(value: unknown): string {
   return value;
 }
 
+// Synthetic token for this disposable Den's maintenance endpoint (not a secret).
+const MAINTENANCE_TOKEN = "eval-maintenance-token-0123456789abcdef";
+
 export async function auditLogs(seed: Seed, { place }: { place: Place }) {
   if (process.env.OPENWORK_EVAL_DEN_API_URL?.trim() || process.env.OPENWORK_EVAL_DEN_WEB_URL?.trim()) throw new Error("Audit journey requires a fresh disposable Den, never an attached service");
   await requireCurrentRemoteSource(place);
@@ -65,6 +68,7 @@ export async function auditLogs(seed: Seed, { place }: { place: Place }) {
       // Remove inherited overrides from the child process: prove the deployment defaults.
       DEN_AUDIT_CAPTURE_ENABLED: undefined, DEN_AUDIT_VISIBILITY_ENABLED: undefined,
       PROVISIONER_MODE: "stub", RESEND_API_KEY: "", STRIPE_SECRET_KEY: "", SENTRY_DSN: "",
+      DEN_MAINTENANCE_TOKEN: MAINTENANCE_TOKEN,
     },
     org: {
       name: "Audit proof workspace",
@@ -102,13 +106,80 @@ export async function auditLogs(seed: Seed, { place }: { place: Place }) {
   const providerId = identifier(record(record(created.body).inferenceProvider).id);
   const warmed = await seed.api(den.admin, `/v1/inference-providers/${encodeURIComponent(providerId)}/models`);
   if (!warmed.response.ok) throw new Error(`Synthetic model setup failed: ${warmed.response.status}`);
-  // Seed only the release flag, preserving all existing metadata and sibling capabilities.
+  const teammateOrg = await seed.api(teammate, "/v1/org");
+  if (!teammateOrg.response.ok) throw new Error(`Synthetic teammate lookup failed: ${teammateOrg.response.status}`);
+  const teammateUserId = identifier(record(record(teammateOrg.body).currentMember).userId);
+  // A platform administrator who is not a member of the audited organization,
+  // so its admin change is attributed to "Platform administrator", not a member name.
+  const platformAdminEmail = "audit-platform-admin@example.test";
+  const granted = await seed.api(den.admin, "/v1/admin/admins", { method: "POST", body: JSON.stringify({ email: platformAdminEmail, note: "Synthetic audit proof admin" }) });
+  if (!granted.response.ok) throw new Error(`Synthetic platform admin grant failed: ${granted.response.status}`);
+  const owner = den.admin;
+  const platformAdmin = await createAdmin(den, { name: "Audit Platform Admin", email: platformAdminEmail });
+  // createAdmin also replaces den.admin; the organization owner stays the primary session.
+  den.admin = owner;
+  // Seed only the auditLogs feature override, leaving every other feature alone.
   // Provider setup predates the grant; browser/API traffic initializes the real
   // default policy and records access events before the user's provider save.
-  await seedAuditDatabase(den, "UPDATE organization SET metadata = JSON_SET(JSON_SET(COALESCE(metadata, JSON_OBJECT()), '$.capabilities', COALESCE(JSON_EXTRACT(metadata, '$.capabilities'), JSON_OBJECT())), '$.capabilities.auditLogs', CAST('true' AS JSON)) WHERE id = ?", [orgId]);
+  // Custom roles were removed; the audited access change is now a team's
+  // permission set, which needs the Permissions feature and a team. Both are
+  // arranged before audit capture starts, so the journey's own team creation
+  // stays the only team operation in the history.
+  const reviewersTeamName = "Audit reviewers";
+  const reviewers = await seed.api(den.admin, "/v1/teams", { method: "POST", body: JSON.stringify({ name: reviewersTeamName, memberIds: [] }) });
+  if (reviewers.response.status !== 201) throw new Error(`Synthetic team setup failed: ${reviewers.response.status}`);
+  const reviewersTeamId = identifier(record(record(reviewers.body).team).id);
+  await seedAuditDatabase(den, "INSERT INTO organization_feature (organization_id, feature_key, enabled, source) VALUES (?, 'permissions', TRUE, 'platform') ON DUPLICATE KEY UPDATE enabled = TRUE", [orgId]);
+  await seedAuditDatabase(den, "INSERT INTO organization_feature (organization_id, feature_key, enabled, source) VALUES (?, 'auditLogs', TRUE, 'platform') ON DUPLICATE KEY UPDATE enabled = TRUE", [orgId]);
   const viewport = { width: 1440, height: 1100 };
   const web = await seed.web({ den, signedInAs: den.admin, startPath: "/dashboard/audit-logs", headless: true, viewport });
   const memberWeb = await seed.web({ den, signedInAs: teammate, startPath: "/dashboard/audit-logs", headless: true, viewport });
   const unflaggedWeb = await seed.web({ den, signedInAs: unflaggedOwner, startPath: "/dashboard", headless: true, viewport });
-  return { den, web, memberWeb, unflaggedWeb, unflaggedOwner, unflaggedOrgId, teammate, orgId, providerId, originalCredential, replacementCredential, viewport };
+  // Audit writes never update usage totals; the scheduled refresh does
+  // (POST /internal/audit/usage/refresh, the den-audit-usage cron). Run it on demand.
+  async function refreshAuditUsage() {
+    const response = await fetch(`${den.ref.apiUrl.replace(/\/+$/, "")}/internal/audit/usage/refresh`, {
+      method: "POST", headers: { authorization: `Bearer ${MAINTENANCE_TOKEN}` }, signal: AbortSignal.timeout(60_000),
+    });
+    await response.body?.cancel();
+    if (!response.ok) throw new Error(`Audit usage refresh failed: ${response.status}`);
+  }
+  // Read-only rendered-label witness: probe.dom exposes option text/geometry but
+  // not line-clamp or text overflow. A DOM string alone also passes when every
+  // distinguishing suffix is ellipsized. Read real glyph ranges and computed CSS;
+  // never import product source, change styles or dispatch input from the world.
+  function eventOptionLayout() {
+    return evaluateOnSurface(web, () => Array.from(document.querySelectorAll('[role="listbox"] [role="option"]'), (option) => {
+      const label = option.querySelector("span:first-child");
+      if (!label) throw new Error("Event type option has no label");
+      const style = getComputedStyle(label);
+      const box = label.getBoundingClientRect();
+      const range = document.createRange();
+      range.selectNodeContents(label);
+      const fragments = Array.from(range.getClientRects());
+      const fullTextFits = fragments.length > 0
+        && label.scrollWidth <= label.clientWidth + 1 && label.scrollHeight <= label.clientHeight + 1
+        && fragments.every((fragment) => fragment.left >= box.left - 1 && fragment.right <= box.right + 1
+          && fragment.top >= box.top - 1 && fragment.bottom <= box.bottom + 1);
+      return {
+        text: label.textContent?.trim() ?? "",
+        fullTextFits,
+        lineClamp: style.webkitLineClamp,
+        whiteSpace: style.whiteSpace,
+        textOverflow: style.textOverflow,
+        width: box.width,
+        height: box.height,
+        lines: new Set(fragments.map((fragment) => Math.round(fragment.top))).size,
+      };
+    }));
+  }
+  // Read-only color witness: a request with no final result must use the same
+  // neutral ink as a successful event, not the failure color. DOM text alone
+  // cannot prove this presentation boundary.
+  function outcomeColors() {
+    return evaluateOnSurface(web, () => Array.from(document.querySelectorAll("[data-audit-outcome]"))
+      .filter((element) => element.checkVisibility())
+      .map((element) => ({ outcome: element.getAttribute("data-audit-outcome"), color: getComputedStyle(element).color })));
+  }
+  return { den, refreshAuditUsage, eventOptionLayout, outcomeColors, web, memberWeb, unflaggedWeb, unflaggedOwner, unflaggedOrgId, teammate, teammateUserId, platformAdmin, orgId, providerId, originalCredential, replacementCredential, reviewersTeamId, reviewersTeamName, viewport };
 }

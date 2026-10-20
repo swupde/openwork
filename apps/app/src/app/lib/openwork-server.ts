@@ -14,11 +14,11 @@ import {
   AGENT_CONTEXT_DIAGNOSTICS_REQUEST_TIMEOUT_MS,
   requestAgentContextDiagnosticsPayload,
 } from "./agent-context-diagnostics-transport";
-import { desktopFetch, desktopFetchViaMain, desktopFetchAgentContextDiagnostics, desktopUploadMultipart, electronLocalPathForFile } from "./desktop";
+import { desktopFetch, desktopFetchViaMain, desktopFetchAgentContextDiagnostics } from "./desktop";
 import { isOpenworkGatewayRuntime } from "./gateway-runtime";
 import { isDesktopRuntime } from "./runtime-env";
 import type { ExecResult, OpencodeConfigFile, WorkspaceInfo, WorkspaceList } from "./desktop";
-import type { DenOrgMarketplace, DenOrgPluginResolved, DenResourceSnapshot } from "./den-types";
+import type { DenResourceSnapshot } from "./den-types";
 import type { CloudImportedMarketplace, CloudImportedPlugin, CloudImportedProvider } from "../cloud/import-state";
 import { desktopFreeAccessStatusSchema } from "./inference-access";
 
@@ -87,6 +87,8 @@ export interface EngineV2MigrationStatus {
   /** ISO time the current migration started. */
   startedAt?: string;
   error?: string;
+  /** Where the v2 chat database was copied before this migration wrote to it. */
+  backupPath?: string;
 }
 
 function parseEngineV2Migration(value: unknown): EngineV2MigrationStatus | undefined {
@@ -101,6 +103,7 @@ function parseEngineV2Migration(value: unknown): EngineV2MigrationStatus | undef
   return { state: value.state, imported: value.imported, skipped: value.skipped, total: value.total,
     ...(phase ? { phase } : {}),
     ...("startedAt" in value && typeof value.startedAt === "string" ? { startedAt: value.startedAt } : {}),
+    ...("backupPath" in value && typeof value.backupPath === "string" ? { backupPath: value.backupPath } : {}),
     error: "error" in value && typeof value.error === "string" ? value.error : undefined };
 }
 
@@ -143,6 +146,8 @@ export interface EngineV2PreviewStatus {
   pid?: number;
   binSource?: string;
   migration?: EngineV2MigrationStatus;
+  /** Older servers omit it; treat that as unknown and do not prompt. */
+  v1HistoryAvailable?: boolean;
   mirroredProviderIds: string[];
   skippedProviderIds: string[];
   catalogModelIds: string[];
@@ -184,6 +189,8 @@ function parseEngineV2PreviewStatus(value: unknown): EngineV2PreviewStatus {
   }
   return {
     migration: parseEngineV2Migration("migration" in value ? value.migration : undefined),
+    ...("v1HistoryAvailable" in value && typeof value.v1HistoryAvailable === "boolean"
+      ? { v1HistoryAvailable: value.v1HistoryAvailable } : {}),
     enabled: value.enabled,
     running: value.running,
     chatRouting: "chatRouting" in value && typeof value.chatRouting === "boolean" ? value.chatRouting : false,
@@ -355,7 +362,6 @@ export type OpenworkServerSettings = {
   portOverride?: number;
   token?: string;
   hostToken?: string;
-  remoteAccessEnabled?: boolean;
 };
 
 // The shared WorkspaceWire contract now carries the opencode block; keep the
@@ -532,7 +538,7 @@ export type OpenworkDesktopCloudSyncResult = {
   state: OpenworkDesktopCloudSyncState;
 };
 
-export type OpenworkCloudPluginInstallResult = {
+export type OpenworkCloudPluginRemoveResult = {
   item: CloudImportedPlugin;
   warnings: string[];
 };
@@ -540,22 +546,6 @@ export type OpenworkCloudPluginInstallResult = {
 export type OpenworkCloudPluginsResult = {
   marketplaces: Record<string, CloudImportedMarketplace>;
   plugins: Record<string, CloudImportedPlugin>;
-};
-
-export type OpenworkClaudePluginComponent = {
-  type: "mcp" | "skill" | "command" | "agent";
-  name: string;
-  description: string | null;
-};
-
-export type OpenworkClaudePluginPreview = {
-  pluginId: string;
-  name: string;
-  description: string | null;
-  version: string | null;
-  source: { owner: string; repo: string; ref: string; dir: string | null };
-  components: OpenworkClaudePluginComponent[];
-  warnings: string[];
 };
 
 function arrayBufferToBase64(data: ArrayBuffer): string {
@@ -979,20 +969,6 @@ export type OpenworkWorkspaceExportWarning = {
   detail: string;
 };
 
-export type OpenworkArtifactItem = {
-  id: string;
-  name?: string;
-  path?: string;
-  size?: number;
-  createdAt?: number;
-  updatedAt?: number;
-  mime?: string;
-};
-
-export type OpenworkArtifactList = {
-  items: OpenworkArtifactItem[];
-};
-
 export type OpenworkConnectState = {
   ok: true;
   schemaVersion: 1;
@@ -1131,15 +1107,12 @@ export type OpenworkSessionGroupEvent = {
   timestamp: number;
 };
 
-// Fallback for explicit server-mode URL derivation. Desktop local workers replace this
-// with the persisted runtime-discovered port once the host reports it.
-export const DEFAULT_OPENWORK_SERVER_PORT = 8787;
-
 const STORAGE_URL_OVERRIDE = "openwork.server.urlOverride";
 const STORAGE_PORT_OVERRIDE = "openwork.server.port";
 const STORAGE_TOKEN = "openwork.server.token";
 const STORAGE_HOST_AUTH_KEY = "openwork.server.hostToken";
-const STORAGE_REMOTE_ACCESS = "openwork.server.remoteAccessEnabled";
+// Remote access was removed; writes clear the key older builds persisted.
+const LEGACY_STORAGE_REMOTE_ACCESS = "openwork.server.remoteAccessEnabled";
 
 type OpenworkBootstrap = {
   token?: string;
@@ -1227,53 +1200,12 @@ export function buildOpenworkWorkspaceBaseUrl(hostUrl: string, workspaceId?: str
   }
 }
 
-const OPENWORK_INVITE_PARAM_URL = "ow_url";
-const OPENWORK_INVITE_PARAM_TOKEN = "ow_token";
-const OPENWORK_INVITE_PARAM_STARTUP = "ow_startup";
-const OPENWORK_INVITE_PARAM_AUTO_CONNECT = "ow_auto_connect";
-
 export type OpenworkConnectInvite = {
   url: string;
   token?: string;
   startup?: "server";
   autoConnect?: boolean;
 };
-
-export function readOpenworkConnectInviteFromSearch(input: string | URLSearchParams) {
-  const search =
-    typeof input === "string"
-      ? new URLSearchParams(input.startsWith("?") ? input.slice(1) : input)
-      : input;
-
-  const rawUrl = search.get(OPENWORK_INVITE_PARAM_URL)?.trim() ?? "";
-  const url = normalizeOpenworkServerUrl(rawUrl);
-  if (!url) return null;
-
-  const token = search.get(OPENWORK_INVITE_PARAM_TOKEN)?.trim() ?? "";
-  const startupRaw = search.get(OPENWORK_INVITE_PARAM_STARTUP)?.trim() ?? "";
-  const startup = startupRaw === "server" ? "server" : undefined;
-  const autoConnect = search.get(OPENWORK_INVITE_PARAM_AUTO_CONNECT)?.trim() === "1";
-
-  return {
-    url,
-    token: token || undefined,
-    startup,
-    autoConnect: autoConnect || undefined,
-  } satisfies OpenworkConnectInvite;
-}
-
-export function stripOpenworkConnectInviteFromUrl(input: string) {
-  try {
-    const url = new URL(input);
-    url.searchParams.delete(OPENWORK_INVITE_PARAM_URL);
-    url.searchParams.delete(OPENWORK_INVITE_PARAM_TOKEN);
-    url.searchParams.delete(OPENWORK_INVITE_PARAM_STARTUP);
-    url.searchParams.delete(OPENWORK_INVITE_PARAM_AUTO_CONNECT);
-    return url.toString();
-  } catch {
-    return input;
-  }
-}
 
 export function readOpenworkServerSettings(): OpenworkServerSettings {
   if (typeof window === "undefined") return {};
@@ -1285,13 +1217,11 @@ export function readOpenworkServerSettings(): OpenworkServerSettings {
     const portOverride = portRaw ? Number(portRaw) : undefined;
     const token = window.localStorage.getItem(STORAGE_TOKEN) ?? undefined;
     const hostToken = window.localStorage.getItem(STORAGE_HOST_AUTH_KEY) ?? undefined;
-    const remoteAccessRaw = window.localStorage.getItem(STORAGE_REMOTE_ACCESS) ?? "";
     return {
       urlOverride: urlOverride ?? undefined,
       portOverride: Number.isNaN(portOverride) ? undefined : portOverride,
       token: token?.trim() || undefined,
       hostToken: hostToken?.trim() || undefined,
-      remoteAccessEnabled: remoteAccessRaw === "1",
     };
   } catch {
     return {};
@@ -1305,7 +1235,6 @@ export function writeOpenworkServerSettings(next: OpenworkServerSettings): Openw
     const portOverride = typeof next.portOverride === "number" ? next.portOverride : undefined;
     const token = next.token?.trim() || undefined;
     const hostToken = next.hostToken?.trim() || undefined;
-    const remoteAccessEnabled = next.remoteAccessEnabled === true;
 
     if (urlOverride) {
       window.localStorage.setItem(STORAGE_URL_OVERRIDE, urlOverride);
@@ -1331,11 +1260,7 @@ export function writeOpenworkServerSettings(next: OpenworkServerSettings): Openw
       window.localStorage.removeItem(STORAGE_HOST_AUTH_KEY);
     }
 
-    if (remoteAccessEnabled) {
-      window.localStorage.setItem(STORAGE_REMOTE_ACCESS, "1");
-    } else {
-      window.localStorage.removeItem(STORAGE_REMOTE_ACCESS);
-    }
+    window.localStorage.removeItem(LEGACY_STORAGE_REMOTE_ACCESS);
 
     return readOpenworkServerSettings();
   } catch {
@@ -1431,7 +1356,7 @@ export function clearOpenworkServerSettings() {
     window.localStorage.removeItem(STORAGE_PORT_OVERRIDE);
     window.localStorage.removeItem(STORAGE_TOKEN);
     window.localStorage.removeItem(STORAGE_HOST_AUTH_KEY);
-    window.localStorage.removeItem(STORAGE_REMOTE_ACCESS);
+    window.localStorage.removeItem(LEGACY_STORAGE_REMOTE_ACCESS);
   } catch {
     // ignore
   }
@@ -1489,15 +1414,6 @@ const OPENWORK_STREAM_URL_RE = /\/events(\b|\?)|\/event-stream\b|\/stream\b/;
 
 function isStreamUrl(url: string): boolean {
   return OPENWORK_STREAM_URL_RE.test(url);
-}
-
-function isLoopbackUrl(url: string): boolean {
-  try {
-    const hostname = new URL(url).hostname;
-    return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "[::1]";
-  } catch {
-    return false;
-  }
 }
 
 const resolveFetch = (url?: string) => {
@@ -1831,26 +1747,6 @@ export function createOpenworkServerClient(options: { baseUrl: string; token?: s
         body: payload,
         timeoutMs: timeouts.activateWorkspace,
       }),
-    createRemoteWorkspace: (payload: {
-      baseUrl: string;
-      openworkHostUrl?: string | null;
-      openworkToken?: string | null;
-      openworkWorkspaceId?: string | null;
-      openworkWorkspaceName?: string | null;
-      displayName?: string | null;
-      directory?: string | null;
-      remoteType?: "openwork" | "opencode";
-      sandboxBackend?: string | null;
-      sandboxRunId?: string | null;
-      sandboxContainerName?: string | null;
-    }) =>
-      requestJson<WorkspaceList>(baseUrl, "/workspaces/remote", {
-        token,
-        hostToken,
-        method: "POST",
-        body: payload,
-        timeoutMs: timeouts.activateWorkspace,
-      }),
     updateWorkspaceDisplayName: (workspaceId: string, displayName: string | null) =>
       requestJson<WorkspaceList>(baseUrl, `/workspaces/${encodeURIComponent(workspaceId)}/display-name`, {
         token,
@@ -2000,7 +1896,8 @@ export function createOpenworkServerClient(options: { baseUrl: string; token?: s
         `/workspace/${encodeURIComponent(workspaceId)}/runtime-config`,
         { token, hostToken, timeoutMs: timeouts.config },
       ),
-    patchConfig: (workspaceId: string, payload: { opencode?: Record<string, unknown>; openwork?: Record<string, unknown> }) =>
+    /** `mergeProviderModels`: provider IDs whose saved models are kept, with the patch's models added. */
+    patchConfig: (workspaceId: string, payload: { opencode?: Record<string, unknown>; openwork?: Record<string, unknown>; mergeProviderModels?: string[] }) =>
       requestJson<{ updatedAt?: number | null }>(baseUrl, `/workspace/${workspaceId}/config`, {
         token,
         hostToken,
@@ -2027,35 +1924,11 @@ export function createOpenworkServerClient(options: { baseUrl: string; token?: s
         hostToken,
         timeoutMs: timeouts.config,
       }),
-    installCloudPlugin: (workspaceId: string, payload: { marketplaceId: string | null; marketplace?: DenOrgMarketplace | null; resolved: DenOrgPluginResolved }) =>
-      requestJson<OpenworkCloudPluginInstallResult>(baseUrl, `/workspace/${encodeURIComponent(workspaceId)}/cloud-plugins`, {
-        token,
-        hostToken,
-        method: "POST",
-        body: payload,
-        timeoutMs: timeouts.config,
-      }),
     removeCloudPlugin: (workspaceId: string, pluginId: string) =>
-      requestJson<OpenworkCloudPluginInstallResult>(baseUrl, `/workspace/${encodeURIComponent(workspaceId)}/cloud-plugins/${encodeURIComponent(pluginId)}`, {
+      requestJson<OpenworkCloudPluginRemoveResult>(baseUrl, `/workspace/${encodeURIComponent(workspaceId)}/cloud-plugins/${encodeURIComponent(pluginId)}`, {
         token,
         hostToken,
         method: "DELETE",
-        timeoutMs: timeouts.config,
-      }),
-    previewClaudePlugin: (workspaceId: string, payload: { url: string; ref?: string }) =>
-      requestJson<{ preview: OpenworkClaudePluginPreview }>(baseUrl, `/workspace/${encodeURIComponent(workspaceId)}/claude-plugins`, {
-        token,
-        hostToken,
-        method: "POST",
-        body: { ...payload, dryRun: true },
-        timeoutMs: timeouts.config,
-      }),
-    installClaudePlugin: (workspaceId: string, payload: { url: string; ref?: string }) =>
-      requestJson<OpenworkCloudPluginInstallResult & { preview: OpenworkClaudePluginPreview }>(baseUrl, `/workspace/${encodeURIComponent(workspaceId)}/claude-plugins`, {
-        token,
-        hostToken,
-        method: "POST",
-        body: payload,
         timeoutMs: timeouts.config,
       }),
     readOpencodeConfigFile: (workspaceId: string, scope: "project" | "global" = "project") => {
@@ -2394,39 +2267,21 @@ export function createOpenworkServerClient(options: { baseUrl: string; token?: s
         hostToken,
         method: "DELETE",
       }),
-    uploadInboxPrefersOriginalFile: (file: File) =>
-      isDesktopRuntime() && !isLoopbackUrl(baseUrl) && electronLocalPathForFile(file) !== null,
     uploadInbox: async (workspaceId: string, file: File, options?: { path?: string }) => {
       const id = workspaceId.trim();
       if (!id) throw new Error("workspaceId is required");
       if (!file) throw new Error("file is required");
       const uploadPath = `/workspace/${encodeURIComponent(id)}/inbox`;
-      let result: { ok: boolean; status: number; text: string };
-      if (isDesktopRuntime() && !isLoopbackUrl(baseUrl) && electronLocalPathForFile(file) !== null) {
-        const response = await desktopUploadMultipart(file, {
-          url: `${baseUrl}${uploadPath}`,
-          method: "POST",
-          headers: buildAuthHeaders(token, hostToken),
-          fields: options?.path?.trim() ? { path: options.path.trim() } : undefined,
-          timeoutMs: timeouts.binary,
-        });
-        result = {
-          ok: response.status >= 200 && response.status < 300,
-          status: response.status,
-          text: response.body,
-        };
-      } else {
-        const form = new FormData();
-        form.append("file", file);
-        if (options?.path?.trim()) form.append("path", options.path.trim());
-        result = await requestMultipartRaw(baseUrl, uploadPath, {
-          token,
-          hostToken,
-          method: "POST",
-          body: form,
-          timeoutMs: timeouts.binary,
-        });
-      }
+      const form = new FormData();
+      form.append("file", file);
+      if (options?.path?.trim()) form.append("path", options.path.trim());
+      const result = await requestMultipartRaw(baseUrl, uploadPath, {
+        token,
+        hostToken,
+        method: "POST",
+        body: form,
+        timeoutMs: timeouts.binary,
+      });
 
       if (!result.ok) {
         let message = result.text.trim();
@@ -2598,18 +2453,13 @@ export function createOpenworkServerClient(options: { baseUrl: string; token?: s
         },
       ),
 
-    downloadWorkspaceFile: (workspaceId: string, path: string) =>
+    /** `sessionId` also finds files the conversation wrote after moving into a worktree. */
+    downloadWorkspaceFile: (workspaceId: string, path: string, options?: { sessionId?: string }) =>
       requestBinary(
         baseUrl,
-        `/workspace/${encodeURIComponent(workspaceId)}/files/raw?path=${encodeURIComponent(path)}`,
+        `/workspace/${encodeURIComponent(workspaceId)}/files/raw?path=${encodeURIComponent(path)}${options?.sessionId ? `&session=${encodeURIComponent(options.sessionId)}` : ""}`,
         { token, hostToken, timeoutMs: timeouts.binary },
       ),
-
-    listArtifacts: (workspaceId: string) =>
-      requestJson<OpenworkArtifactList>(baseUrl, `/workspace/${encodeURIComponent(workspaceId)}/artifacts`, {
-        token,
-        hostToken,
-      }),
 
     resolveArtifacts: (
       workspaceId: string,
@@ -2626,13 +2476,6 @@ export function createOpenworkServerClient(options: { baseUrl: string; token?: s
         baseUrl,
         `/workspace/${encodeURIComponent(workspaceId)}/artifacts/resolve`,
         { token, hostToken, method: "POST", body: { targets } },
-      ),
-
-    downloadArtifact: (workspaceId: string, artifactId: string) =>
-      requestBinary(
-        baseUrl,
-        `/workspace/${encodeURIComponent(workspaceId)}/artifacts/${encodeURIComponent(artifactId)}`,
-        { token, hostToken, timeoutMs: timeouts.binary },
       ),
 
     // User-level env vars (host-auth only — desktop shell is the sole caller).

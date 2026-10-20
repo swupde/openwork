@@ -17,7 +17,7 @@ on:
 
 jobs:
   triage-issue:
-    if: inputs.target == 'issue'
+    if: github.repository == 'different-ai/openwork' && (inputs.target == 'issue')
     runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       contents: read
@@ -53,7 +53,7 @@ jobs:
           opencode run --agent triage "$(cat /tmp/issue_prompt.txt)"
 
   duplicate-prs:
-    if: inputs.target == 'pull_request'
+    if: github.repository == 'different-ai/openwork' && (inputs.target == 'pull_request')
     runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       contents: read

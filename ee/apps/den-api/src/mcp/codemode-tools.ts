@@ -28,6 +28,7 @@ import {
   buildNativeCapabilityName,
   executeNativeCapability,
   nativeOperations,
+  enabledNativeCatalog,
 } from "./native-capabilities.js"
 
 export {
@@ -264,10 +265,11 @@ export async function buildNativeProviderToolTree(input: {
     member: memberIdentity,
   })
   const organizationId = normalizeDenTypeId("organization", input.organizationId)
+  const catalog = await enabledNativeCatalog(input.catalog, organizationId)
   const namespaceEntries = namespaceContext.codemodeNativeProviderEntries.flatMap((connection) => {
     const namespace = namespaceContext.namespaces.native.get(connection.id)
     if (!namespace) return []
-    const definitions = nativeOperations(input.catalog, connection.nativeProviderKey).map((operation) => [operation.name, Tool.make({
+    const definitions = nativeOperations(catalog, connection.nativeProviderKey).map((operation) => [operation.name, Tool.make({
       description: operation.operation.summary ?? operation.operation.description ?? operation.name,
       input: denInputJsonSchema(operation),
       output: operation.outputSchema,
@@ -294,7 +296,7 @@ export async function buildNativeProviderToolTree(input: {
     tools: Object.fromEntries(namespaceEntries),
     manifest: buildNativeProviderManifest({
       connections: namespaceContext.codemodeNativeProviderEntries,
-      catalog: input.catalog,
+      catalog,
       namespaces: namespaceContext.namespaces.native,
     }),
   }

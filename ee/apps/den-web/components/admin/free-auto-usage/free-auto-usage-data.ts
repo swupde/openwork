@@ -9,6 +9,8 @@ export type FreeAutoUsage = {
   requests: number;
   estimatedRequests: number;
   inputTokens: number;
+  /** The part of inputTokens served from OpenAI's prompt cache. */
+  cachedInputTokens: number;
   outputTokens: number;
 };
 
@@ -16,7 +18,6 @@ export type FreeAutoOrganizationUsage = FreeAutoUsage & {
   id: string;
   name: string;
   slug: string | null;
-  enrolled: boolean;
   subscribed: boolean;
   memberCount: number;
   activePeople: number;
@@ -27,7 +28,7 @@ export type FreeAutoOrganizationUsage = FreeAutoUsage & {
 export type FreeAutoUsageReport = {
   generatedAt: string;
   range: { days: number; from: string; to: string; timezone: "UTC" };
-  settings: { membersEnabled: boolean; rolloutAllOrganizations: boolean; weeklyLimitMicroUsd: number };
+  settings: { membersEnabled: boolean; weeklyLimitMicroUsd: number };
   totals: FreeAutoUsage & { activePeople: number; activeOrganizations: number };
   members: FreeAutoUsage & { activePeople: number };
   guests: FreeAutoUsage;
@@ -47,13 +48,13 @@ function isCount(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 function isUsage(value: unknown): value is FreeAutoUsage {
-  return isRecord(value) && ["costMicroUsd", "requests", "estimatedRequests", "inputTokens", "outputTokens"].every((key) => isCount(value[key]));
+  return isRecord(value) && ["costMicroUsd", "requests", "estimatedRequests", "inputTokens", "cachedInputTokens", "outputTokens"].every((key) => isCount(value[key]));
 }
 function isOrganization(value: unknown): value is FreeAutoOrganizationUsage {
   if (!isRecord(value) || !isUsage(value)) return false;
   const row: Record<string, unknown> = value;
   return typeof row.id === "string" && typeof row.name === "string"
-    && typeof row.enrolled === "boolean" && typeof row.subscribed === "boolean"
+    && typeof row.subscribed === "boolean"
     && ["memberCount", "activePeople", "peopleAtWeeklyLimit"].every((key) => isCount(row[key]))
     && (row.lastUsedAt === null || typeof row.lastUsedAt === "string");
 }
@@ -100,10 +101,9 @@ export function useFreeAutoUsage(days: FreeAutoRange) {
 
 export type OrganizationSort = "spend" | "requests" | "people" | "limit" | "recent";
 
-export function selectOrganizations(rows: readonly FreeAutoOrganizationUsage[], options: { search: string; sort: OrganizationSort; enrolledOnly: boolean }) {
+export function selectOrganizations(rows: readonly FreeAutoOrganizationUsage[], options: { search: string; sort: OrganizationSort }) {
   const needle = options.search.trim().toLowerCase();
-  const filtered = rows.filter((row) => (!options.enrolledOnly || row.enrolled)
-    && (!needle || row.name.toLowerCase().includes(needle) || row.id.toLowerCase().includes(needle) || (row.slug ?? "").toLowerCase().includes(needle)));
+  const filtered = rows.filter((row) => !needle || row.name.toLowerCase().includes(needle) || row.id.toLowerCase().includes(needle) || (row.slug ?? "").toLowerCase().includes(needle));
   const key: Record<OrganizationSort, (row: FreeAutoOrganizationUsage) => number> = {
     spend: (row) => row.costMicroUsd,
     requests: (row) => row.requests,
@@ -121,9 +121,9 @@ function csvCell(value: string | number | boolean | null) {
 
 /** One row per listed organization, amounts in USD, for spreadsheets. */
 export function organizationsCsv(report: FreeAutoUsageReport): string {
-  const header = ["organization_id", "name", "enrolled", "subscribed", "members", "active_people", "requests", "estimated_requests",
-    "input_tokens", "output_tokens", "spend_usd", "people_at_weekly_limit", "last_used_at"];
-  const rows = report.organizations.map((row) => [row.id, row.name, row.enrolled, row.subscribed, row.memberCount, row.activePeople, row.requests,
-    row.estimatedRequests, row.inputTokens, row.outputTokens, (row.costMicroUsd / 1_000_000).toFixed(6), row.peopleAtWeeklyLimit, row.lastUsedAt]);
+  const header = ["organization_id", "name", "subscribed", "members", "active_people", "requests", "estimated_requests",
+    "input_tokens", "cached_input_tokens", "output_tokens", "spend_usd", "people_at_weekly_limit", "last_used_at"];
+  const rows = report.organizations.map((row) => [row.id, row.name, row.subscribed, row.memberCount, row.activePeople, row.requests,
+    row.estimatedRequests, row.inputTokens, row.cachedInputTokens, row.outputTokens, (row.costMicroUsd / 1_000_000).toFixed(6), row.peopleAtWeeklyLimit, row.lastUsedAt]);
   return [header, ...rows].map((row) => row.map(csvCell).join(",")).join("\n") + "\n";
 }

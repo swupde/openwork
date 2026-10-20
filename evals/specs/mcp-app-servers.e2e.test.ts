@@ -1,6 +1,6 @@
 import { expect } from "vitest";
 import { spec, type SpecBodyContext } from "@openwork/testkit";
-import { appSource, appTitle, buildPrompt, buildReply, chatPrompt, chatReply, launchInput, mcpAppServers, mcpAppServersChat, mcpAppCreationV1, mcpAppCreationV2, mcpAppCreationDesktop, payload, pricerTitle, record, reopenPrompt, reopenReply, reservationId, rows, toolNames } from "../worlds/mcp-app-servers.ts";
+import { appSource, appTitle, buildPrompt, buildReply, chatPrompt, chatReply, launchInput, mcpAppServers, mcpAppServersChat, mcpAppServersChatOwnSignIn, mcpAppCreationV1, mcpAppCreationV2, mcpAppCreationDesktop, payload, pricerTitle, record, reopenPrompt, reopenReply, reservationId, rows, signInPrompt, signInReply, toolNames } from "../worlds/mcp-app-servers.ts";
 
 const test = spec.world(mcpAppServers, {
   resources: { surfaces: ["web"], services: ["den", "mock"] },
@@ -17,6 +17,15 @@ const orderLine = `${launchInput.quantity} × ${launchInput.sku}`;
 const pricedLine = `${orderLine} at 7`;
 const reservedLine = `Reserved ${reservationId}`;
 const reservation = { sku: launchInput.sku, quantity: launchInput.quantity };
+const emptyDashboardHeading = "Pin the artifacts you check every day";
+
+/** Compact dashboard tiles show their menu only while hovered (#5560), so point at the App inside the tile first. */
+async function openTileMenu({ user, probe }: Pick<SpecBodyContext<unknown>, "user" | "probe">, admin: Parameters<SpecBodyContext<unknown>["probe"]["api"]>[0], title: string) {
+  const apps = rows(record((await probe.api(admin, "/v1/mcp-apps")).body).apps);
+  const resourceUri = String(apps.find(app => app.title === title)?.resourceUri ?? "");
+  await user.hover({ mcpApp: { resourceUri }, role: "heading", label: title });
+  await user.click({ role: "button", label: `Artifact options for ${title}` });
+}
 
 test("an owner composes an App that is its own MCP server, and a teammate uses it from a standard host once its Plugin is shared", async ({ world, user, probe, step, evidence }) => {
   const appTile = (resourceUri: string) => ({
@@ -77,11 +86,11 @@ test("an owner composes an App that is its own MCP server, and a teammate uses i
   let ownerSince = "";
   let updatedResourceUri = "";
 
-  await step("before: an organization has no App builder until a platform admin turns it on in /admin", async () => {
-    expect(world.builderToolsBefore).toEqual([]);
-    const names = rows((await world.rpc("owner", "connect", "tools/list", {})).tools).map(tool => tool.name);
-    expect(names).toEqual(expect.arrayContaining(["create_app", "update_app", "read_app"]));
-    evidence.recordAssertionEvidence("Building your own Apps is off until /admin turns it on", "Before the organization's Apps built in OpenWork capability was on, Connect offered none of create_app, update_app, or read_app. After a platform admin turned it on through the route the /admin panel uses, Connect offers all three.", true);
+  await step("a new organization can build Apps without a platform admin turning anything on", async () => {
+    expect([...world.builderToolsByDefault].sort()).toEqual(["create_app", "read_app", "update_app"]);
+    const capabilities = record((await probe.api(world.den.admin, `/v1/admin/organizations/${world.organizationId}/capabilities`)).body).capabilities;
+    expect(record(capabilities)).not.toHaveProperty("appMcpServers");
+    evidence.recordAssertionEvidence("Building your own Apps is on by default", `Before any /admin change, Connect offered ${[...world.builderToolsByDefault].sort().join(", ")} to the new organization's owner, and /admin has no Apps built in OpenWork capability to turn on.`, world.builderToolsByDefault.length === 3);
   });
 
   await step("before: a teammate the App's Plugin is not shared with is refused by its MCP server", async () => {
@@ -167,28 +176,11 @@ test("an owner composes an App that is its own MCP server, and a teammate uses i
     evidence.recordAssertionEvidence("OpenWork can open the App, and its tools stay scoped to it", "The App host's Connect server index lists the App at its MCP URL without exposing it to the model directly, and executing its search match returns an openwork/mcpApp launch reference to open_app on that server. create_app refuses a tool that is not a real capability and an OpenWork action that changes data (postPluginsAccess), publishing nothing.", true);
   });
 
-  const adminUser = user.on(world.adminWeb);
-  await step("Den's dashboard Add app picker lists the App under Apps built in OpenWork", async () => {
-    await adminUser.see({ text: world.dashboardName }, { timeoutMs: 120_000 });
-    await adminUser.click("Add app");
-    await adminUser.see({ text: "Apps built in OpenWork" }, { timeoutMs: 60_000 });
-    await adminUser.see({ testId: "built-app-sharing-note" }, { text: "Members see an App only when its Plugin is shared with them." });
-    await adminUser.see({ text: appTitle });
-    await adminUser.screenshot();
-    evidence.recordAssertionEvidence("Apps built in OpenWork appear in dashboard assignment", `The owner's Add app picker offers "Apps built in OpenWork" first, lists ${appTitle}, and notes that members need the App's Plugin.`, true);
-  });
-
-  await step("adding it saves a dashboard tile that opens the App through its own server", async () => {
-    await adminUser.click("Add");
-    const saved = await probe.eventually(() => world.dashboardElements(), {
-      within: 60_000, intervalMs: 1_000, label: "the App's tile saved in Den", until: elements => elements.length === 1,
-    });
+  await step("the App's catalog entry saves a dashboard tile that opens the App through its own server", async () => {
+    await world.addAppTile();
     // The tile opens the App through its own server, which the desktop finds by App id.
-    expect(saved).toEqual([appTile(world.created.resourceUri)]);
-    await adminUser.click("Done");
-    await adminUser.see({ text: "App built in OpenWork" }, { timeoutMs: 15_000 });
-    await adminUser.screenshot();
-    evidence.recordAssertionEvidence("The App's dashboard tile opens the App itself", `Adding ${appTitle} saved one tile that opens the App's own server, which the desktop finds by App id: connectionId ${world.created.appId}, open_app, and the App's current revision. The dashboard lists it as "App built in OpenWork".`, true);
+    expect(await world.dashboardElements()).toEqual([appTile(world.created.resourceUri)]);
+    evidence.recordAssertionEvidence("The App's dashboard tile opens the App itself", `Den's App catalog lists ${appTitle}, and saving that entry as a tile stores one that opens the App's own server, which the desktop finds by App id: connectionId ${world.created.appId}, open_app, and the App's current revision.`, true);
   });
 
   await step("Workflow-bound views from before are read-only beside App servers", async () => {
@@ -296,15 +288,14 @@ chatTest("an owner follows App creation progress and opens the finished App besi
     await world.holdCreation(true);
     builtAt = new Date().toISOString();
     await agent.send(buildPrompt);
-    await user.see({ text: "Writing the app" });
-    expect(await probe.eventually(async () => (await probe.dom('[data-app-creation-step="needs"][data-step-status="complete"]')).elements, {
+    await user.see({ text: /Writing artifact “/ });
+    // The row reaches "writing" only once the preparation result is recorded.
+    expect(await probe.eventually(async () => (await probe.dom('[data-app-builder-step][data-app-creation-stage="writing"]')).elements, {
       within: 30_000, intervalMs: 200, label: "preparation completes while creation is held", until: elements => elements.length === 1,
     })).toHaveLength(1);
-    expect((await probe.dom('[data-app-creation-step="writing"][data-step-status="running"]')).elements).toHaveLength(1);
-    expect((await probe.dom('[data-app-creation-step="ready"][data-step-status="pending"]')).elements).toHaveLength(1);
     expect((await probe.dom("[data-built-app-preview]")).elements).toHaveLength(0);
     await user.screenshot();
-    evidence.recordAssertionEvidence("Creation progress follows the actual work", "The agent called prepare_app, which verified the four tools and returned a starter. While the agent was still writing, Found what it needs was complete, Writing the app was active, Ready to open was pending, and no preview opened.", true);
+    evidence.recordAssertionEvidence("Creation progress follows the actual work", "The agent called prepare_app, which verified the four tools and returned a starter. While the agent was still writing, the creation row read Writing artifact with preparation complete, and no preview opened.", true);
     await world.holdCreation(false);
   });
 
@@ -312,7 +303,7 @@ chatTest("an owner follows App creation progress and opens the finished App besi
     await user.see({ text: buildReply }, { timeoutMs: 120_000 });
     const calls = (await world.den.mocks.inventory.agentRequests({ promptMarker: buildPrompt })).filter(request => request.kind === "tool");
     expect(calls.map(call => call.toolName)).toEqual([expect.stringMatching(/prepare_app$/), expect.stringMatching(/create_app$/)]);
-    expect(await probe.eventually(async () => (await probe.dom('[data-app-creation-step="ready"][data-step-status="complete"]')).elements, {
+    expect(await probe.eventually(async () => (await probe.dom('[data-app-builder-step][data-app-creation-stage="ready"]')).elements, {
       within: 30_000, intervalMs: 200, label: "the checked App is ready to open", until: elements => elements.length === 1,
     })).toHaveLength(1);
     expect((await probe.dom('[data-app-builder-step] button[aria-expanded="false"]')).elements).toHaveLength(1);
@@ -437,15 +428,15 @@ chatTest("an owner follows App creation progress and opens the finished App besi
     await frame?.[Symbol.asyncDispose]();
     frame = undefined;
     await user.click({ role: "button", label: "Dashboard" });
-    await user.see({ role: "heading", label: "Your dashboard" });
+    await user.see({ role: "heading", label: emptyDashboardHeading });
     expect((await probe.dom('[data-dashboard-tile^="personal:"]')).elements).toHaveLength(0);
     await user.screenshot();
   });
 
   await step("after: the owner chooses an existing App and uses it on their dashboard", async () => {
-    await user.click({ role: "button", label: "Add" });
-    await user.see({ label: "Search apps" });
-    await user.type({ label: "Search apps" }, "qckordprcr", { replace: true });
+    await user.click({ role: "button", label: "Add an artifact" });
+    await user.see({ label: "Search artifacts" });
+    await user.type({ label: "Search artifacts" }, "qckordprcr", { replace: true });
     await user.screenshot();
     await user.click({ role: "option", label: `Add ${pricerTitle}` });
     expect((await probe.dom('[data-dashboard-tile^="personal:"]')).elements).toHaveLength(1);
@@ -457,25 +448,94 @@ chatTest("an owner follows App creation progress and opens the finished App besi
   });
 
   await step("removing a dashboard tile keeps the App available to add again", async () => {
-    await user.click({ role: "button", label: `App options for ${pricerTitle}` });
+    // Undo is covered by the creation journeys; here the App is added back from the picker.
+    await openTileMenu({ user, probe }, world.den.admin, pricerTitle);
     await user.click({ role: "menuitem", label: `Remove ${pricerTitle} from dashboard` });
     expect((await probe.dom('[data-dashboard-tile^="personal:"]')).elements).toHaveLength(0);
-    await user.click({ role: "button", label: "Undo" });
-    expect((await probe.dom('[data-dashboard-tile^="personal:"]')).elements).toHaveLength(1);
-    pricer = await focus(pricerTitle);
-    await pricer.see({ testId: "order-line" }, { text: pricedLine, timeoutMs: 90_000 });
-    await user.click({ role: "button", label: `App options for ${pricerTitle}` });
-    await user.click({ role: "menuitem", label: `Remove ${pricerTitle} from dashboard` });
-    expect((await probe.dom('[data-dashboard-tile^="personal:"]')).elements).toHaveLength(0);
-    await user.click({ role: "button", label: "Add" });
-    await user.type({ label: "Search apps" }, "qckordprcr", { replace: true });
+    await user.click({ role: "button", label: "Add an artifact" });
+    await user.type({ label: "Search artifacts" }, "qckordprcr", { replace: true });
     await user.see({ role: "option", label: `Add ${pricerTitle}` });
     await user.screenshot();
-    evidence.recordAssertionEvidence("Removing a tile changes only personal placement", "After removing Quick order pricer, its tile is gone but the App remains in the Add picker; neither the App nor its sharing grants were deleted.", true);
+    await user.click({ role: "option", label: `Add ${pricerTitle}` });
+    expect((await probe.dom('[data-dashboard-tile^="personal:"]')).elements).toHaveLength(1);
+    // A re-added tile shows its saved copy at once, then replaces that frame with the live App.
+    // Read the order line from the frame that stays, once the tile has finished loading.
+    expect(await probe.eventually(async () => (await probe.dom('[data-dashboard-tile^="personal:"][aria-busy="false"]')).elements, {
+      within: 90_000, intervalMs: 200, label: "the re-added tile has replaced its saved copy with the live App", until: elements => elements.length === 1,
+    })).toHaveLength(1);
+    pricer = await focus(pricerTitle);
+    await pricer.see({ testId: "order-line" }, { text: pricedLine, timeoutMs: 90_000 });
+    evidence.recordAssertionEvidence("Removing a tile changes only personal placement", "After removing Quick order pricer, its tile is gone but the App remains in the Add picker, and adding it again restores a working tile; neither the App nor its sharing grants were deleted.", true);
   });
 
 });
 
+
+const signInTest = spec.world(mcpAppServersChatOwnSignIn, {
+  resources: { surfaces: ["appWeb"], services: ["den", "mock"] },
+  needs: { commands: ["bun", "pnpm", "opencode"] }, timeout: 600_000,
+});
+
+signInTest("a person who has not signed in to the service an App uses is asked to sign in, and the App reloads once they do", async ({ world, agent, user, probe, step, evidence }) => {
+  let frame: Awaited<ReturnType<typeof world.appFrame>> | undefined;
+  await using _openFrame = { [Symbol.asyncDispose]: async () => { await frame?.[Symbol.asyncDispose](); } };
+  const focus = async () => {
+    await frame?.[Symbol.asyncDispose]();
+    frame = await world.appFrame(appTitle);
+    return user.on(frame);
+  };
+  // Inventory signs each person in with their own account.
+  const signInRow = { text: `Sign in to ${world.inventoryName} to use ${appTitle}` };
+
+  await step("signed in to Inventory, the owner opens the Order calculator and its price loads with no prompt", async () => {
+    expect(await world.inventorySignedIn()).toBe(true);
+    const openedAt = new Date().toISOString();
+    await agent.send(chatPrompt);
+    await user.see({ text: chatReply }, { timeoutMs: 120_000 });
+    const calculator = await focus();
+    await calculator.see({ testId: "order-line" }, { text: pricedLine, timeoutMs: 90_000 });
+    await user.notSee({ role: "button", label: "Sign in" });
+    expect((await world.inventoryCalls({ sinceIso: openedAt, atLeast: 1 })).map(call => call.args)).toEqual([{ sku: launchInput.sku }]);
+    await user.screenshot();
+    evidence.recordAssertionEvidence("A connected person sees no sign-in prompt", `Signed in to ${world.inventoryName}, the owner opened ${appTitle}: one Inventory lookup ran, the order line reads "${pricedLine}", and no Sign in button was shown.`, true);
+  });
+
+  await step("before: without an Inventory sign-in, the App's price lookup fails and the App asks the person to sign in", async () => {
+    await frame?.[Symbol.asyncDispose]();
+    frame = undefined;
+    await world.disconnectInventory();
+    expect(await world.inventorySignedIn()).toBe(false);
+    const openedAt = new Date().toISOString();
+    await agent.send(signInPrompt);
+    await user.see({ text: signInReply }, { timeoutMs: 120_000 });
+    await user.see(signInRow, { timeoutMs: 60_000 });
+    await user.see({ role: "button", label: "Sign in" });
+    const calculator = await focus();
+    await calculator.see({ role: "button", label: "Look up price" }, { timeoutMs: 90_000 });
+    await calculator.see({ testId: "order-line" }, { text: orderLine });
+    await user.notSee({ text: /needs_connection|connectionStatus/ });
+    expect(await world.inventoryCalls({ sinceIso: openedAt })).toEqual([]);
+    await user.screenshot();
+    evidence.recordAssertionEvidence("A missing sign-in is named above the App", `After the owner disconnected their own Inventory account, opening ${appTitle} showed "Sign in to ${world.inventoryName} to use ${appTitle}" with one Sign in button above the App. Its price lookup never reached Inventory (0 lookups), so the order line reads "${orderLine}" with no price.`, true);
+  });
+
+  await step("after: one click on Sign in completes Inventory's sign-in, and the App reloads with its price", async () => {
+    const signedInAt = new Date().toISOString();
+    await user.click({ role: "button", label: "Sign in" });
+    await probe.eventually(() => world.inventorySignedIn(), { within: 90_000, intervalMs: 1_000, label: "the owner's Inventory sign-in completes", until: signedIn => signedIn });
+    await world.returnToOpenWork();
+    await user.notSee(signInRow, { timeoutMs: 60_000 });
+    // The reload replaces the App's frame; read the new one, not the closed one the browser may still list.
+    await frame?.[Symbol.asyncDispose]();
+    frame = await world.appFrameShowing(appTitle, pricedLine);
+    const calculator = user.on(frame);
+    await calculator.see({ testId: "order-line" }, { text: pricedLine });
+    await calculator.notSee({ role: "button", label: "Look up price" });
+    expect((await world.inventoryCalls({ sinceIso: signedInAt, atLeast: 1 })).map(call => call.args)).toEqual([{ sku: launchInput.sku }]);
+    await user.screenshot();
+    evidence.recordAssertionEvidence("Signing in reloads the App", `One click on Sign in completed Inventory's OAuth sign-in (connectedForMe true). The sign-in row went away, ${appTitle} reloaded on its own, and its lookup reached Inventory once, so the order line reads "${pricedLine}".`, true);
+  });
+});
 
 const creationV1Test = spec.world(mcpAppCreationV1, { resources: { surfaces: ["appWeb"], services: ["den", "mock"] }, needs: { commands: ["bun", "pnpm", "opencode"] }, timeout: 600_000 });
 const creationV2Test = spec.world(mcpAppCreationV2, { resources: { surfaces: ["appWeb"], services: ["den", "mock"] }, needs: { commands: ["bun", "pnpm", "opencode"] }, timeout: 600_000 });
@@ -491,13 +551,20 @@ async function creationJourney({ world, agent, user, probe, step, evidence }: Sp
       frame = await world.appFrame(pricerTitle);
       await user.on(frame).see({ text: `Ready — ${text}` }, { timeoutMs: 90_000 });
     };
+    // An added or restored tile shows its saved copy at once, then replaces that frame with the live App.
+    // Read the revision from the frame that stays, once the tile has finished loading.
+    const tileRevision = async (text: string) => {
+      expect(await probe.eventually(async () => (await probe.dom('[data-dashboard-tile^="personal:"][aria-busy="false"]')).elements, {
+        within: 90_000, intervalMs: 200, label: "the tile has replaced its saved copy with the live App", until: elements => elements.length === 1,
+      })).toHaveLength(1);
+      await revision(text);
+    };
     await step("before: discovery and preparation have no App preview", async () => {
       await world.holdCreation(true);
       expect((await probe.dom("[data-built-app-preview]")).elements).toHaveLength(0);
       await agent.send(buildPrompt);
-      await user.see({ text: "Writing the app" }, { timeoutMs: 120_000 });
-      expect(await probe.eventually(async () => (await probe.dom('[data-app-creation-step="needs"][data-step-status="complete"]')).elements, { within: 30_000, intervalMs: 200, label: "the actual preparation completes before checking the held writing stage", until: elements => elements.length === 1 })).toHaveLength(1);
-      expect((await probe.dom('[data-app-creation-step="writing"][data-step-status="running"]')).elements).toHaveLength(1);
+      await user.see({ text: /Writing artifact “/ }, { timeoutMs: 120_000 });
+      expect(await probe.eventually(async () => (await probe.dom('[data-app-builder-step][data-app-creation-stage="writing"]')).elements, { within: 30_000, intervalMs: 200, label: "the actual preparation completes before checking the held writing stage", until: elements => elements.length === 1 })).toHaveLength(1);
       expect((await probe.dom("[data-built-app-preview]")).elements).toHaveLength(0);
       const calls = (await world.den.mocks.inventory.agentRequests({ promptMarker: buildPrompt })).filter(request => request.kind === "tool");
       expect(calls.length).toBeGreaterThanOrEqual(2);
@@ -542,11 +609,11 @@ async function creationJourney({ world, agent, user, probe, step, evidence }: Sp
       const prompt = "Create an App with the invalid source to check the failure.";
       await world.prepareLifecycleTurn(prompt, "failure");
       await agent.send(prompt);
-      await user.see({ text: "Needs a fix" }, { timeoutMs: 120_000 });
+      await user.see({ text: /Couldn’t create artifact “Broken App”/ }, { timeoutMs: 120_000 });
       await user.see({ text: "The App could not be created." }, { timeoutMs: 30_000 });
       expect(await probe.eventually(async () => (await probe.dom('button[aria-label="Stop"]')).elements, { within: 30_000, intervalMs: 200, label: "the failed creation turn finishes before the next workload", until: elements => elements.length === 0 })).toHaveLength(0);
       expect((await probe.dom('[data-built-app-preview]')).elements).toHaveLength(0);
-      evidence.recordAssertionEvidence("A real compilation failure never becomes readiness", `${name}: create_app rejects invalid source; the creation step says Needs a fix and opens no App.`, true);
+      evidence.recordAssertionEvidence("A real compilation failure never becomes readiness", `${name}: create_app rejects invalid source; the creation row says Couldn’t create artifact and opens no App.`, true);
       await user.screenshot();
     });
     await step("after: stopping creation pauses its step without opening an App", async () => {
@@ -554,10 +621,10 @@ async function creationJourney({ world, agent, user, probe, step, evidence }: Sp
       await world.prepareLifecycleTurn(prompt, "interrupt");
       await world.holdCreation(true);
       await agent.send(prompt);
-      expect(await probe.eventually(async () => (await probe.dom('[data-app-creation-step="writing"][data-step-status="running"]')).elements, { within: 60_000, intervalMs: 200, label: "the interrupted turn is actually writing before Stop", until: elements => elements.length === 1 && elements[0].rect.height > 0 })).toHaveLength(1);
+      expect(await probe.eventually(async () => (await probe.dom('[data-app-builder-step][data-app-creation-stage="writing"] .ow-text-shimmer')).elements, { within: 60_000, intervalMs: 200, label: "the interrupted turn is actually writing before Stop", until: elements => elements.length === 1 && elements[0].rect.height > 0 })).toHaveLength(1);
       await user.click({ role: "button", label: "Stop" });
       await user.see({ text: "Paused" }, { timeoutMs: 30_000 });
-      expect((await probe.dom('[data-app-builder-step] [data-step-status="running"]')).elements).toHaveLength(0);
+      expect((await probe.dom('[data-app-builder-step] .ow-text-shimmer')).elements).toHaveLength(0);
       expect((await probe.dom('[data-built-app-preview]')).elements).toHaveLength(0);
       evidence.recordAssertionEvidence("Interrupted creation stays paused without an App", `${name}: the owner stops the held creation through the composer; no running stage or preview remains.`, true);
       await user.screenshot();
@@ -565,22 +632,22 @@ async function creationJourney({ world, agent, user, probe, step, evidence }: Sp
     });
     await step("after: a personal tile can be refreshed, removed and restored without losing the App", async () => {
       await user.click({ role: "button", label: "Dashboard" });
-      await user.see({ role: "heading", label: "Your dashboard" });
-      await user.click({ role: "button", label: "Add an app" });
-      await user.type({ label: "Search apps" }, pricerTitle, { replace: true });
+      await user.see({ role: "heading", label: emptyDashboardHeading });
+      await user.click({ role: "button", label: "Add an artifact" });
+      await user.type({ label: "Search artifacts" }, pricerTitle, { replace: true });
       await user.click({ role: "option", label: new RegExp(pricerTitle) });
-      await revision("revision two");
+      await tileRevision("revision two");
       await closeFrame();
-      await user.click({ role: "button", label: `App options for ${pricerTitle}` });
+      await openTileMenu({ user, probe }, world.den.admin, pricerTitle);
       await user.click({ role: "menuitem", label: `Refresh ${pricerTitle}` });
-      await revision("revision two");
+      await tileRevision("revision two");
       await closeFrame();
-      await user.click({ role: "button", label: `App options for ${pricerTitle}` });
+      await openTileMenu({ user, probe }, world.den.admin, pricerTitle);
       await user.click({ role: "menuitem", label: `Remove ${pricerTitle} from dashboard` });
       expect((await probe.dom('[data-dashboard-tile^="personal:"]')).elements).toHaveLength(0);
       await user.click({ role: "button", label: "Undo" });
       expect((await probe.dom('[data-dashboard-tile^="personal:"]')).elements).toHaveLength(1);
-      await revision("revision two");
+      await tileRevision("revision two");
       evidence.recordAssertionEvidence("Personal placement survives refresh, removal and Undo", `${name}: the real App shows revision two in its personal tile, refreshes through the tile menu, and remains usable after remove and Undo.`, true);
       await user.screenshot();
     });

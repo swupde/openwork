@@ -119,6 +119,7 @@ concurrency:
 
 jobs:
   aur-validate:
+    if: github.repository == 'different-ai/openwork'
     name: Validate AUR package (${{ inputs.arch }}, ${{ inputs.mode }})
     runs-on: ubuntu-22.04
     container:

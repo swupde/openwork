@@ -721,7 +721,7 @@ describe("Cloud provider materialization", () => {
       force: true,
     })
 
-    expect(result).toEqual({ ok: true, status: "noop", fingerprint, providers: 1 })
+    expect(result).toEqual({ ok: true, status: "noop", fingerprint, providers: 1, missingMemberCredentials: [] })
     expect(callMethods(instance.calls)).toEqual([
       "GET /opencode/config",
       `GET /env/${ANTHROPIC_API_KEY_ENV}`,

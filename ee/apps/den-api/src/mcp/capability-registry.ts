@@ -1,12 +1,15 @@
 import { Tool, toolError } from "@openwork/codemode"
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
 import type { DenTypeId } from "@openwork-ee/utils/typeid"
+import type { CapabilityUsageVia } from "@openwork-ee/den-db/schema"
 import { Effect } from "effect"
 import type { Hono } from "hono"
 import { z } from "zod"
-import { memberFacingMcpConnectionsEnabled } from "../capability-sources/external-mcp-rollout.js"
+import type { FeatureMap } from "../features.js"
+import { AuditUnavailableError, auditUnavailableToolResult, runMcpServiceAction, serviceAuditResourceId, serviceErrorStatus, toolResultStatus, type McpAuditPrincipal } from "../audit/mcp-service-audit.js"
+import type { AuditServiceActionName } from "../audit/service-actions.js"
 import { isPlatformAdminUserId } from "../middleware/admin.js"
-import type { McpPrincipal } from "./auth.js"
+import { mcpPrincipalCredentialId, type McpPrincipal } from "./auth.js"
 import type { McpToolOperation } from "./catalog.js"
 import {
   executeAdminCapability,
@@ -55,6 +58,7 @@ import {
   searchMarketplaceCapabilities,
   type MarketplaceCapabilityExecuteResult,
   type MarketplaceCapabilityObjectType,
+  type MarketplaceWorkflowAudit,
 } from "./marketplace-capabilities.js"
 import {
   connectionStatusMatch,
@@ -81,6 +85,7 @@ import {
   type SearchCapabilityType,
 } from "./search.js"
 import { externalToolContent } from "./tool-content.js"
+import { withRemoteSessionReceiptUri } from "./remote-session-resources.js"
 
 export const CAPABILITY_SOURCE_KINDS = ["catalog", "native", "externalMcp", "marketplace", "builtinSkill", "remoteSession", "admin"] as const
 export type CapabilitySourceKind = (typeof CAPABILITY_SOURCE_KINDS)[number]
@@ -124,8 +129,11 @@ export type CapabilityRegistryContext = {
   generatedArtifactViewsEnabled: boolean
   externalMcpConnectionsEnabled: boolean
   remoteSessionsEnabled: boolean
+  remoteSessionEventsEnabled: boolean
   resolvePlatformAdmin: () => Promise<boolean>
   resolveNamespaceContext: () => Promise<CodemodeConnectionNamespaceContext>
+  /** Set only by MCP transports: direct service mutations are audited for this caller (src/audit/service-actions.ts). */
+  audit: McpAuditPrincipal | null
 }
 
 export type CapabilityRegistryContextInput = {
@@ -137,14 +145,14 @@ export type CapabilityRegistryContextInput = {
   member: McpMemberIdentity | null
   redirectUriBase: string
   generatedArtifactViewsEnabled: boolean
-  organizationMetadata: Parameters<typeof memberFacingMcpConnectionsEnabled>[0]
-  mcpConnectionsGatingEnabled: boolean
+  /** Effective features of the organization (see features.ts). */
+  organizationFeatures: Pick<FeatureMap, "mcpConnections"> & Partial<Pick<FeatureMap, "remoteSessionTargets" | "remoteSessionEvents">>
+  /** MCP transports pass the verified caller; route and Automation contexts omit it (their route records the request). */
+  audit?: McpAuditPrincipal | null
 }
 
 export function createCapabilityRegistryContext(input: CapabilityRegistryContextInput): CapabilityRegistryContext {
-  const externalMcpConnectionsEnabled = memberFacingMcpConnectionsEnabled(input.organizationMetadata, {
-    gatingEnabled: input.mcpConnectionsGatingEnabled,
-  })
+  const externalMcpConnectionsEnabled = input.organizationFeatures.mcpConnections
   let platformAdmin: Promise<boolean> | undefined
   const resolvePlatformAdmin = () => {
     platformAdmin ??= isPlatformAdminUserId(input.principal.userId)
@@ -169,19 +177,46 @@ export function createCapabilityRegistryContext(input: CapabilityRegistryContext
     redirectUriBase: input.redirectUriBase,
     generatedArtifactViewsEnabled: input.generatedArtifactViewsEnabled,
     externalMcpConnectionsEnabled,
-    remoteSessionsEnabled: remoteSessionCapabilitiesEnabled(input.organizationMetadata),
+    remoteSessionsEnabled: remoteSessionCapabilitiesEnabled(input.organizationFeatures.remoteSessionTargets === true),
+    remoteSessionEventsEnabled: input.organizationFeatures.remoteSessionEvents === true,
     resolvePlatformAdmin,
     resolveNamespaceContext,
+    audit: input.audit ?? null,
   }
+}
+
+/** HTTP-equivalent status of a failed Workflow execution, or null on success. */
+export function workflowExecutionAuditStatus(result: { ok: true } | { ok: false; error: string }): number | null {
+  if (result.ok) return null
+  if (result.error === "invalid_arguments" || result.error === "invalid_result") return 400
+  // No provider call was attempted, so no external effect happened.
+  if (result.error === "capability_unavailable" || result.error === "unsupported") return 424
+  return 502
+}
+
+/** Service-layer audit of saved Workflow runs for MCP callers; undefined for route/Automation contexts. */
+export function workflowExecutionAudit(ctx: Pick<CapabilityRegistryContext, "audit">): MarketplaceWorkflowAudit | undefined {
+  const principal = ctx.audit
+  if (!principal) return undefined
+  return (configObjectId, run) => runMcpServiceAction("workflow.execute", principal, serviceAuditResourceId(configObjectId), run, {
+    result: workflowExecutionAuditStatus, error: serviceErrorStatus,
+  })
+}
+
+const remoteSessionAuditActions: Partial<Record<RemoteSessionAction, AuditServiceActionName>> = {
+  create: "remote_session.create", send: "remote_session.send", stop: "remote_session.stop",
+}
+
+function remoteSessionResourceId(body: unknown): string | null {
+  const normalized = normalizeToolBody(body)
+  if (typeof normalized !== "object" || normalized === null || Array.isArray(normalized) || !("sessionId" in normalized)) return null
+  return serviceAuditResourceId(normalized.sessionId)
 }
 
 export function catalogOperationAvailableToCapabilities(
   context: Pick<CapabilityRegistryContext, "generatedArtifactViewsEnabled">,
   operation: Pick<McpToolOperation, "method" | "path">,
 ) {
-  // Standalone URL-App operations are deferred and never enter the generic
-  // capability gateway, even if their retained storage routes are reworked.
-  if (operation.path.startsWith("/v1/remote-mcp-apps")) return false
   if (context.generatedArtifactViewsEnabled) return true
   return operation.path !== "/v1/workflows/{configObjectId}/views"
     && !operation.path.startsWith("/v1/artifact-views/")
@@ -414,6 +449,7 @@ async function executeMarketplaceSource(
   ctx: CapabilityRegistryContext,
   parsed: Extract<ParsedCapability, { kind: "marketplace" }>,
   input: CapabilityExecuteInput,
+  usageVia: CapabilityUsageVia,
 ): Promise<MarketplaceCapabilityExecuteResult> {
   return executeMarketplaceCapability({
     buildTools: () => buildCapabilityToolTree(ctx),
@@ -425,6 +461,8 @@ async function executeMarketplaceSource(
     validateScriptOutput: true,
     enabled: ctx.externalMcpConnectionsEnabled,
     redirectUriBase: ctx.redirectUriBase,
+    auditWorkflowExecution: workflowExecutionAudit(ctx),
+    usageVia,
   })
 }
 
@@ -638,7 +676,7 @@ const marketplaceSource: CapabilitySource = {
         readOnly: true,
         authority: "den",
         run: async (args) => {
-          const result = await executeMarketplaceSource(ctx, parsed, { name: capabilityName, body: args })
+          const result = await executeMarketplaceSource(ctx, parsed, { name: capabilityName, body: args }, "codemode")
           if (!result.ok) throw toolError(result.message)
           const content = result.result.content ?? result.result.source ?? result.result.definition
           return typeof content === "string" ? content : JSON.stringify(result.result)
@@ -648,7 +686,7 @@ const marketplaceSource: CapabilitySource = {
   },
   execute: async (ctx, parsed, input) => {
     if (!parsedForKind(parsed, "marketplace")) return unknownCapabilityResult(input.name)
-    const result = await executeMarketplaceSource(ctx, parsed, input)
+    const result = await executeMarketplaceSource(ctx, parsed, input, "execute_capability")
     if (!result.ok) {
       return result.error === "unknown_capability"
         ? unknownCapabilityResult(input.name)
@@ -704,7 +742,9 @@ const remoteSessionSource: CapabilitySource = {
   enumerate: () => Promise.resolve([]),
   execute: async (ctx, parsed, input) => {
     if (!parsedForKind(parsed, "remoteSession")) return unknownCapabilityResult(input.name)
-    if (!ctx.remoteSessionsEnabled) {
+    // A rollout revert stops admitting new work, never access to an existing
+    // receipt or the ability to stop an already admitted native session.
+    if (!ctx.remoteSessionsEnabled && parsed.action !== "read" && parsed.action !== "list" && parsed.action !== "stop") {
       return {
         isError: true,
         content: textContent(JSON.stringify({
@@ -722,14 +762,22 @@ const remoteSessionSource: CapabilitySource = {
         })),
       }
     }
-    return executeRemoteSessionCapability({
+    const run = async () => withRemoteSessionReceiptUri(await executeRemoteSessionCapability({
       action: parsed.action,
       organizationId: ctx.organizationId,
       userId: ctx.principal.userId,
       hasWriteScope: ctx.principal.scopes.has(DEN_MCP_WRITE_SCOPE),
       body: input.body,
       headlessRunTokenId: headlessRunTokenId(ctx.principal.payload),
-    })
+    }), ctx.remoteSessionEventsEnabled)
+    const auditAction = remoteSessionAuditActions[parsed.action]
+    if (!auditAction || !ctx.audit) return run()
+    try {
+      return await runMcpServiceAction(auditAction, ctx.audit, remoteSessionResourceId(input.body), run, { result: toolResultStatus })
+    } catch (error) {
+      if (error instanceof AuditUnavailableError) return auditUnavailableToolResult()
+      throw error
+    }
   },
 }
 
@@ -770,7 +818,8 @@ const adminSource: CapabilitySource = {
     if (!parsedForKind(parsed, "admin") || !(await ctx.resolvePlatformAdmin())) {
       return unknownCapabilityResult(input.name)
     }
-    return (await executeAdminCapability(parsed.name, input.body)) ?? unknownCapabilityResult(input.name)
+    const admin = { userId: ctx.principal.userId, credentialId: mcpPrincipalCredentialId(ctx.principal) }
+    return (await executeAdminCapability(parsed.name, input.body, admin)) ?? unknownCapabilityResult(input.name)
   },
 }
 

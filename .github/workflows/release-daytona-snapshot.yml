@@ -39,6 +39,7 @@ concurrency:
 
 jobs:
   publish-daytona-snapshot:
+    if: github.repository == 'different-ai/openwork'
     name: Build and Push Daytona Snapshot
     runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:

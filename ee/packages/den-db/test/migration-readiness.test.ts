@@ -504,7 +504,7 @@ describe("Den DB migration readiness wiring", () => {
     const { scripts } = JSON.parse(readRepoFile("ee/packages/den-db/package.json"))
     const node = "node --conditions=development --import tsx"
     for (const command of ["generate", "migrate", "push"]) {
-      const repair = command === "generate" ? "" : ` && ${node} scripts/ensure-schema-repairs.ts`
+      const repair = command === "generate" ? "" : ` && ${node} scripts/ensure-schema-repairs.ts && ${node} scripts/reconcile-permissions.ts`
       assert.equal(scripts[`db:${command}`], `${node} ./node_modules/drizzle-kit/bin.cjs ${command} --config drizzle.config.ts${repair}`)
     }
 
