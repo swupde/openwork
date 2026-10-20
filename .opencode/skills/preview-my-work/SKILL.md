@@ -92,8 +92,17 @@ them, from the repo root; never print a value.
 - `preview-app-web`: configurable source web app plus the isolated server it
   needs, locally or on an owned private Daytona sandbox. This is not Den's web
   UI and not the Cloud-off `seed.appWeb` test fixture. No Den or activation is seeded.
-- Freestyle supports `preview-app-web`, `acme-web`, and `preview-desktop`
-  (signed-out `fresh` only); `preview-den` and `preview-full` do not run there.
+- `preview-workbot`: **Workbot with what it runs on**: the seeded Acme Den
+  (sign in as alex@acme.test), the headless runner and the Workbot app, with
+  Workbot and headless Automations turned on. The model is the deterministic
+  Acme upstream and the runner's computer is off, so no paid or Freestyle key
+  enters the world. Local, Daytona (Den sandbox plus one private sandbox for
+  the runner and Workbot) and Freestyle (`--source ref:dev`); every placement
+  signs in through Den and gets a runner answer before reporting ready. On
+  Freestyle, open the `workbotUrl` link: it authorizes Den and Workbot together.
+- Freestyle supports `preview-app-web`, `acme-web`, `preview-workbot`, and
+  `preview-desktop` (signed-out `fresh` only); `preview-den` and `preview-full`
+  do not run there.
 
 To turn on an app setting such as the v2 engine, export it and select it with
 `--env` **before** `--`; desktop previews on local and Daytona pass selected keys
@@ -105,10 +114,19 @@ OPENWORK_ENGINE_V2_PREVIEW=1 pnpm world up preview-desktop --place daytona --sta
 ```
 
 For the isolated `preview-den`/`preview-full` presets, choose `--scenario fresh`
-for signup/first use, `team` for an owner with Notion
-and Linear available (individual accounts remain unconnected), `restricted`
-for that team with the API's canonical restricted policy values, or `workspace`
-for a signed-in desktop workspace without pre-added tools. Fresh desktop is a
+for signup/first use, `team` for an owner with the demo apps and real
+connectors, `restricted` for that team with the API's canonical restricted
+policy values, or `workspace` for that team signed in on the desktop. Every
+seeded org (not `fresh`) gets demo Slack, Notion, Linear, Google Calendar and
+Gmail connections: realistic Acme Robotics data where the person is Alex Chen,
+readable and writable in memory (`worlds/lib/demo-workspace.ts`), so a demo can
+post, create and read back. Restarting the world restores the seed; locally,
+`demoState` shows the live data. `acme-web` (local, Daytona and Freestyle)
+gets the same demo apps, so a Freestyle demo uses `acme-web`. Seeded desktops
+and web runtimes treat their world's Den as activated, so the demo apps appear
+as their own apps on every placement. Real `Notion (live)` and `Linear (live)`
+OAuth connectors sit next to them (unconnected), and more real connectors can
+be added from Den as usual. Fresh desktop is a
 true first launch: the harness adds no workspace and does not sign into Den.
 Because the preview's own Den is configured through a bootstrap file, the app
 behaves like a bootstrapped install and skips the public-download "OpenWork

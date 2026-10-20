@@ -16,6 +16,7 @@ permissions:
 
 jobs:
   audit:
+    if: github.repository == 'different-ai/openwork'
     runs-on: ubuntu-latest
     env:
       TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}

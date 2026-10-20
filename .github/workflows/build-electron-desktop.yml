@@ -19,6 +19,7 @@ permissions:
 
 jobs:
   build-electron:
+    if: github.repository == 'different-ai/openwork'
     strategy:
       fail-fast: false
       matrix:
@@ -72,6 +73,7 @@ jobs:
           path: apps/desktop/dist-electron/**
 
   electron-macos-notarization-smoke:
+    if: github.repository == 'different-ai/openwork'
     name: Electron macOS notarization smoke
     runs-on: macos-14
 

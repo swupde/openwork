@@ -197,3 +197,41 @@ negative tests, not as a side effect of a future version import.
 Cached managed restrictions survive sign-out and restart until a fresh verified
 identity establishes the applicable policy; credentials and identity still clear
 on sign-out. Unmanaged local profiles remain unaffected.
+
+
+## v0.18.58 reconciliation (2026-10-20)
+
+The reviewed upstream release is `v0.18.58` at
+`258218b9b69c91e3d5020488fe1d14ff767679e9`. The existing 122-migration
+prefix retains its deployed SQL hashes, tags, and timestamps. Upstream
+migrations `0122`–`0141` become fork migrations `0123`–`0142`; their SQL
+bytes and timestamps are unchanged. Snapshot links retain the pending OAuth
+nullable, no-default `connected_account.connected_at` contract. The migration
+history regression now pins all 122 deployed receipts.
+
+The upstream analytics-retirement migration is now a no-op, so this upgrade
+preserves existing analytics data; its later restoration uses `CREATE TABLE
+IF NOT EXISTS`. The upstream role migration intentionally normalizes legacy
+super-admin/custom roles to the built-in roles. The new native permission and
+feature tables are retained without a custom-role compatibility layer.
+
+Unattended/live Workflow execution remains restricted to first-party read-only
+capabilities, and desktop policy enforcement remains enabled. New connection
+readiness fields coexist with the pending OAuth timestamp contract. Native
+Google compatibility routes retain connector policy and scope checks and now
+carry declarations in the upstream audit coverage registry.
+
+The upstream Node unit suites coexist with the retained Bun deployment
+regressions. Their package commands select the appropriate runner explicitly.
+Shared API-key configuration constants have a dependency-free module so the
+new audited service graph cannot initialize authentication through a circular
+service import.
+
+The six retained workflows continue to use GitHub-hosted runners. Optional
+inherited workflow jobs are restricted to the upstream repository before
+registration, and native workflow enablement must still be checked after
+merge. Container PR triggers cover all workspace packages and patches;
+selection retains the four existing deployment images. New headless/Workbot
+images and upstream cloud deployment automation are not adopted. Source
+integration and CI evidence do not establish production deployment or a
+published desktop update.

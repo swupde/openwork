@@ -1,7 +1,7 @@
 "use client";
 
 import { useQueryClient } from "@tanstack/react-query";
-import { Plus } from "lucide-react";
+import { LogIn, Plus } from "lucide-react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useRef, useState } from "react";
 import { DenButton } from "../../_components/ui/button";
@@ -18,9 +18,9 @@ import {
 import { useOrgDashboard } from "../_providers/org-dashboard-provider";
 import { ownedAccessStatus } from "./access-summary";
 import { draftFromPluginGrants } from "./item-sharing";
-import { FilterInput, ItemMenu, removeEntry, ItemPanel, ItemRow, ItemSection, ItemSectionSkeleton } from "./item-list";
+import { FilterInput, ItemFlatList, ItemMenu, ItemPanel, ItemRow, LibraryListRow, removeEntry, ItemSection, ItemSectionSkeleton } from "./item-list";
 import { ItemPage } from "./item-header";
-import { ConnectorLogo, LetterTile } from "./item-logo";
+import { ConnectorLogo, LetterTile, PluginLogo } from "./item-logo";
 import { LibraryAddDialog, type LibraryAddChoice, ConnectorLogoStrip } from "./library-add-dialog";
 import { type LibraryItem, libraryQueryKeys, useLibrary } from "./library-data";
 import {
@@ -29,6 +29,8 @@ import {
   LIBRARY_FILTERS,
   type LibraryFilter,
   libraryItemDescription,
+  libraryItemReady,
+  libraryKindLabel,
   NEEDS_SIGN_IN_STATUS,
   needsViewerSignIn,
   parseLibraryFilter,
@@ -41,10 +43,12 @@ import { useMemberSignIn } from "./connector-setup";
 import { matchesModelQuery } from "./library-models";
 import { useLibraryModels, useModelSignIn } from "./library-models-data";
 import { LibraryModelRow } from "./library-models-ui";
+import { MemberApiKeyDialog } from "./member-api-key-dialog";
 import { usePluginAccess } from "./plugin-access-data";
 import { useDenToast } from "./den-toast";
 import { requestJson, getRequestError } from "../../_lib/den-flow";
 import { pluginQueryKeys, usePluginSummaries } from "./plugin-data";
+import { useLibraryIntegrated } from "./use-library-integrated";
 
 function itemHref(orgSlug: string | null, item: LibraryItem): string {
   if (item.type === "connection") return getLibraryConnectorRoute(orgSlug, item.id);
@@ -53,8 +57,9 @@ function itemHref(orgSlug: string | null, item: LibraryItem): string {
 }
 
 function ItemLogo({ item }: { item: LibraryItem }) {
+  const integrated = useLibraryIntegrated();
   if (item.type === "connection") return <ConnectorLogo name={item.name} url={item.url} />;
-  return <LetterTile name={item.name} />;
+  return integrated ? <PluginLogo name={item.name} /> : <LetterTile name={item.name} />;
 }
 
 function OwnedConnectionStatus({ connection }: { connection: ExternalMcpConnection | undefined }) {
@@ -82,6 +87,7 @@ function LibraryItemRow({ item, mine, ownedConnection, signIn }: {
   const queryClient = useQueryClient();
   const toast = useDenToast();
   const { orgSlug } = useOrgDashboard();
+  const integrated = useLibraryIntegrated();
   const deleteConnection = useDeleteMcpConnection();
   const href = itemHref(orgSlug, item);
 
@@ -103,11 +109,14 @@ function LibraryItemRow({ item, mine, ownedConnection, signIn }: {
     : receivedStatus(item.edges);
 
   const needsSignIn = item.type === "connection" && item.state === "needs_signin";
+  const apiKeyStatus = item.type === "connection" ? signIn.apiKeyStatus(item.id) : null;
   const action = needsSignIn && item.type === "connection" ? (
     item.transport === "native" ? (
-      <DenButton variant="secondary" size="xs" href={`${getYourConnectionsRoute(orgSlug)}?connectionId=${encodeURIComponent(item.id)}`}>Sign in</DenButton>
+      <DenButton variant="secondary" size="xs" icon={integrated ? LogIn : undefined} aria-label="Sign in" className={integrated ? "size-7 p-0" : undefined} href={`${getYourConnectionsRoute(orgSlug)}?connectionId=${encodeURIComponent(item.id)}`}>{integrated ? null : "Sign in"}</DenButton>
     ) : (
-      <DenButton variant="secondary" size="xs" loading={signIn.pendingId === item.id} onClick={() => void signIn.signIn(item)}>Sign in</DenButton>
+      <DenButton variant="secondary" size="xs" icon={integrated ? LogIn : undefined} aria-label={apiKeyStatus === "reconnect_required" ? "Replace key" : apiKeyStatus === "missing" ? "Add key" : "Sign in"} className={integrated ? "size-7 p-0" : undefined} loading={signIn.pendingId === item.id} onClick={() => void signIn.signIn(item)}>
+        {integrated ? null : apiKeyStatus === "reconnect_required" ? "Replace key" : apiKeyStatus === "missing" ? "Add key" : "Sign in"}
+      </DenButton>
     )
   ) : (
     <ItemMenu
@@ -122,20 +131,32 @@ function LibraryItemRow({ item, mine, ownedConnection, signIn }: {
   );
 
   return (
-    <div data-library-item={item.name} data-library-kind={item.type}>
-      <ItemRow
+    <div data-library-item={item.name} data-library-kind={item.type} title={libraryItemDescription(item)}>
+      {integrated ? <ItemRow compact href={href} logo={<ItemLogo item={item} />} title={item.name} description={libraryItemDescription(item)} status={libraryItemReady(item) ? "Ready" : item.type !== "plugin" && item.state === "needs_signin" ? "Sign in" : "Set up"} action={action} /> : <LibraryListRow
         href={href}
         logo={<ItemLogo item={item} />}
         title={item.name}
-        description={libraryItemDescription(item)}
+        ready={libraryItemReady(item)}
+        kind={libraryKindLabel(item)}
         status={status}
         action={action}
-      />
+      />}
     </div>
   );
 }
 
 function LibraryEmpty({ onAdd }: { onAdd: () => void }) {
+  const integrated = useLibraryIntegrated();
+  if (integrated) return (
+    <ItemPanel>
+      <div className="flex flex-col items-center gap-3 px-5 py-8 text-center" data-testid="library-empty">
+        <h2 className="text-sm font-medium text-[var(--dls-text-primary)]">Nothing in your Library yet</h2>
+        <p className="text-[13px] text-[var(--dls-text-secondary)]">Add a connector, skill or plugin.</p>
+        <DenButton icon={Plus} onClick={onAdd}>Add to library</DenButton>
+        <p className="text-xs text-[var(--dls-text-secondary)]">Only you can use it until you share it.</p>
+      </div>
+    </ItemPanel>
+  );
   return (
     <div className="flex flex-col items-center gap-3">
       <div className="flex w-full flex-col items-center gap-5 rounded-2xl border border-gray-100 bg-white px-6 pb-14 pt-16 text-center" data-testid="library-empty">
@@ -166,6 +187,7 @@ function LibraryContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const { orgSlug, orgContext } = useOrgDashboard();
+  const integrated = useLibraryIntegrated();
   const library = useLibrary();
   // Carries who can use each plugin the viewer manages, so rows need no request each.
   usePluginSummaries();
@@ -224,12 +246,14 @@ function LibraryContent() {
     + (models.data ?? []).filter((provider) => provider.state === "needs_signin").length;
   const hasModels = (models.data ?? []).length > 0;
   const empty = !library.isLoading && !library.error && items.length === 0 && !models.isLoading && !hasModels;
+  const List = integrated ? ItemPanel : ItemFlatList;
 
   return (
     <ItemPage testId="library-screen">
       <DenPageHeader
         title="My Library"
-        action={empty ? undefined : <DenButton icon={Plus} onClick={openAdd}>Add to your Library</DenButton>}
+        size={integrated ? "compact" : "default"}
+        action={empty || integrated ? undefined : <DenButton icon={Plus} onClick={openAdd}>Add to your Library</DenButton>}
       />
 
       {library.error ? (
@@ -243,7 +267,7 @@ function LibraryContent() {
       {!empty && !library.error ? (
         <>
           <div className="-mt-1 flex flex-wrap items-center justify-between gap-3">
-            <div className="flex items-center gap-1.5" role="tablist" aria-label="Show">
+            <div className={integrated ? "flex flex-wrap items-center gap-1.5" : "flex items-center gap-1.5"} role="tablist" aria-label="Show">
               {LIBRARY_FILTERS.map((entry) => {
                 const active = entry.value === filter;
                 return (
@@ -253,7 +277,7 @@ function LibraryContent() {
                     role="tab"
                     aria-selected={active}
                     onClick={() => setFilter(entry.value)}
-                    className={`h-[30px] rounded-full px-3 text-[12px] font-medium transition-colors ${active ? "bg-gray-900 text-white" : "border border-gray-200 bg-white text-gray-600 hover:bg-gray-50 hover:text-gray-900"}`}
+                    className={`h-7 rounded-full px-3 text-[12px] transition-colors ${active ? "bg-gray-900 text-white" : "bg-gray-100 text-gray-700 hover:bg-gray-200/70"}`}
                   >
                     {entry.label}
                   </button>
@@ -267,7 +291,7 @@ function LibraryContent() {
                     aria-pressed={onlyNeedsSignIn}
                     onClick={toggleNeedsSignIn}
                     data-testid="library-needs-sign-in-filter"
-                    className={`flex h-[30px] items-center gap-1.5 rounded-full px-3 text-[12px] font-medium transition-colors ${onlyNeedsSignIn ? "bg-gray-900 text-white" : "border border-gray-200 bg-white text-gray-600 hover:bg-gray-50 hover:text-gray-900"}`}
+                    className={`flex h-7 items-center gap-1.5 rounded-full px-3 text-[12px] transition-colors ${onlyNeedsSignIn ? "bg-gray-900 text-white" : "border border-gray-200 bg-white text-gray-700 hover:bg-gray-50"}`}
                   >
                     <span className="h-1.5 w-1.5 rounded-full bg-amber-500" aria-hidden="true" />
                     Needs sign-in
@@ -276,31 +300,34 @@ function LibraryContent() {
                 </>
               ) : null}
             </div>
-            <FilterInput value={query} onChange={setQuery} className="w-[240px]" />
+            <div className="flex flex-wrap items-center gap-2">
+              <FilterInput value={query} onChange={setQuery} className="w-[200px] max-w-full" />
+              {integrated ? <DenButton size="sm" icon={Plus} onClick={openAdd}>Add to library</DenButton> : null}
+            </div>
           </div>
 
           {library.isLoading ? <ItemSectionSkeleton label="Loading your Library" /> : null}
 
           {groups.mine.length > 0 ? (
-            <ItemSection title="Added by you" testId="library-section-mine">
-              <ItemPanel>
+            <ItemSection title="Added by you" meta={integrated ? undefined : String(groups.mine.length)} testId="library-section-mine" variant="rule">
+              <List>
                 {groups.mine.map((item) => (
                   <LibraryItemRow key={`${item.type}:${item.id}`} item={item} mine ownedConnection={ownedConnections.get(item.id)} signIn={signIn} />
                 ))}
-              </ItemPanel>
+              </List>
             </ItemSection>
           ) : null}
 
           {groups.received.length > 0 || modelRows.length > 0 ? (
-            <ItemSection title="From OpenWork" testId="library-section-received">
-              <ItemPanel>
+            <ItemSection title="From OpenWork" meta={integrated ? undefined : `${groups.received.length + modelRows.length} shared with you`} testId="library-section-received" variant="rule">
+              <List>
                 {groups.received.map((item) => (
                   <LibraryItemRow key={`${item.type}:${item.id}`} item={item} mine={false} ownedConnection={undefined} signIn={signIn} />
                 ))}
                 {modelRows.map((provider) => (
                   <LibraryModelRow key={`model:${provider.id}`} provider={provider} signIn={modelSignIn} />
                 ))}
-              </ItemPanel>
+              </List>
             </ItemSection>
           ) : null}
 
@@ -323,6 +350,7 @@ function LibraryContent() {
       ) : null}
 
       <LibraryAddDialog open={addOpen} onOpenChange={setAddOpen} hrefFor={hrefFor} />
+      <MemberApiKeyDialog target={signIn.apiKeyTarget} onClose={signIn.closeApiKey} />
     </ItemPage>
   );
 }

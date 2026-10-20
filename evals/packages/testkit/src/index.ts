@@ -1,11 +1,15 @@
 export { browserScript } from "@openwork/cdp";
 export { attachSurface, evaluateOnSurface } from "@openwork/cdp";
-export { denFetch, signIn as signInDen } from "@openwork/behaviors";
+export { denFetch, signIn as signInDen, engineSessionProbe, sendComposerMessage, waitFor } from "@openwork/behaviors";
+export type { DenSession } from "@openwork/behaviors";
+export { allocateFreePorts, listTargets, setViewport } from "@openwork/cdp";
+export { chrome } from "@openwork/hosts";
 // checkpointCapability and its types come from @openwork/env (re-exported below).
 export { screenshot } from "@openwork/test-evidence";
 export type { BrowserEvaluation, BrowserScript } from "@openwork/cdp";
 export { control, createDesktopHandoffGrant, evalIn, quitDesktop, signInDesktopAs } from "@openwork/behaviors";
-export { requestDenLoopback } from "@openwork/labs";
+export { requestDenLoopback, startMockGoogle } from "@openwork/labs";
+export type { MockGoogleHandle } from "@openwork/labs";
 export { desktop as relaunchDesktop, electronProfilePaths } from "@openwork/hosts";
 export type { DesktopHandle } from "@openwork/hosts";
 export type { Surface } from "@openwork/cdp";
@@ -20,6 +24,7 @@ export * from "@openwork/env";
 export * from "./brief.ts";
 export * from "./daytona-witness.ts";
 export * from "./app-web-preview-witness.ts";
+export * from "./browser-evidence.ts";
 export * from "./eventually.ts";
 export * from "./link.ts";
 export * from "./self-host.ts";

@@ -5,6 +5,7 @@ import { generateSignedCookie } from "hono/cookie"
 import { getDenSessionExpiresAt, getDenSessionRefreshCutoff } from "../src/session-lifetime.js"
 import type { OrganizationContextVariables } from "../src/middleware/index.js"
 import type { AuthContextVariables } from "../src/session.js"
+import { resolveFeatures } from "@openwork/features"
 
 type StoredSession = {
   session: {
@@ -45,6 +46,7 @@ const memberId = createDenTypeId("member")
 let stored: StoredSession | null = null
 let cached: StoredSession | null = null
 let apiKeyEnabled = false
+let memberRole: "owner" | "member" = "owner"
 let cacheEnabled = false
 let applyUpdates = true
 let selects = 0
@@ -63,7 +65,8 @@ let mcpTokenRoutesModule: typeof import("../src/routes/mcp/index.js")
 let orgSharedModule: typeof import("../src/routes/org/shared.js")
 
 function seedRequiredEnv() {
-  process.env.DATABASE_URL = process.env.DATABASE_URL ?? "mysql://root:password@127.0.0.1:3306/openwork_test"
+  process.env.DATABASE_URL = "mysql://fixture:fixture@127.0.0.1:1/not_connected"
+  process.env.DB_MODE = "mysql"
   process.env.DEN_DB_ENCRYPTION_KEY = process.env.DEN_DB_ENCRYPTION_KEY ?? "x".repeat(32)
   process.env.BETTER_AUTH_SECRET = process.env.BETTER_AUTH_SECRET ?? "y".repeat(32)
   process.env.BETTER_AUTH_URL = process.env.BETTER_AUTH_URL ?? "http://127.0.0.1:8790"
@@ -358,7 +361,8 @@ beforeAll(async () => {
           name: "API Key Org",
           metadata: null,
         },
-        currentMember: { id: memberId, role: "owner", isOwner: true },
+        currentMember: { id: memberId, role: memberRole, directRole: memberRole, isOwner: memberRole === "owner", adminTeams: [] },
+        features: resolveFeatures({ deployment: "self_hosted", locks: {}, rollouts: {}, overrides: {} }),
         currentMemberTeams: [],
         members: [],
         teams: [],
@@ -401,6 +405,7 @@ afterEach(() => {
   stored = null
   cached = null
   apiKeyEnabled = false
+  memberRole = "owner"
   cacheEnabled = false
   applyUpdates = true
   selects = 0
@@ -507,8 +512,8 @@ test("x-api-key explicitly bypasses privileged session freshness after org autho
 
   const app = new Hono<{ Variables: AuthContextVariables & Partial<OrganizationContextVariables> }>()
   app.use("*", sessionModule.sessionMiddleware)
-  app.get("/privileged-org-route", routeAccessModule.orgMemberRoute(), (c) => {
-    const permission = orgSharedModule.ensureOrganizationAdmin(c, "Workspace admin required.")
+  app.get("/privileged-org-route", routeAccessModule.orgMemberRoute(), async (c) => {
+    const permission = await orgSharedModule.requirePermission(c, "desktop_policies.manage")
     return permission.ok
       ? c.json({ ok: true })
       : c.json(permission.response, 403)
@@ -520,6 +525,21 @@ test("x-api-key explicitly bypasses privileged session freshness after org autho
 
   expect(response.status).toBe(200)
   await expect(response.json()).resolves.toEqual({ ok: true })
+})
+
+test("x-api-key never bypasses a missing sensitive organization permission", async () => {
+  enableApiKeySession(new Date("2026-07-09T12:00:00.000Z"))
+  memberRole = "member"
+  const app = new Hono<{ Variables: AuthContextVariables & Partial<OrganizationContextVariables> }>()
+  app.use("*", sessionModule.sessionMiddleware)
+  app.get("/privileged-org-route", routeAccessModule.orgMemberRoute(), async (c) => {
+    const permission = await orgSharedModule.requirePermission(c, "desktop_policies.manage")
+    return permission.ok ? c.json({ ok: true }) : c.json(permission.response, 403)
+  })
+
+  const response = await app.request("/privileged-org-route", { headers: { "x-api-key": apiKeySecret } })
+  expect(response.status).toBe(403)
+  await expect(response.json()).resolves.toMatchObject({ error: "forbidden", requiredPermission: "desktop_policies.manage" })
 })
 
 test("real user sessions pass the reusable user-session guard", async () => {

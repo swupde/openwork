@@ -1,7 +1,7 @@
 /** @jsxImportSource react */
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { Agent } from "@opencode-ai/sdk/v2/client";
-import { AppWindowMac, Cloud, Monitor, ArrowUp, Check, ChevronDown, FileText, LoaderCircle, RefreshCw, Square, Terminal, Zap } from "lucide-react";
+import { Cloud, Monitor, ArrowUp, Check, ChevronDown, FileText, LoaderCircle, RefreshCw, Square, Terminal, Zap } from "lucide-react";
 import fuzzysort from "fuzzysort";
 import { toast } from "@/components/ui/sonner";
 import type { CloudImportedPlugin, CloudImportedPluginFile } from "@/app/cloud/import-state";
@@ -17,7 +17,6 @@ import {
 import { ModelSelect } from "@/components/model-select";
 import { ImageLightbox } from "@/components/chat/image-lightbox";
 import { LexicalPromptEditor, syncAttachmentChipStatus, type ComposerAttachmentToken, type LexicalPromptEditorHandle } from "./editor";
-import { listRunningAppsForMention } from "./app-mentions";
 import { COMPUTER_MENTIONS } from "./computer-mentions";
 import type { ComposerMentionKind } from "./mention-encoding";
 import {
@@ -83,7 +82,8 @@ type ComposerProps = {
   onModelPickerOpenChange: (open: boolean) => void;
   onModelChange: (model: ModelRef, variant?: string | null) => void;
   attachments: ComposerAttachment[];
-  onAttachFiles: (files: File[]) => void;
+  /** `draftOffset` is the caret position in the draft; omitted, the chips are appended. */
+  onAttachFiles: (files: File[], draftOffset?: number) => void;
   onRemoveAttachment: (id: string) => void;
   attachmentsEnabled: boolean;
   /** True while the draft's attachments are being compressed/uploaded during a send; chips show a spinner overlay. */
@@ -112,14 +112,11 @@ type ComposerProps = {
   onInsertMention: (kind: ComposerMentionKind, value: string, draft?: string) => void;
   /** Sent-prompt history (oldest first) recalled with ArrowUp/ArrowDown (#2012). */
   inputHistory?: string[];
-  onPasteText: (text: string) => void;
+  onPasteText: (text: string, draftOffset?: number) => void;
   onUnsupportedFileLinks: (links: string[]) => void;
   pastedText: PastedTextChip[];
   onExpandPastedText: (id: string) => void;
   onRemovePastedText: (id: string) => void;
-  isRemoteWorkspace: boolean;
-  isSandboxWorkspace: boolean;
-  onUploadInboxFiles?: ((files: File[]) => void | Promise<unknown>) | null;
   draftScopeKey?: string;
   compactTopSpacing?: boolean;
   /** Render inline in a page (new-task hero): no sticky dock chrome or inner max-width, aligning with sibling content. */
@@ -321,7 +318,14 @@ export const ReactSessionComposer = memo(function ReactSessionComposer(props: Co
   const handleEditorSubmit = useCallback((options: { queue: boolean }) => {
     const hasContent = props.draft.trim().length > 0 || props.attachments.length > 0;
     if (!hasContent) return;
-    if (props.submissionPreparing || props.stopping) return;
+    if (props.submissionPreparing) return;
+    // A new Enter after Stop is fresh work, not a follow-up to the interrupted
+    // turn. The immediate send path fences admission on the shared interruption
+    // promise; dropping Enter here silently leaves the person's draft unsent.
+    if (props.stopping) {
+      void props.onSend();
+      return;
+    }
     if (props.busy && !props.editing) {
       if (options.queue) void props.onSteer();
       else void props.onQueue();
@@ -502,18 +506,13 @@ export const ReactSessionComposer = memo(function ReactSessionComposer(props: Co
     void Promise.all([
       props.listAgents().catch(() => []),
       props.searchFiles(mentionQuery).catch(() => []),
-      listRunningAppsForMention(),
-    ]).then(([agentList, files, apps]) => {
+    ]).then(([agentList, files]) => {
       if (cancelled) return;
       const recent = props.recentFiles.slice(0, 8);
       const next: MentionItem[] = [
         ...COMPUTER_MENTIONS,
         ...agentList.map((agent) => ({ id: `agent:${agent.name}`, kind: "agent" as const, value: agent.name, label: agent.name })),
         ...recent.map((file) => ({ id: `file:${file}`, kind: "file" as const, value: file, label: file })),
-        // Running macOS apps (Computer Use targets). Listed after recent files
-        // so an empty "@" stays file-first; fuzzy search surfaces them as the
-        // user types (e.g. "@mus" → Music).
-        ...apps.map((appName) => ({ id: `app:${appName}`, kind: "app" as const, value: appName, label: appName })),
         ...files.filter((file) => !recent.includes(file)).map((file) => ({ id: `file:${file}`, kind: "file" as const, value: file, label: file })),
       ];
       setMentionItems(next);
@@ -1178,7 +1177,7 @@ export const ReactSessionComposer = memo(function ReactSessionComposer(props: Co
     syncAttachmentChipStatus(root, props.attachmentsUploading ? "uploading" : "ready");
   }, [props.attachmentsUploading, props.attachments]);
 
-  const addAttachments = async (inputFiles: File[]) => {
+  const addAttachments = async (inputFiles: File[], draftOffset?: number) => {
     if (!inputFiles.length) return;
     if (!props.attachmentsEnabled) {
       toast.warning(props.attachmentsDisabledReason ?? t("composer.attachments_unavailable"));
@@ -1189,7 +1188,7 @@ export const ReactSessionComposer = memo(function ReactSessionComposer(props: Co
     // endpoint or provider) with their own errors instead of a composer rule.
     // Oversized images are compressed at send time (see image-compression.ts)
     // so the chip appears instantly instead of blocking on canvas work here.
-    props.onAttachFiles(inputFiles);
+    props.onAttachFiles(inputFiles, draftOffset);
   };
 
   const panelRoundedClass =
@@ -1281,8 +1280,6 @@ export const ReactSessionComposer = memo(function ReactSessionComposer(props: Co
                     item.value === "cloud" ? <Cloud size={14} className="mt-0.5 shrink-0 text-gray-9" /> : <Monitor size={14} className="mt-0.5 shrink-0 text-gray-9" />
                   ) : item.kind === "agent" ? (
                     <Zap size={14} className="mt-0.5 shrink-0 text-gray-9" />
-                  ) : item.kind === "app" ? (
-                    <AppWindowMac size={14} className="mt-0.5 shrink-0 text-gray-9" />
                   ) : (
                     <FileText size={14} className="mt-0.5 shrink-0 text-gray-9" />
                   )}
@@ -1291,9 +1288,7 @@ export const ReactSessionComposer = memo(function ReactSessionComposer(props: Co
                     <div className="truncate text-xs text-gray-10">
                       {item.description ? item.description : item.kind === "agent"
                         ? t("composer.agent_label")
-                        : item.kind === "app"
-                          ? t("composer.app_kind")
-                          : t("composer.file_kind")}
+                        : t("composer.file_kind")}
                     </div>
                   </div>
                 </button>
@@ -1376,7 +1371,7 @@ export const ReactSessionComposer = memo(function ReactSessionComposer(props: Co
                 const files = Array.from(event.clipboardData?.files ?? []);
                 if (files.length) {
                   event.preventDefault();
-                  void addAttachments(files);
+                  void addAttachments(files, editorRef.current?.draftOffsetAtSelection() ?? undefined);
                   return;
                 }
 
@@ -1389,33 +1384,12 @@ export const ReactSessionComposer = memo(function ReactSessionComposer(props: Co
                   return;
                 }
 
-                const text = event.clipboardData?.getData("text/plain") ?? "";
-
                 // Plain text paste display is owned by PasteChipPlugin inside
                 // the Lexical editor: text collapses when it would exceed the
                 // editor's current width and maximum height, unless the whole
                 // string is a standalone HTTP(S) URL. Text that fits, or is
                 // expanded from a chip, renders like normal text. Do NOT
                 // duplicate that here.
-
-                if (
-                  text.trim() &&
-                  (props.isRemoteWorkspace || props.isSandboxWorkspace) &&
-                  /file:\/\/|(^|\s)\/(Users|home|var|etc|opt|tmp|private|Volumes|Applications)\//.test(text)
-                ) {
-                  const attachedFiles = props.attachments.map((attachment) => attachment.file);
-                  toast.warning(t("composer.remote_worker_paste_warning"), {
-                    action:
-                      props.onUploadInboxFiles && attachedFiles.length > 0
-                        ? {
-                            label: t("composer.upload_to_shared_folder"),
-                            onClick: () => void props.onUploadInboxFiles?.(attachedFiles),
-                          }
-                        : undefined,
-                  });
-                  // Intentionally no preventDefault — the notice is advisory,
-                  // the paste still goes through the editor.
-                }
               }}
               onDragOver={(event) => {
                 if (event.dataTransfer?.files?.length) {

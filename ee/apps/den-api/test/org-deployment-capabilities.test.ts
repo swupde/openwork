@@ -1,3 +1,6 @@
+import { resolveFeatures } from "@openwork/features"
+import { OrganizationTable } from "@openwork-ee/den-db/schema"
+import { createMockDenAuth } from "./fork-auth-fixture.js"
 import { afterAll, expect, mock, test } from "bun:test"
 import { Hono, type MiddlewareHandler } from "hono"
 import { createDenTypeId } from "@openwork-ee/utils/typeid"
@@ -12,9 +15,21 @@ process.env.OPENWORK_DEV_MODE = "1"
 process.env.GATEWAY_ENABLED = "false"
 process.env.DEN_ORG_MODE = "single_org"
 
-const rows = { from: () => rows, where: () => rows, limit: async () => [] }
-mock.module("../src/db.js", () => ({ db: { select: () => rows } }))
-mock.module("../src/auth.js", () => ({ auth: { api: {} } }))
+const select = () => {
+  let table: unknown
+  const result = () => table === OrganizationTable ? [{ metadata: null }] : []
+  const rows = {
+    from: (source: unknown) => { table = source; return rows },
+    where: () => rows,
+    limit: async () => result(),
+    then: (resolve: (value: ReturnType<typeof result>) => unknown) => Promise.resolve(result()).then(resolve),
+  }
+  return rows
+}
+mock.module("../src/db.js", () => ({ db: { select } }))
+mock.module("../src/auth.js", createMockDenAuth)
+
+const { memberPermissionsForOrganizationContext, resolveMemberPermissionsMiddleware } = await import("../src/middleware/member-permissions.js")
 
 let authenticated = true
 let dashboard = false
@@ -22,8 +37,9 @@ const memberRoute: MiddlewareHandler = async (c, next) => {
   if (!authenticated) return c.json({ error: "unauthorized" }, 401)
   c.set("organizationContext", {
     organization: { id: createDenTypeId("organization"), metadata: { capabilities: { gatewayDashboard: dashboard } } },
-    currentMember: { id: createDenTypeId("member"), role: "owner", isOwner: true },
+    currentMember: { id: createDenTypeId("member"), role: "owner", directRole: "owner", adminTeams: [], isOwner: true },
     members: [], teams: [], roles: [],
+    features: resolveFeatures({ deployment: "self_hosted", locks: {}, rollouts: {}, overrides: {} }),
   })
   await next()
 }
@@ -35,6 +51,9 @@ mock.module("../src/middleware/index.js", () => ({
   userSessionRoute: () => memberRoute,
   publicRoute: passthrough,
   resolveMemberTeamsMiddleware: passthrough,
+  memberPermissionsForOrganizationContext,
+  resolveMemberPermissionsMiddleware,
+  orgPermissionRoute: () => memberRoute,
 }))
 
 const { env } = await import("../src/env.js")
@@ -43,7 +62,7 @@ const app = new Hono()
 registerOrgCoreRoutes(app)
 afterAll(() => mock.restore())
 
-test("authenticated GET /v1/org returns the versioned deployment capability independently of org dashboard flag", async () => {
+test("authenticated GET /v1/org returns the versioned deployment capability independently of retired org dashboard metadata", async () => {
   for (const enabled of [false, true]) for (const exposed of [false, true]) {
     env.gatewayEnabled = enabled
     dashboard = exposed
@@ -52,7 +71,7 @@ test("authenticated GET /v1/org returns the versioned deployment capability inde
     const payload = await response.json()
     expect(payload.deploymentCapabilities).toEqual({ version: 1, aiGateway: enabled })
     expect(parseDeploymentCapabilities(payload.deploymentCapabilities).aiGateway).toBe(enabled)
-    expect(payload.capabilities.gatewayDashboard).toBe(exposed)
+    expect(payload.capabilities.gatewayDashboard).toBe(true)
     expect(payload.organization.deploymentCapabilities).toBeUndefined()
   }
 })

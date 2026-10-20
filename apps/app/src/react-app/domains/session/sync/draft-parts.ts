@@ -110,7 +110,6 @@ export async function draftToParts(
         const value = decodeComposerMentionValue(segment.slice(1));
         const mentionPart = draft.parts.find((part) =>
           (part.type === "agent" && part.name === value)
-          || (part.type === "app" && part.name === value)
           || (part.type === "computer" && part.target === value
             && (index <= 1 && !segments[0] || /\s$/.test(segments[index - 1] ?? "")))
           || (part.type === "file" && part.path === value),
@@ -119,7 +118,7 @@ export async function draftToParts(
           parts.push({ type: "agent", name: mentionPart.name });
           continue;
         }
-        if (mentionPart?.type === "computer" || mentionPart?.type === "app") {
+        if (mentionPart?.type === "computer") {
           parts.push(...composerPillPromptParts(composerPillFromPart(mentionPart)));
           continue;
         }
@@ -158,7 +157,7 @@ export async function draftToParts(
         parts.push({ type: "agent", name: part.name });
         continue;
       }
-      if (part.type === "skill" || part.type === "connect-skill" || part.type === "connector" || part.type === "computer" || part.type === "app") {
+      if (part.type === "skill" || part.type === "connect-skill" || part.type === "connector" || part.type === "computer") {
         parts.push(...composerPillPromptParts(composerPillFromPart(part)));
         continue;
       }

@@ -54,6 +54,15 @@ export const automationModelSchema = z.object({
 })
 export type AutomationModel = z.infer<typeof automationModelSchema>
 
+export function automationModelAllowedByProvider(config: Record<string, unknown>, modelId: string): boolean {
+  const readList = (value: unknown): string[] => Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+    : []
+  const blacklist = readList(config.blacklist)
+  const whitelist = readList(config.whitelist)
+  return !blacklist.includes(modelId) && (!Array.isArray(config.whitelist) || whitelist.includes(modelId))
+}
+
 export const automationSavedScriptReferenceSchema = z.object({
   pluginId: idSchema,
   configObjectId: idSchema,
@@ -200,7 +209,11 @@ export const automationExecutionThreadSchema = z.object({
 }).meta({ ref: "AutomationExecutionThread" })
 export type AutomationExecutionThread = z.infer<typeof automationExecutionThreadSchema>
 
-/** Creation surface fixes execution placement: Desktop stays local; Web runs in Cloud. */
+/**
+ * Where an Automation runs: on one of the owner's connected desktops, or in
+ * OpenWork Cloud. The owner may move it between the two (a new revision) or run
+ * it once on the other target; agents may only ever move work to the cloud.
+ */
 export const automationExecutionTargetSchema = z.enum(["desktop", "cloud"])
 export type AutomationExecutionTarget = z.infer<typeof automationExecutionTargetSchema>
 
@@ -212,13 +225,19 @@ export const REMOTE_SESSION_DESKTOP_RUNNER_CAPABILITY = "remote_session_v1"
  * misread the request work item, so Den routes requests by this capability.
  */
 export const REMOTE_SESSION_CONTROL_RUNNER_CAPABILITY = "remote_session_control_v1"
+/** An interactive session runner, never a scheduled Automation executor. */
+export const REMOTE_SESSION_ONLY_RUNNER_CAPABILITY = "remote_session_only_v1"
+/** Sticky, same-owner recovery backed by a local effects journal. */
+export const REMOTE_SESSION_RECOVERY_RUNNER_CAPABILITY = "remote_session_recovery_v1"
 export const AUTOMATION_MODEL_ATTENTION_CAPABILITY_HEADER = "x-openwork-automation-model-attention" as const
 export const automationDesktopRunnerCapabilitySchema = z.enum([
   AUTOMATION_MODEL_ATTENTION_CAPABILITY,
   REMOTE_SESSION_DESKTOP_RUNNER_CAPABILITY,
   REMOTE_SESSION_CONTROL_RUNNER_CAPABILITY,
+  REMOTE_SESSION_ONLY_RUNNER_CAPABILITY,
+  REMOTE_SESSION_RECOVERY_RUNNER_CAPABILITY,
 ])
-export const AUTOMATION_DESKTOP_RUNNER_CAPABILITY_LIMIT = 3
+export const AUTOMATION_DESKTOP_RUNNER_CAPABILITY_LIMIT = 5
 export type AutomationDesktopRunnerCapability = z.infer<typeof automationDesktopRunnerCapabilitySchema>
 
 export const automationDesktopRunnerRegistrationSchema = z.object({
@@ -247,6 +266,37 @@ export const automationDesktopRunnerPresenceSchema = z.object({
 }).meta({ ref: "AutomationDesktopRunnerPresence" })
 export type AutomationDesktopRunnerPresence = z.infer<typeof automationDesktopRunnerPresenceSchema>
 
+/** One of the owner's registered desktops. Any connected one may run a Desktop Automation. */
+export const automationDesktopTargetSchema = z.object({
+  kind: z.literal("desktop"),
+  id: idSchema,
+  platform: z.enum(["darwin", "win32", "linux"]),
+  appVersion: z.string().trim().min(1).max(80),
+  lastSeenAt: timestampSchema,
+  connected: z.boolean(),
+}).meta({ ref: "AutomationDesktopTarget" })
+export type AutomationDesktopTarget = z.infer<typeof automationDesktopTargetSchema>
+
+/**
+ * Whether the owner can run agent Automations in OpenWork Cloud right now, and
+ * on which runtime: the shared headless runner or their OpenWork Web computer.
+ * `runtime` is null when Cloud is unavailable.
+ */
+export const automationCloudTargetSchema = z.object({
+  kind: z.literal("cloud"),
+  available: z.boolean(),
+  runtime: z.enum(["headless", "web"]).nullable(),
+  /** The owner has an OpenWork Web computer, so a cloud run can also use its files. */
+  cloudComputer: z.boolean(),
+}).meta({ ref: "AutomationCloudTarget" })
+export type AutomationCloudTarget = z.infer<typeof automationCloudTargetSchema>
+
+/** Every place the owner's Automations can run: their desktops, then Cloud. */
+export const automationExecutionTargetListSchema = z.object({
+  items: z.array(z.discriminatedUnion("kind", [automationDesktopTargetSchema, automationCloudTargetSchema])),
+}).meta({ ref: "AutomationExecutionTargetList" })
+export type AutomationExecutionTargetList = z.infer<typeof automationExecutionTargetListSchema>
+
 export const automationRunnerNotificationSchema = z.object({
   type: z.enum(["automation_work_available", "automation_cancellation_available"]),
   cursor: z.string().trim().min(1).max(40),
@@ -257,15 +307,74 @@ export const automationRunnerWorkItemSchema = z.union([
   // The automation-run item shape predates remote-session commands and is
   // consumed by released desktop runners: it must keep every field it has
   // always carried.
-  z.object({ runId: idSchema, executionTarget: z.literal("desktop") }),
+  z.object({
+    runId: idSchema,
+    executionTarget: z.literal("desktop"),
+    /**
+     * Present only for a run pinned to one workspace. A workspace exists on the
+     * desktop that has its folder, so a runner without it leaves the run for
+     * the owner's desktop that does. Released runners ignore the field.
+     */
+    workspaceId: automationWorkspaceIdSchema.optional(),
+  }),
   z.object({ kind: z.literal("remote_session_create"), commandId: idSchema }),
   // Listed only for runners that registered remote_session_control_v1.
   z.object({ kind: z.literal("remote_session_request"), requestId: idSchema }),
 ])
+/** Runs a desktop may claim per work poll; a runner skips the ones pinned elsewhere. */
+export const AUTOMATION_RUNNER_WORK_RUN_LIMIT = 20
 export const automationRunnerWorkResponseSchema = z.object({
-  items: z.array(automationRunnerWorkItemSchema).max(14),
+  // Up to the run limit plus five remote-session commands and five remote-session requests.
+  items: z.array(automationRunnerWorkItemSchema).max(AUTOMATION_RUNNER_WORK_RUN_LIMIT + 10),
 })
 export type AutomationRunnerWorkResponse = z.infer<typeof automationRunnerWorkResponseSchema>
+
+/** Workspaces and models a desktop reports per workspace; anything beyond is dropped. */
+export const DESKTOP_INVENTORY_WORKSPACE_LIMIT = 50
+export const DESKTOP_INVENTORY_MODEL_LIMIT = 200
+const desktopInventoryIdSchema = z.string().trim().min(1).max(240)
+
+export const desktopInventoryModelSchema = z.object({
+  providerId: z.string().trim().min(1).max(160),
+  modelId: z.string().trim().min(1).max(160),
+  name: z.string().trim().min(1).max(200),
+})
+export type DesktopInventoryModel = z.infer<typeof desktopInventoryModelSchema>
+
+export const desktopInventoryWorkspaceSchema = z.object({
+  workspaceId: desktopInventoryIdSchema,
+  name: z.string().trim().min(1).max(120),
+  /** The workspace the desktop uses when a remote session names none. */
+  active: z.boolean(),
+  engine: z.enum(["v1", "v2"]),
+  defaultModel: z.object({
+    providerId: z.string().trim().min(1).max(160),
+    modelId: z.string().trim().min(1).max(160),
+    variant: z.string().trim().min(1).max(60).optional(),
+  }).nullable(),
+  /** Models the workspace can use right now; empty when the desktop could not list them. */
+  models: z.array(desktopInventoryModelSchema).max(DESKTOP_INVENTORY_MODEL_LIMIT),
+})
+export type DesktopInventoryWorkspace = z.infer<typeof desktopInventoryWorkspaceSchema>
+
+/**
+ * What a desktop runner has, reported to `PUT /v1/automation-runner/inventory`
+ * when it connects and when it changes. Den keeps only the latest report per
+ * runner. Objects are deliberately not strict so either side can add fields.
+ */
+export const desktopRunnerInventorySchema = z.object({
+  computer: z.object({
+    label: z.string().trim().min(1).max(120),
+    platform: z.enum(["darwin", "win32", "linux"]),
+    appVersion: z.string().trim().min(1).max(80),
+  }),
+  workspaces: z.array(desktopInventoryWorkspaceSchema).max(DESKTOP_INVENTORY_WORKSPACE_LIMIT),
+})
+export type DesktopRunnerInventory = z.infer<typeof desktopRunnerInventorySchema>
+export const desktopRunnerInventoryResponseSchema = z.object({
+  ok: z.literal(true),
+  updatedAt: timestampSchema,
+})
 
 export const remoteSessionCommandAssignmentSchema = z.object({
   commandId: idSchema,
@@ -278,6 +387,11 @@ export const remoteSessionCommandAssignmentSchema = z.object({
     variant: z.string().trim().min(1).max(60).nullable(),
   }).nullable(),
   expiresAt: timestampSchema,
+  /**
+   * The workspace the caller chose. The desktop creates the session there or
+   * fails with `workspace_unavailable`; absent means its active workspace.
+   */
+  workspaceId: desktopInventoryIdSchema.nullable().optional(),
 })
 export const remoteSessionCommandClaimResponseSchema = z.object({
   assignment: remoteSessionCommandAssignmentSchema,
@@ -410,6 +524,8 @@ export const remoteSessionTranscriptMessageSchema = z.object({
 })
 export type RemoteSessionTranscriptMessage = z.infer<typeof remoteSessionTranscriptMessageSchema>
 export const remoteSessionReadResultSchema = z.object({
+  /** Whether the engine returned full history or only its current context. */
+  historyScope: z.enum(["full", "context"]).optional(),
   title: z.string().max(240).nullable(),
   status: remoteSessionStatusSchema,
   waitingFor: remoteSessionWaitingForSchema.nullable(),
@@ -625,7 +741,11 @@ export const updateAutomationSchema = z.object({
   schedule: automationScheduleSchema.optional(),
   model: automationModelSchema.optional(),
   action: automationActionSchema.optional(),
-  /** Accepted for round-tripping; execution placement itself is immutable. */
+  /**
+   * Moves the Automation between the owner's desktops and the cloud. A pinned
+   * workspace belongs to one computer, so moving drops it unless `workspaceId`
+   * is set in the same request. Workflows run only in the cloud.
+   */
   executionTarget: automationExecutionTargetSchema.optional(),
   /** Re-pin to a different workspace; null clears the pin (legacy active-workspace fallback). */
   workspaceId: automationWorkspaceIdSchema.nullable().optional(),
@@ -634,6 +754,16 @@ export const updateAutomationSchema = z.object({
   "At least one behavior-changing field is required",
 )
 export type UpdateAutomation = z.infer<typeof updateAutomationSchema>
+
+/**
+ * Optional body of a manual run. `executionTarget` runs this one occurrence on
+ * the other target (a Desktop Automation once in the cloud, or the reverse)
+ * without changing the Automation. Older clients send `{}` or no body.
+ */
+export const runAutomationNowSchema = z.object({
+  executionTarget: automationExecutionTargetSchema.optional(),
+})
+export type RunAutomationNow = z.infer<typeof runAutomationNowSchema>
 
 export const automationListSchema = z.object({
   items: z.array(z.object({
@@ -644,6 +774,30 @@ export const automationListSchema = z.object({
   nextCursor: z.string().nullable(),
 }).meta({ ref: "AutomationList" })
 export type AutomationList = z.infer<typeof automationListSchema>
+
+/** Most days one calendar range read may cover (a month view plus padding). */
+export const AUTOMATION_RUN_RANGE_MAX_DAYS = 45
+
+export const automationRunRangeQuerySchema = z.object({
+  from: z.coerce.number().int().nonnegative().describe("Inclusive lower bound, epoch milliseconds."),
+  to: z.coerce.number().int().positive().describe("Exclusive upper bound, epoch milliseconds."),
+  cursor: z.string().trim().min(1).max(160).optional().describe("nextCursor from the previous page."),
+  limit: z.coerce.number().int().min(1).max(500).optional().describe("Maximum runs to scan for this page (default 200)."),
+}).refine((value) => value.to > value.from, { message: "to must be after from", path: ["to"] })
+  .refine((value) => value.to - value.from <= AUTOMATION_RUN_RANGE_MAX_DAYS * 24 * 60 * 60 * 1_000, {
+    message: `The range may cover at most ${AUTOMATION_RUN_RANGE_MAX_DAYS} days`, path: ["to"],
+  })
+export type AutomationRunRangeQuery = z.infer<typeof automationRunRangeQuerySchema>
+
+/**
+ * Runs of every Automation the caller owns, placed by scheduledFor (else
+ * startedAt, else createdAt). A non-null `nextCursor` means more may exist.
+ */
+export const automationRunRangeSchema = z.object({
+  items: z.array(automationRunSchema),
+  nextCursor: z.string().nullable(),
+}).meta({ ref: "AutomationRunRange" })
+export type AutomationRunRange = z.infer<typeof automationRunRangeSchema>
 
 export const automationDetailSchema = z.object({
   automation: automationSchema,

@@ -1,6 +1,6 @@
 import * as crypto from "node:crypto"
-import { eq } from "@openwork-ee/den-db/drizzle"
-import { OAuthAccessTokenTable } from "@openwork-ee/den-db/schema"
+import { and, eq, gt, isNull } from "@openwork-ee/den-db/drizzle"
+import { AuthSessionTable, MemberTable, OAuthAccessTokenTable, OAuthConsentTable } from "@openwork-ee/den-db/schema"
 import { normalizeDenTypeId } from "@openwork-ee/utils/typeid"
 import { verifyJwsAccessToken } from "better-auth/oauth2"
 import {
@@ -132,6 +132,21 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function readStringClaim(payload: Record<string, unknown>, claim: string) {
   const value = payload[claim]
   return typeof value === "string" && value.trim() ? value.trim() : null
+}
+
+/**
+ * Non-secret identifier of the credential behind a principal, for audit
+ * attribution: the OAuth grant id, else the headless-run token row id, else the
+ * OAuth client id (JWT `client_id`/`azp`). Never token material.
+ */
+export function mcpPrincipalCredentialId(principal: McpPrincipal): string | null {
+  const payload = principal.payload
+  const grantId = readStringClaim(payload, DEN_MCP_GRANT_ID_CLAIM)
+  if (grantId) return `grant:${grantId}`
+  const runTokenId = payload.client_id === DEN_MCP_HEADLESS_RUN_CLIENT_ID ? readStringClaim(payload, DEN_MCP_HEADLESS_RUN_TOKEN_ID_CLAIM) : null
+  if (runTokenId) return `run_token:${runTokenId}`
+  const clientId = readStringClaim(payload, "client_id") ?? readStringClaim(payload, "azp")
+  return clientId ? `client:${clientId}` : null
 }
 
 function readTokenAudiences(payload: Record<string, unknown>) {
@@ -474,4 +489,36 @@ export async function verifyMcpRequest(headers: Headers, optionsInput?: string |
   }
 
   return { userId, organizationId, scopes, payload }
+}
+
+/** Long-lived streams must not extend cached membership, grant or session liveness. */
+export async function verifyMcpSubscriptionRequest(headers: Headers, options: McpAuthResourceContext, signal: AbortSignal): Promise<McpPrincipal | null> {
+  signal.throwIfAborted()
+  const principal = await verifyMcpRequest(headers, options)
+  signal.throwIfAborted()
+  if (principal instanceof Response) return null
+  const userId = normalizeDenTypeId("user", principal.userId)
+  const organizationId = normalizeDenTypeId("organization", principal.organizationId)
+  const [member] = await db.select({ id: MemberTable.id }).from(MemberTable).where(and(
+    eq(MemberTable.userId, userId), eq(MemberTable.organizationId, organizationId), isNull(MemberTable.removedAt),
+  )).limit(1)
+  signal.throwIfAborted()
+  if (!member) return null
+  const grantId = readStringClaim(principal.payload, DEN_MCP_GRANT_ID_CLAIM)
+  if (grantId) {
+    const [grant] = await db.select({ id: OAuthConsentTable.id }).from(OAuthConsentTable).where(and(
+      eq(OAuthConsentTable.id, normalizeDenTypeId("oauthConsent", grantId)), eq(OAuthConsentTable.userId, userId),
+    )).limit(1)
+    if (!grant) return null
+  } else {
+    const sessionId = readStringClaim(principal.payload, "sid")
+    if (sessionId) {
+      const [session] = await db.select({ id: AuthSessionTable.id }).from(AuthSessionTable).where(and(
+        eq(AuthSessionTable.id, normalizeDenTypeId("session", sessionId)), eq(AuthSessionTable.userId, userId), gt(AuthSessionTable.expiresAt, new Date()),
+      )).limit(1)
+      if (!session) return null
+    }
+    // Session-less headless credentials were already verified by verifyMcpRequest.
+  }
+  return principal
 }

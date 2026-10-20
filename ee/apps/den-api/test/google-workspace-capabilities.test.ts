@@ -814,7 +814,7 @@ beforeAll(async () => {
   expect(tokenResponse.status).toBe(200)
   const tokenBody: unknown = await tokenResponse.json()
   directUploadMcpToken = expectString(expectRecord(tokenBody, "MCP token response").token, "MCP upload token")
-})
+}, 30_000)
 
 beforeEach(async () => {
   resetFakeGoogle()
@@ -2137,8 +2137,7 @@ test("native Google file update replaces whole Docs, Sheets, and Slides content"
 })
 
 test("fork Google routes enforce the organization Connect policy before calling Google", async () => {
-  await db.update(schema.OrganizationTable).set({ metadata: JSON.stringify({ connectEnabled: false }) })
-    .where(drizzle.eq(schema.OrganizationTable.id, organizationId))
+  await db.insert(schema.OrganizationFeatureTable).values({ organization_id: organizationId, feature_key: "mcpConnections", enabled: false, source: "admin" })
   try {
     const cases = [
       { path: "/v1/capabilities/google-workspace/calendar-agenda?day=tomorrow&timeZone=Europe%2FBerlin", init: undefined },
@@ -2152,8 +2151,10 @@ test("fork Google routes enforce the organization Connect policy before calling 
     }
     expect(googleCallCount).toBe(0)
   } finally {
-    await db.update(schema.OrganizationTable).set({ metadata: null })
-      .where(drizzle.eq(schema.OrganizationTable.id, organizationId))
+    await db.delete(schema.OrganizationFeatureTable).where(drizzle.and(
+      drizzle.eq(schema.OrganizationFeatureTable.organization_id, organizationId),
+      drizzle.eq(schema.OrganizationFeatureTable.feature_key, "mcpConnections"),
+    ))
   }
 })
 

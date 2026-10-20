@@ -1,8 +1,11 @@
 import { createDenTypeId } from "@openwork-ee/utils/typeid"
 import { afterAll, beforeAll, beforeEach, expect, mock, test } from "bun:test"
 import { Hono } from "hono"
+import { resolveFeatures } from "@openwork/features"
+import { MemberTable } from "@openwork-ee/den-db/schema"
 
 function seedRequiredEnv() {
+  process.env.DEN_APP_MCP_SERVERS_ENABLED = "false"
   process.env.DATABASE_URL = process.env.DATABASE_URL ?? "mysql://root:password@127.0.0.1:3306/openwork_test"
   process.env.DEN_DB_ENCRYPTION_KEY = process.env.DEN_DB_ENCRYPTION_KEY ?? "x".repeat(32)
   process.env.BETTER_AUTH_SECRET = process.env.BETTER_AUTH_SECRET ?? "y".repeat(32)
@@ -12,9 +15,9 @@ function seedRequiredEnv() {
 
 const userId = createDenTypeId("user")
 const organizationId = createDenTypeId("organization")
-let organizationMetadata: Record<string, unknown> | null = null
-let selectCount = 0
+const memberId = createDenTypeId("member")
 let recordedRows: unknown[] = []
+let memberActive = true
 let registerAgentMcpRoutes: typeof import("../src/mcp/agent.js")["registerAgentMcpRoutes"]
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -22,6 +25,20 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function installMocks() {
+  const select = () => {
+    let table: unknown
+    const rows = () => table === MemberTable && memberActive ? [{ id: memberId, userId, organizationId, role: "member", removedAt: null }] : []
+    const query = {
+      from: (source: unknown) => { table = source; return query },
+      where: () => query,
+      innerJoin: () => query,
+      leftJoin: () => query,
+      orderBy: () => query,
+      limit: async () => rows(),
+      then: (resolve: (value: ReturnType<typeof rows>) => unknown) => Promise.resolve(rows()).then(resolve),
+    }
+    return query
+  }
   mock.module("../src/db.js", () => ({
     db: {
       insert: () => ({
@@ -30,20 +47,12 @@ function installMocks() {
           return { execute: () => Promise.resolve() }
         },
       }),
-      select: () => ({
-        from: () => ({
-          where: () => ({
-            limit: () => {
-              selectCount += 1
-              return Promise.resolve(selectCount % 2 === 1 ? [] : [{ metadata: organizationMetadata }])
-            },
-          }),
-        }),
-      }),
+      select,
+      selectDistinct: select,
       transaction: () => Promise.resolve(null),
     },
   }))
-  mock.module("../src/mcp/auth.js", () => ({
+  mock.module("../src/mcp/auth.js", () => ({ mcpPrincipalCredentialId: () => null, verifyMcpSubscriptionRequest: async () => null,
     getMcpResourceContext: (_request: Request, _route: string, requestId?: string) => ({
       route: "agent",
       resourceUrl: "http://127.0.0.1:8790/mcp/agent",
@@ -90,7 +99,6 @@ function buildApp() {
 }
 
 async function rpc(app: ReturnType<typeof buildApp>, method: string, params: Record<string, unknown> = {}) {
-  selectCount = 0
   const response = await app.request("http://127.0.0.1:8790/mcp/agent", {
     method: "POST",
     headers: {
@@ -134,13 +142,28 @@ function firstText(payload: Record<string, unknown>): string {
 beforeAll(async () => {
   seedRequiredEnv()
   installMocks()
+  const orgs = await import("../src/orgs.js")
+  mock.module("../src/orgs.js", () => ({
+    ...orgs,
+    listTeamsForMember: async () => [],
+    getOrganizationContextForUser: async () => {
+      const now = new Date()
+      return {
+        organization: { id: organizationId, name: "Code Mode fixture", slug: organizationId, logo: null,
+          allowedEmailDomains: null, metadata: null, createdAt: now, updatedAt: now },
+        currentMember: { id: memberId, userId, role: "member", directRole: "member", adminTeams: [],
+          createdAt: now, joinedAt: now, isOwner: false },
+        invitations: [], members: [], roles: [], teams: [],
+        features: resolveFeatures({ deployment: "self_hosted", locks: {}, rollouts: {}, overrides: {} }),
+      }
+    },
+  }))
   registerAgentMcpRoutes = (await import("../src/mcp/agent.js")).registerAgentMcpRoutes
 })
 
 beforeEach(() => {
-  organizationMetadata = null
-  selectCount = 0
   recordedRows = []
+  memberActive = true
 })
 
 afterAll(() => {
@@ -159,7 +182,7 @@ test("registers Code Mode without enabling agent-authored MCP App views", async 
   const names = listedToolNames(await rpc(buildApp(), "tools/list"))
   expect(names).toContain("execute_capability_script")
   expect(names).toContain("render_workflow_artifact")
-  expect(names).toContain("render_dynamic_artifact")
+  expect(names).not.toContain("render_dynamic_artifact")
   expect(names).not.toContain("save_artifact_view")
   expect(names).not.toContain("activate_artifact_view_revision")
   expect(names).not.toContain("retire_artifact_view")
@@ -194,6 +217,39 @@ test("executes a confined script by default", async () => {
     arguments: { code: "return 1 + 1" },
   })
   expect(firstText(payload)).toBe("2")
+})
+
+test("denies authoring after the caller's organization membership is removed", async () => {
+  memberActive = false
+  const payload = await rpc(buildApp(), "tools/call", {
+    name: "execute_capability_script", arguments: { code: "return 2" },
+  })
+  expect(resultRecord(payload).isError).toBe(true)
+  expect(JSON.parse(firstText(payload))).toMatchObject({ error: "membership_required" })
+  expect(recordedRows).toEqual([])
+})
+
+test("default App-server authoring keeps the live write restriction", async () => {
+  const { env } = await import("../src/env.js")
+  const previous = env.appMcpServersEnabled
+  env.appMcpServersEnabled = true
+  try {
+    const names = listedToolNames(await rpc(buildApp(), "tools/list"))
+    expect(names).toContain("prepare_app")
+    expect(names).toContain("create_app")
+    const payload = await rpc(buildApp(), "tools/call", {
+      name: "execute_capability_script",
+      arguments: {
+        mode: "live",
+        code: 'try { await tools.den.saveWorkflow({ body: {} }); return "write executed" } catch { return "write denied" }',
+      },
+    })
+    expect(firstText(payload)).toBe("write denied")
+    expect(recordedRows).toHaveLength(1)
+    expect(recordedRows.every((row) => isRecord(row) && row.source === "authoring:live")).toBe(true)
+  } finally {
+    env.appMcpServersEnabled = previous
+  }
 })
 
 test("normalizes JSON-encoded script input", async () => {
@@ -256,7 +312,8 @@ test("returns receipt metadata without changing legacy text or persisting raw ar
   expect(result.structuredContent).toMatchObject({
     value: { privateValue: "private-test-value" },
     metadata: { receiptId: expect.any(String), mode: "adhoc", executionType: "authoring-test", verification: "schema",
-      executedAt: expect.any(String), fetchedAt: expect.any(String), retention: { available: false, canSaveByReceipt: false } },
+      executedAt: expect.any(String), fetchedAt: expect.any(String),
+      retention: { available: true, canSaveByReceipt: true, scope: "process", ttlMs: 900_000 } },
   })
   expect(result.content).toHaveLength(2)
   const receipt = recordedRows.find((row) => isRecord(row) && row.source === "adhoc")

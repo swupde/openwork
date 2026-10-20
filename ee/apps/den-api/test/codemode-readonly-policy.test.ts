@@ -1,3 +1,4 @@
+import { createMockDenAuth } from "./fork-auth-fixture.js"
 import { afterAll, beforeAll, expect, mock, test } from "bun:test"
 import { Tool } from "@openwork/codemode"
 import { Effect } from "effect"
@@ -11,7 +12,7 @@ beforeAll(async () => {
   process.env.DEN_DB_ENCRYPTION_KEY ??= "x".repeat(32)
   process.env.BETTER_AUTH_SECRET ??= "y".repeat(32)
   process.env.BETTER_AUTH_URL ??= "http://127.0.0.1:8790"
-  mock.module("../src/auth.js", () => ({ auth: {} }))
+  mock.module("../src/auth.js", createMockDenAuth)
   restrict = (await import("../src/mcp/codemode-tools.js")).restrictReadOnlyCodemodeToolTree
 })
 

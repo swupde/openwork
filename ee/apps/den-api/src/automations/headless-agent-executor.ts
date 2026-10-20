@@ -10,11 +10,13 @@ import {
   defaultHeadlessRunnerDeps,
   type HeadlessRunnerClient,
   type RunnerMessage,
+  type RunnerRepeatLimits,
   type RunnerTurn,
 } from "../headless-runner/client.js"
 import { DEN_MCP_HEADLESS_RUN_TOKEN_MAX_TTL_MS } from "../mcp/headless-run-token.js"
 import type { CloudAgentEvent, CloudAgentExecution, CloudAgentExecutorInput } from "./cloud-agent-executor.js"
 import { cloudAutomationRuntime } from "./headless-runtime.js"
+import { organizationDefaultModel } from "../workbot/model.js"
 
 /**
  * Runs one cloud agent Automation on the shared headless runner.
@@ -34,6 +36,14 @@ const RESULT_SUMMARY_LIMIT = 20_000
 /** The token outlives the run's own deadline a little, so the last steps never lose MCP mid-call. */
 const TOKEN_GRACE_MS = 5 * 60_000
 
+/**
+ * Nobody is waiting on an Automation, but its run has a deadline: waiting on an unchanged answer gets a third of
+ * it (5 of the default 15 minutes), so the agent still has time to report before the run is cut off.
+ */
+export function automationRepeatLimits(maximumRuntimeMs: number): RunnerRepeatLimits {
+  return { maxWaitingMs: Math.min(Math.max(Math.floor(maximumRuntimeMs / 3), 10_000), 24 * 3_600_000), maxIdenticalFailures: 3 }
+}
+
 export const HEADLESS_AUTOMATION_INSTRUCTIONS = [
   "This conversation is one run of a scheduled Automation. Nobody is watching while it runs.",
   "Do the work the message describes, then reply with the result. Your reply is saved as the run's result, so lead with what matters and keep it short.",
@@ -47,6 +57,8 @@ export type HeadlessAgentExecutorDeps = {
   ownerUserId: (scope: OwnerScope) => Promise<string | null>
   /** Live check that the organization still runs Automations headless. */
   stillHeadless: (organizationId: string) => Promise<boolean>
+  /** The organization's default model for runs on the cloud default (workbotDefaultModel); null: the runner's. */
+  defaultModel: (organizationId: string) => Promise<string | null>
   sleep: (ms: number, signal: AbortSignal) => Promise<void>
   pollIntervalMs: number
 }
@@ -96,6 +108,7 @@ function defaultDeps(): HeadlessAgentExecutorDeps {
     client: runner ? createHeadlessRunnerClient(runner) : null,
     ownerUserId,
     stillHeadless: async (organizationId) => (await cloudAutomationRuntime(organizationId)) === "headless",
+    defaultModel: (organizationId) => organizationDefaultModel(organizationId),
     sleep: abortableSleep,
     pollIntervalMs: POLL_INTERVAL_MS,
   }
@@ -177,10 +190,16 @@ function turnFailure(turn: RunnerTurn, messages: RunnerMessage[]): CloudAgentExe
 
 /**
  * The member's own selection when the runner can serve it, otherwise the
- * runner's default model. Either way the run records which model it used.
+ * runner's default model. An Automation on the cloud default runs on the
+ * organization's default model when admins chose one, else the runner's
+ * default. Either way the run records which model it used.
  */
-async function chooseModel(client: HeadlessRunnerClient, model: { providerId: string; modelId: string }) {
-  if (isAutomationCloudDefaultModel(model)) return { model: undefined, warning: null }
+export async function chooseModel(
+  client: Pick<HeadlessRunnerClient, "listModels">,
+  model: { providerId: string; modelId: string },
+  organizationModel: string | null = null,
+) {
+  if (isAutomationCloudDefaultModel(model)) return { model: organizationModel ?? undefined, warning: null }
   const modelId = model.modelId
   const catalog = await client.listModels()
   if (!catalog) return { model: undefined, warning: null }
@@ -224,7 +243,11 @@ export async function executeHeadlessAgent(
     }
 
     if (!sessionId) {
-      const created = await client.createSession({ title: `Automation: ${input.automationName}`, instructions: HEADLESS_AUTOMATION_INSTRUCTIONS })
+      const created = await client.createSession({
+        title: `Automation: ${input.automationName}`,
+        instructions: HEADLESS_AUTOMATION_INSTRUCTIONS,
+        repeats: automationRepeatLimits(input.maximumRuntimeMs),
+      })
       // Nothing has run yet, so a runner outage here is safe to retry.
       if (!created.ok) return failure({ code: "execution_runtime_unavailable", message: "The headless runner is unavailable.", retryable: true })
       sessionId = created.value.id
@@ -232,7 +255,11 @@ export async function executeHeadlessAgent(
       await input.onAdmitted({ runtime: "headless", sessionId, messageId })
     }
 
-    const { model, warning } = await chooseModel(client, input.action.model)
+    // Read only for runs on the cloud default; a failed read keeps the runner's default for this run.
+    const organizationModel = isAutomationCloudDefaultModel(input.action.model)
+      ? await deps.defaultModel(input.organizationId).catch(() => null)
+      : null
+    const { model, warning } = await chooseModel(client, input.action.model, organizationModel)
     const ttlMs = Math.min(input.maximumRuntimeMs + TOKEN_GRACE_MS, DEN_MCP_HEADLESS_RUN_TOKEN_MAX_TTL_MS)
     const runSessionId = sessionId
     const sendTurn = () => client.sendTurn(actor, { sessionId: runSessionId, messageId, prompt: input.action.instructions, model, ttlMs })

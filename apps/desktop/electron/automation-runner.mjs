@@ -1,7 +1,13 @@
-import { createHeadlessThreadClient } from "@openwork/headless-threads"
+import { createHeadlessThreadClient, isHeadlessModelAccessError } from "@openwork/headless-threads"
 
 const EMPTY_USAGE = { inputTokens: null, outputTokens: null, costMicros: null }
 const RUNNER_WORK_POLL_MS = 60_000
+/** Inventory is gathered at most this often; it is sent only when it changed. */
+const INVENTORY_MIN_INTERVAL_MS = 2 * 60_000
+const INVENTORY_WORKSPACE_LIMIT = 50
+const INVENTORY_MODEL_LIMIT = 200
+const INVENTORY_REQUEST_TIMEOUT_MS = 10_000
+const INVENTORY_CONCURRENCY = 4
 
 function serializedError(value) {
   if (value instanceof Error) return value.message
@@ -16,7 +22,7 @@ export function classifyAutomationExecutionError(error) {
   if (error?.code === "model_access_lost") {
     return { code: "model_access_lost", message: raw }
   }
-  if (/ProviderModelNotFoundError/i.test(raw) || /model\s+not\s+found\s*:/i.test(raw)) {
+  if (isHeadlessModelAccessError(error)) {
     const identity = raw.match(/model\s+not\s+found\s*:\s*([^.,}\]"\n]+)/i)?.[1]?.trim()
     return {
       code: "model_access_lost",
@@ -169,7 +175,7 @@ function messageText(message) {
  * engine proxy routes the desktop UI and task recovery already use.
  * Returns undefined when the probe could not be read.
  */
-async function readRemoteSessionWaitingFor(local, workspaceId, sessionId, engine, fetchImpl, signal) {
+export async function readRemoteSessionWaitingFor(local, workspaceId, sessionId, engine, fetchImpl, signal) {
   const workspace = `/workspace/${encodeURIComponent(workspaceId)}`
   const session = encodeURIComponent(sessionId)
   const [permissionPath, questionPath] = engine === "v2"
@@ -360,6 +366,7 @@ export const REMOTE_SESSION_REQUEST_POLL = Object.freeze({
   activeWindowMs: 30 * 60_000,
 })
 export const REMOTE_SESSION_CONTROL_CAPABILITY = "remote_session_control_v1"
+export const REMOTE_SESSION_RECOVERY_CAPABILITY = "remote_session_recovery_v1"
 const TRANSCRIPT_TEXT_LIMIT = 20_000
 const TOOL_SUMMARY_LIMIT = 2_000
 const TOOL_CALLS_PER_MESSAGE_LIMIT = 200
@@ -567,7 +574,7 @@ function sleep(ms, signal) {
   })
 }
 
-async function requestJson(fetchImpl, baseUrl, token, requestPath, options = {}) {
+export async function requestJson(fetchImpl, baseUrl, token, requestPath, options = {}) {
   const response = await fetchImpl(`${baseUrl.replace(/\/+$/, "")}${requestPath}`, {
     method: options.method ?? "GET",
     headers: {
@@ -589,11 +596,13 @@ async function requestJson(fetchImpl, baseUrl, token, requestPath, options = {})
   return payload
 }
 
-function createWorkspaceSessionClient(local, workspaceId, fetchImpl) {
+export function createWorkspaceSessionClient(local, workspaceId, fetchImpl, requireModelAvailability = false, engine = undefined) {
   return createHeadlessThreadClient({
     baseUrl: local.baseUrl,
     workspaceId,
     token: local.token,
+    requireModelAvailability,
+    ...(engine ? { engine } : {}),
     // Automation run receipts own recovery; desktop restart must not independently
     // resume an occurrence that its scheduler may already have settled or retried.
     fetch: (input, init) => {
@@ -601,7 +610,7 @@ function createWorkspaceSessionClient(local, workspaceId, fetchImpl) {
       headers.set("x-openwork-task-recovery", "off")
       return fetchImpl(input, { ...init, headers })
     },
-    requestTimeoutMs: 0,
+    requestTimeoutMs: requireModelAvailability ? 15_000 : 0,
   })
 }
 
@@ -673,6 +682,40 @@ export function resolveAssignmentWorkspace(listed, pinnedWorkspaceId) {
   return workspace
 }
 
+/**
+ * Ids of the workspaces this desktop has, or null when the local runtime
+ * cannot say (it is starting, or unreachable).
+ */
+export async function listLocalWorkspaceIds(options) {
+  const local = await options.getLocalRuntime()
+  if (!local?.baseUrl || !local?.token) return null
+  const listed = await requestJson(options.fetchImpl ?? fetch, local.baseUrl, local.token, "/workspaces", { signal: options.signal })
+  const items = Array.isArray(listed?.items) ? listed.items : []
+  return new Set(items.flatMap((item) => (typeof item?.id === "string" && item.id ? [item.id] : [])))
+}
+
+/**
+ * Picks the first work item this desktop can run. A member may have many
+ * desktops and every one of them sees the same work, so a run pinned to a
+ * workspace this desktop lacks is left for the desktop that has it rather
+ * than claimed and failed here. Local workspaces are listed only when a pinned
+ * item appears; when they cannot be listed, pinned items wait for the next poll.
+ */
+export async function selectRunnableWorkItem(items, listWorkspaceIds) {
+  let workspaceIds
+  for (const item of Array.isArray(items) ? items : []) {
+    if (item?.kind === "remote_session_create") {
+      if (item.commandId) return item
+      continue
+    }
+    if (!item?.runId) continue
+    if (!item.workspaceId) return item
+    if (workspaceIds === undefined) workspaceIds = await listWorkspaceIds().catch(() => null)
+    if (workspaceIds?.has(item.workspaceId)) return item
+  }
+  return null
+}
+
 /** Runs the assignment as a normal visible local OpenWork thread. */
 export async function executeDesktopAutomation(assignment, options) {
   const local = await options.getLocalRuntime()
@@ -687,7 +730,7 @@ export async function executeDesktopAutomation(assignment, options) {
   const listed = await localRequest("/workspaces")
   const workspace = resolveAssignmentWorkspace(listed, assignment.workspaceId ?? null)
   const workspaceId = String(workspace.id)
-  const client = createWorkspaceSessionClient(local, workspaceId, options.fetchImpl ?? fetch)
+  const client = createWorkspaceSessionClient(local, workspaceId, options.fetchImpl ?? fetch, true)
   const created = await client.createThread({
     title: `Automation: ${assignment.automationName}`.slice(0, 120),
     ...(assignment.instructions ? { prompt: assignment.instructions } : {}),
@@ -753,10 +796,187 @@ export async function executeDesktopAutomation(assignment, options) {
   }
 }
 
+function trimmedText(value, limit) {
+  return typeof value === "string" && value.trim() ? value.trim().slice(0, limit) : null
+}
+
+/** Runs `task` over `items` with at most `limit` in flight, preserving order. */
+async function mapBounded(items, limit, task) {
+  const results = new Array(items.length)
+  let next = 0
+  const worker = async () => {
+    while (next < items.length) {
+      const index = next++
+      results[index] = await task(items[index])
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
+  return results
+}
+
+function modelsFromV1Providers(payload) {
+  const providers = Array.isArray(payload?.all) ? payload.all : []
+  const connected = Array.isArray(payload?.connected) ? new Set(payload.connected) : null
+  const models = []
+  for (const provider of providers) {
+    const providerId = trimmedText(provider?.id, 160)
+    if (!providerId || (connected && !connected.has(providerId))) continue
+    const entries = provider?.models && typeof provider.models === "object" ? Object.entries(provider.models) : []
+    for (const [key, model] of entries) {
+      const modelId = trimmedText(model?.id, 160) ?? trimmedText(key, 160)
+      if (!modelId) continue
+      models.push({ providerId, modelId, name: trimmedText(model?.name, 200) ?? modelId })
+    }
+  }
+  return models
+}
+
+function modelsFromV2Catalog(payload) {
+  const items = Array.isArray(payload) ? payload : Array.isArray(payload?.data) ? payload.data : []
+  return items.flatMap((model) => {
+    const providerId = trimmedText(model?.providerID, 160)
+    const modelId = trimmedText(model?.id, 160)
+    if (!providerId || !modelId) return []
+    return [{ providerId, modelId, name: trimmedText(model?.name, 200) ?? modelId }]
+  })
+}
+
+function defaultModelFrom(payload) {
+  const model = payload?.model
+  const providerId = trimmedText(model?.providerID, 160)
+  const modelId = trimmedText(model?.modelID, 160)
+  if (!providerId || !modelId) return null
+  const variant = trimmedText(model?.variant, 60)
+  return { providerId, modelId, ...(variant ? { variant } : {}) }
+}
+
+/**
+ * What this desktop has for remote-session callers: a friendly computer
+ * label and, per workspace, its engine, default model and usable models.
+ * Every source is optional: an endpoint this openwork-server lacks (404) or
+ * that fails reads as "nothing known" rather than failing the report. Returns
+ * null when the local runtime is not up yet.
+ */
+export async function collectDesktopInventory(options) {
+  const local = await options.getLocalRuntime()
+  if (!local?.baseUrl || !local?.token) return null
+  const computer = await options.describeComputer()
+  const localRequest = (requestPath) => requestJson(options.fetchImpl ?? fetch, local.baseUrl, local.token, requestPath, {
+    signal: options.signal
+      ? AbortSignal.any([options.signal, AbortSignal.timeout(INVENTORY_REQUEST_TIMEOUT_MS)])
+      : AbortSignal.timeout(INVENTORY_REQUEST_TIMEOUT_MS),
+  })
+  const optional = (requestPath) => localRequest(requestPath).catch(() => null)
+  const listed = await localRequest("/workspaces")
+  const status = await optional("/experimental/engine-v2-preview/status")
+  const engine = status?.enabled === true && status?.chatRouting === true ? "v2" : "v1"
+  const items = (Array.isArray(listed?.items) ? listed.items : [])
+    .filter((item) => typeof item?.id === "string" && item.id)
+    .slice(0, INVENTORY_WORKSPACE_LIMIT)
+  const workspaces = await mapBounded(items, INVENTORY_CONCURRENCY, async (item) => {
+    const base = `/workspace/${encodeURIComponent(item.id)}`
+    const [defaults, catalog] = await Promise.all([
+      optional(`${base}/default-model`),
+      optional(engine === "v2" ? `${base}/opencode2/api/model` : `${base}/opencode/provider`),
+    ])
+    const models = engine === "v2" ? modelsFromV2Catalog(catalog) : modelsFromV1Providers(catalog)
+    return {
+      workspaceId: String(item.id).slice(0, 240),
+      name: trimmedText(item.displayName, 120) ?? trimmedText(item.name, 120) ?? "Workspace",
+      active: item.id === listed?.activeId,
+      engine,
+      defaultModel: defaultModelFrom(defaults),
+      models: models.slice(0, INVENTORY_MODEL_LIMIT),
+    }
+  })
+  return {
+    computer: {
+      label: trimmedText(computer?.label, 120) ?? "Computer",
+      platform: computer.platform,
+      appVersion: trimmedText(computer?.appVersion, 80) ?? "unknown",
+    },
+    workspaces,
+  }
+}
+
+/**
+ * Describes this computer for remote-session callers. macOS has a
+ * user-visible computer name (System Settings > General > Sharing); other
+ * platforms, and a Mac whose name cannot be read, use the host name.
+ */
+export function createComputerDescriber(options) {
+  return async () => {
+    const named = options.platform === "darwin" && options.readComputerName
+      ? trimmedText(await options.readComputerName().catch(() => null), 120)
+      : null
+    let hostname = null
+    try { hostname = trimmedText(options.hostname(), 120) } catch { /* unnamed host */ }
+    return {
+      label: named ?? hostname ?? "Computer",
+      platform: options.platform,
+      appVersion: options.appVersion,
+    }
+  }
+}
+
+function workspaceUnavailable(workspaceId) {
+  const error = new Error(`Workspace ${workspaceId} is not available on this desktop`)
+  Object.defineProperty(error, "code", { value: "workspace_unavailable" })
+  return error
+}
+
+/**
+ * The desktop app is connected and took the command, but its local OpenWork
+ * server or engine is not answering. Den shows this code as final, so the
+ * caller does not queue the same task again until OpenWork is running.
+ */
+const LOCAL_RUNTIME_UNREACHABLE = Object.freeze({
+  code: "openwork_unreachable",
+  message: "Can't reach OpenWork on your desktop. Make sure OpenWork is running.",
+})
+
+/** Codes the local OpenWork server answers with when its engine is down or not started. */
+const LOCAL_ENGINE_DOWN_CODES = new Set(["opencode_unreachable", "opencode_engine_unreachable", "engine_v2_preview_not_running"])
+
+/** True only when the local runtime gave no answer, or said its engine is down; an engine's own error is not that. */
+function isLocalRuntimeUnreachable(error) {
+  if (error?.code === "runtime_unavailable" || error?.name === "TimeoutError") return true
+  // The session client keeps the server's code, or its whole body when the body uses `error`.
+  if (LOCAL_ENGINE_DOWN_CODES.has(error?.code) || LOCAL_ENGINE_DOWN_CODES.has(error?.body?.error)) return true
+  if (typeof error?.status === "number") return false
+  // No response at all: the session client's network failure, or a raw fetch that was refused, reset or timed out.
+  if (error?.code === "request_failed") return true
+  return /fetch failed|ECONNREFUSED|ECONNRESET|ETIMEDOUT|socket hang up|other side closed/i
+    .test(`${serializedError(error)} ${serializedError(error?.cause ?? "")}`)
+}
+
+/** The failure Den stores when a remote command could not start a local session. */
+export function classifyRemoteSessionCommandError(error) {
+  if (error?.code === "workspace_unavailable") {
+    return { code: "workspace_unavailable", message: serializedError(error).slice(0, REMOTE_SESSION_MESSAGE_LIMIT) }
+  }
+  const detail = serializedError(error)
+  // Once a session exists the task started; only a failure to start it is about reachability.
+  if (Reflect.get(Object(error), "sessionId") === undefined && isLocalRuntimeUnreachable(error)) {
+    return {
+      code: LOCAL_RUNTIME_UNREACHABLE.code,
+      message: `${LOCAL_RUNTIME_UNREACHABLE.message}${detail ? ` (details: ${detail.slice(0, 300)})` : ""}`,
+    }
+  }
+  return {
+    code: "execution_failed",
+    message: (detail || "Remote session creation failed").slice(0, REMOTE_SESSION_MESSAGE_LIMIT),
+  }
+}
+
 /** Delivers a remote command as a normal visible local OpenWork session. */
 export async function executeDesktopRemoteSession(assignment, options) {
   const local = await options.getLocalRuntime()
-  if (!local?.baseUrl || !local?.token) throw new Error("The desktop runtime is unavailable")
+  if (!local?.baseUrl || !local?.token) {
+    const error = new Error("The desktop runtime is unavailable")
+    Object.defineProperty(error, "code", { value: "runtime_unavailable" })
+    throw error
+  }
   const localRequest = (requestPath, request = {}) => requestJson(
     options.fetchImpl ?? fetch,
     local.baseUrl,
@@ -765,9 +985,15 @@ export async function executeDesktopRemoteSession(assignment, options) {
     { ...request, signal: options.signal },
   )
   const listed = await localRequest("/workspaces")
-  const workspaces = Array.isArray(listed?.items) ? listed.items : []
-  const workspace = workspaces.find((item) => item?.id === listed?.activeId) ?? workspaces[0]
-  if (!workspace?.id) throw new Error("No local workspace is available")
+  let workspace
+  try {
+    // The caller's chosen workspace must exist here, exactly like an
+    // Automation's pinned workspace; never fall back to the active one.
+    workspace = resolveAssignmentWorkspace(listed, assignment.workspaceId ?? null)
+  } catch (error) {
+    if (assignment.workspaceId) throw workspaceUnavailable(assignment.workspaceId)
+    throw error
+  }
   const workspaceId = String(workspace.id)
   const client = createWorkspaceSessionClient(local, workspaceId, options.fetchImpl ?? fetch)
   let sessionId = null
@@ -824,15 +1050,15 @@ function runnerTokenBinding(token) {
     const [payload, signature, extra] = String(token).split(".")
     if (!payload || !signature || extra) return null
     const decoded = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"))
-    const scope = [decoded?.o, decoded?.m, decoded?.r].every((value) => typeof value === "string")
-      ? `${decoded.o}\n${decoded.m}\n${decoded.r}`
+    const account = [decoded?.o, decoded?.m, decoded?.r].every((value) => typeof value === "string" && value.trim())
+      ? { organizationId: decoded.o, memberId: decoded.m, runnerId: decoded.r }
       : null
     // Den signs the capabilities it accepted at registration into the token.
     const capabilities = Array.isArray(decoded?.c) ? decoded.c.filter((value) => typeof value === "string") : []
-    if (decoded?.v === 1) return { version: 1, audience: null, scope, capabilities }
+    if (decoded?.v === 1) return { version: 1, audience: null, account, capabilities }
     if (decoded?.v !== 2 || typeof decoded.a !== "string") return null
     const audience = normalizeRunnerBaseUrl(decoded.a)
-    return audience ? { version: 2, audience, scope, capabilities } : null
+    return audience ? { version: 2, audience, account, capabilities } : null
   } catch {
     return null
   }
@@ -874,6 +1100,54 @@ export function createDesktopAutomationRunner(options) {
   let pendingConfiguration = null
   let stopped = false
   const rejectedCredentials = new Set()
+  // A native journal belongs to an account, not a short-lived token generation.
+  // Retiring a credential aborts its poll, but never drops recovery receipts.
+  const sessionRunners = new Map()
+
+  const inventoryMinIntervalMs = options.inventoryMinIntervalMs ?? INVENTORY_MIN_INTERVAL_MS
+  const now = options.now ?? Date.now
+
+  /**
+   * Tells Den what this desktop has, so remote-session callers can choose a
+   * computer, workspace and model. Sent once per credential (registration)
+   * and then only when it changed, gathered at most once per interval. Den
+   * versions without the endpoint answer 404 and are not asked again under
+   * this credential. A failure never affects polling for work.
+   */
+  const reportInventory = (state) => {
+    if (!options.describeComputer || state.inventoryUnsupported || state.inventoryInFlight || !isCurrent(state)) return
+    if (state.inventoryCheckedAt !== null && now() - state.inventoryCheckedAt < inventoryMinIntervalMs) return
+    state.inventoryCheckedAt = now()
+    state.inventoryInFlight = (async () => {
+      try {
+        const inventory = await collectDesktopInventory({
+          getLocalRuntime: options.getLocalRuntime,
+          describeComputer: options.describeComputer,
+          fetchImpl,
+          signal: state.controller.signal,
+        })
+        if (!inventory || !isCurrent(state)) {
+          // The local runtime is still starting: try again on the next poll.
+          if (!inventory) state.inventoryCheckedAt = null
+          return
+        }
+        const key = JSON.stringify(inventory)
+        if (key === state.inventoryKey) return
+        await runnerRequest(state, "/v1/automation-runner/inventory", {
+          method: "PUT",
+          body: inventory,
+          signal: AbortSignal.timeout(lifecycleRequestTimeoutMs),
+        })
+        state.inventoryKey = key
+      } catch (error) {
+        if (error?.status === 404) state.inventoryUnsupported = true
+        else options.log?.(`runner inventory report failed: ${serializedError(error)}`)
+      } finally {
+        state.inventoryInFlight = null
+        options.onInventoryReported?.()
+      }
+    })()
+  }
 
   const credentialKey = (configuration) => `${configuration.baseUrl}\n${configuration.token}`
   const isCurrent = (state) => !stopped
@@ -916,7 +1190,7 @@ export function createDesktopAutomationRunner(options) {
       throw state.controller.signal.reason ?? new Error("Automation runner generation retired")
     }
     try {
-      return await requestJson(
+      const payload = await requestJson(
         fetchImpl,
         state.configuration.baseUrl,
         state.configuration.token,
@@ -928,10 +1202,94 @@ export function createDesktopAutomationRunner(options) {
             : state.controller.signal,
         },
       )
+      // Decoding claims is not signature verification. Require a successful
+      // authenticated Den call before replaying any journalled native effects.
+      state.credentialValidated = true
+      return payload
     } catch (error) {
       if ([401, 403].includes(error?.status)) rejectCredential(state, error.status)
       throw error
     }
+  }
+
+  const getSessionRunner = (state) => {
+    if (!state.recoveryKey) throw new Error("Session recovery was not negotiated")
+    let entry = sessionRunners.get(state.recoveryKey)
+    if (entry) return entry.runner
+    entry = { runner: null, reconcilePromise: null, watching: true }
+    const recoveryKey = state.recoveryKey
+    const baseUrl = state.configuration.baseUrl
+    const account = state.account
+    // Loaded only after Den negotiated the feature-gated recovery capability;
+    // released and feature-off credentials keep the legacy path untouched.
+    entry.runner = (async () => {
+      const [{ createSessionRunner }, { createDesktopSessionAdapter }, journal] = await Promise.all([
+        import("@openwork/remote-sessions"),
+        import("./session-runner-adapter.mjs"),
+        import("./session-runner-journal.mjs"),
+      ])
+      const store = createDesktopSessionJournalStore(journal, baseUrl, account)
+      const deliver = (path, body, signal) => {
+        // Never capture a bearer in an outbox or this closure. Rotation within
+        // the signed account uses the current credential; switching accounts
+        // must not acknowledge the old account's work with the new token.
+        const live = current
+        if (!live || !isCurrent(live) || live.recoveryKey !== recoveryKey) {
+          throw new Error("The session runner account is not connected")
+        }
+        return runnerRequest(live, path, {
+          method: "POST",
+          body,
+          signal: AbortSignal.any([signal, AbortSignal.timeout(lifecycleRequestTimeoutMs)]),
+        }).then(() => undefined)
+      }
+      return createSessionRunner({
+        adapter: createDesktopSessionAdapter({
+          getLocalRuntime: options.getLocalRuntime, fetchImpl, now,
+          creationOwner: journal.desktopSessionRunnerPartition(baseUrl, account),
+        }),
+        store,
+        transport: {
+          complete: (id, body, signal) => deliver(`/v1/remote-session-commands/${encodeURIComponent(id)}/complete`, body, signal),
+          report: (id, body, signal) => deliver(`/v1/remote-session-commands/${encodeURIComponent(id)}/session`, body, signal),
+          completeRequest: (id, body, signal) => deliver(`/v1/remote-session-requests/${encodeURIComponent(id)}/complete`, body, signal),
+        },
+        now,
+      })
+    })().catch((error) => {
+      // Failed module/store initialization has no native effects. Retry the
+      // initialization next poll, without ever erasing an unreadable journal.
+      if (sessionRunners.get(recoveryKey) === entry) sessionRunners.delete(recoveryKey)
+      throw error
+    })
+    sessionRunners.set(recoveryKey, entry)
+    return entry.runner
+  }
+
+  const createDesktopSessionJournalStore = (journal, baseUrl, account) => {
+    const root = options.getJournalRoot()
+    const partition = journal.desktopSessionRunnerPartition(baseUrl, account)
+    return journal.createDesktopSessionJournal(root, partition)
+  }
+
+  const reconcileSessions = async (state) => {
+    if (!state.recoveryKey || !state.credentialValidated || !isCurrent(state)) return
+    const runner = await getSessionRunner(state)
+    const entry = sessionRunners.get(state.recoveryKey)
+    if (!entry || !isCurrent(state)) return
+    if (entry.reconcilePromise) return entry.reconcilePromise
+    const promise = (async () => {
+      await runner.reconcile(state.controller.signal)
+      const journal = await runner.inspect()
+      if (journal.commands.length > 192 || journal.requests.length > 192) await runner.prune()
+      entry.watching = journal.commands.some((command) => command.phase === "delivered" && (
+        !command.reportedProgress || !["idle", "error"].includes(command.reportedProgress.status)
+      ))
+    })().finally(() => {
+      if (entry.reconcilePromise === promise) entry.reconcilePromise = null
+    })
+    entry.reconcilePromise = promise
+    return promise
   }
 
   const heartbeat = async (state, active) => {
@@ -1071,6 +1429,23 @@ export function createDesktopAutomationRunner(options) {
     const controller = new AbortController()
     const active = { assignment, controller }
     state.active = active
+    if (state.recoveryKey) {
+      try {
+        const runner = await getSessionRunner(state)
+        await runner.accept(assignment, AbortSignal.any([state.controller.signal, controller.signal]))
+        state.lastRemoteActivityAt = now()
+        const entry = sessionRunners.get(state.recoveryKey)
+        if (entry) entry.watching = true
+      } finally {
+        if (state.active === active) state.active = null
+        if (isCurrent(state) && pendingConfiguration) {
+          const next = pendingConfiguration
+          pendingConfiguration = null
+          activateConfiguration(next)
+        }
+      }
+      return
+    }
     let result
     let delivered = null
     try {
@@ -1095,13 +1470,7 @@ export function createDesktopAutomationRunner(options) {
       // A session without a first turn has nothing to follow.
       if (result.status === "delivered" && output.started) delivered = output
     } catch (error) {
-      result = {
-        status: "failed",
-        error: {
-          code: "execution_failed",
-          message: (serializedError(error) || "Remote session creation failed").slice(0, 2_000),
-        },
-      }
+      result = { status: "failed", error: classifyRemoteSessionCommandError(error) }
     }
     try {
       await runnerRequest(state, `/v1/remote-session-commands/${encodeURIComponent(assignment.commandId)}/complete`, {
@@ -1196,6 +1565,19 @@ export function createDesktopAutomationRunner(options) {
     const assignment = claimed?.assignment
     if (!assignment?.requestId) return
     state.lastRemoteActivityAt = Date.now()
+    if (state.recoveryKey) {
+      const runner = await getSessionRunner(state)
+      const journal = await runner.inspect()
+      if (journal.commands.some((command) => command.command.commandId === assignment.commandId)) {
+        await runner.execute(assignment, state.controller.signal)
+        const entry = sessionRunners.get(state.recoveryKey)
+        if (entry && assignment.action === "send") entry.watching = true
+        return
+      }
+      // Sessions delivered by a released desktop predate the durable journal.
+      // Keep their existing controls usable, without pretending they can be
+      // recovered by (or recreating them in) the new core.
+    }
     const remainingMs = Number(assignment.expiresAt) - Date.now()
     let body
     let followUp = null
@@ -1282,8 +1664,12 @@ export function createDesktopAutomationRunner(options) {
   const remoteSessionRequestLoop = async (state) => {
     while (isCurrent(state)) {
       const active = state.watchers.size > 0
+        || (state.recoveryKey && (sessionRunners.get(state.recoveryKey)?.watching ?? true))
         || Date.now() - state.lastRemoteActivityAt < requestPoll.activeWindowMs
       if (active) {
+        await reconcileSessions(state).catch((error) => {
+          if (isCurrent(state)) options.log?.(`remote session recovery failed: ${serializedError(error)}`)
+        })
         try {
           await drainRemoteSessionRequests(state)
         } catch (error) {
@@ -1304,6 +1690,11 @@ export function createDesktopAutomationRunner(options) {
     if (state.reconcilePromise) return state.reconcilePromise
     const promise = (async () => {
       while (isCurrent(state)) {
+        // Remote progress has its own durable outbox. An offline native
+        // session or a retired Den command must not park scheduled Automations.
+        reconcileSessions(state).catch((error) => {
+          if (isCurrent(state)) options.log?.(`remote session recovery failed: ${serializedError(error)}`)
+        })
         // A machine that suspends mid-request can leave this socket half-open
         // with no error, which would park the loop until the process restarts.
         // Bounding the idle poll turns that into an ordinary retry.
@@ -1311,6 +1702,10 @@ export function createDesktopAutomationRunner(options) {
           signal: AbortSignal.timeout(workPollTimeoutMs),
         })
         if (!isCurrent(state)) break
+        // The first authenticated work response unlocks cold-boot recovery.
+        reconcileSessions(state).catch((error) => {
+          if (isCurrent(state)) options.log?.(`remote session recovery failed: ${serializedError(error)}`)
+        })
         const items = Array.isArray(response?.items) ? response.items : []
         // Session requests run beside the slot; the loop continues with the
         // first item that needs it.
@@ -1319,9 +1714,15 @@ export function createDesktopAutomationRunner(options) {
             options.log?.(`remote session request drain failed: ${serializedError(error)}`)
           })
         }
-        const item = items.find((entry) => entry?.kind !== "remote_session_request")
-        if (item?.kind === "remote_session_create") {
-          if (!item.commandId) break
+        // A run pinned to a workspace this desktop lacks is left for the
+        // owner's desktop that has it; request items are never selected here.
+        const item = await selectRunnableWorkItem(items, () => listLocalWorkspaceIds({
+          getLocalRuntime: options.getLocalRuntime,
+          fetchImpl,
+          signal: AbortSignal.any([state.controller.signal, AbortSignal.timeout(workPollTimeoutMs)]),
+        }))
+        if (!isCurrent(state) || !item) break
+        if (item.kind === "remote_session_create") {
           state.claimInFlight = true
           let claimed
           try {
@@ -1340,7 +1741,6 @@ export function createDesktopAutomationRunner(options) {
           await runRemoteSessionCommand(state, claimed.assignment)
           continue
         }
-        if (!item?.runId) break
         state.claimInFlight = true
         let claimed
         try {
@@ -1370,6 +1770,7 @@ export function createDesktopAutomationRunner(options) {
   const connectLoop = async (state) => {
     let reconnectAttempt = 0
     while (isCurrent(state)) {
+      reportInventory(state)
       try {
         await reconcile(state)
         reconnectAttempt = 0
@@ -1394,8 +1795,18 @@ export function createDesktopAutomationRunner(options) {
     generation += 1
     if (previous) retire(previous, new Error("Automation runner configuration changed"))
     if (!configuration || stopped) return
+    const binding = runnerTokenBinding(configuration.token)
+    const recoveryCapable = binding?.version === 2
+      && binding.account?.runnerId === configuration.runnerId
+      && binding.capabilities.includes(REMOTE_SESSION_RECOVERY_CAPABILITY)
+      && typeof options.getJournalRoot === "function"
+    const recoveryKey = recoveryCapable
+      ? JSON.stringify([configuration.baseUrl, binding.account.organizationId, binding.account.memberId, binding.account.runnerId])
+      : null
     const state = {
       generation,
+      account: binding?.account,
+      recoveryKey,
       configuration,
       controller: new AbortController(),
       reconcilePromise: null,
@@ -1408,6 +1819,11 @@ export function createDesktopAutomationRunner(options) {
       lastRemoteActivityAt: 0,
       retired: false,
       credentialRejected: false,
+      credentialValidated: false,
+      inventoryKey: null,
+      inventoryCheckedAt: null,
+      inventoryInFlight: null,
+      inventoryUnsupported: false,
     }
     current = state
     void connectLoop(state)
@@ -1472,6 +1888,7 @@ export function createDesktopAutomationRunner(options) {
     wake() {
       const state = current
       if (stopped || !state || !isCurrent(state)) return { polled: false }
+      reportInventory(state)
       reconcile(state).catch((error) => {
         options.log?.(`runner wake poll failed: ${error instanceof Error ? error.message : String(error)}`)
       })

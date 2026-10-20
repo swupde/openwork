@@ -9,7 +9,7 @@ import {
   type ToolAnnotations,
 } from "@modelcontextprotocol/server"
 import { eq } from "@openwork-ee/den-db/drizzle"
-import { OrganizationTable } from "@openwork-ee/den-db/schema"
+import type { CapabilityUsageVia } from "@openwork-ee/den-db/schema"
 import { normalizeDenTypeId } from "@openwork-ee/utils/typeid"
 import { openworkCloudMcpConnectionActionSchema } from "@openwork/types/den/mcp-connection-action"
 import type { Hono } from "hono"
@@ -20,11 +20,16 @@ import { connectorCatalogForQuery } from "./connector-catalog.js"
 import { registerAgentConnectionActionApp } from "./connection-action-app.js"
 import { publicRoute, tokenRoute } from "../middleware/index.js"
 import { db } from "../db.js"
-import { getMcpResourceContext, verifyMcpRequest } from "./auth.js"
+import { getMcpResourceContext, mcpPrincipalCredentialId, verifyMcpRequest, verifyMcpSubscriptionRequest } from "./auth.js"
+import { AUDIT_UNAVAILABLE_TOOL_MESSAGE, AuditUnavailableError, auditUnavailableToolResult, mcpAuditPrincipal, runMcpServiceAction, serviceAuditResourceId, serviceErrorStatus, toolResultStatus } from "../audit/mcp-service-audit.js"
 import { DEN_MCP_APP_HOST_SCOPE, DEN_MCP_WRITE_SCOPE } from "./scopes.js"
 import { getCatalog, protectedResourceMetadata, protectedResourceMetadataRoute } from "./index.js"
 import { preflightMcpJsonRpcRequest } from "./json-rpc-preflight.js"
 import { createScopedAgentMcpHttpHandlers } from "./agent-http.js"
+import { createRemoteSessionReceiptSubscriptions } from "./remote-session-receipt-watch.js"
+import { readRemoteSessionReceipt, registerRemoteSessionReceiptResources, REMOTE_SESSION_RECEIPT_INSTRUCTIONS } from "./remote-session-resources.js"
+import { databaseRemoteSessionCommandStore } from "../remote-sessions/commands.js"
+import { databaseRemoteSessionRequestStore } from "../remote-sessions/requests.js"
 import { rejectStandaloneSseResponse } from "./standalone-sse.js"
 import { appLogger } from "../observability/logger.js"
 import {
@@ -39,6 +44,7 @@ import { resolvePublicOrigin } from "../capability-sources/generic-oauth.js"
 import { automationService } from "../automations/service.js"
 import { AGENT_AUTOMATION_INDEX_LIMIT, registerAgentAutomationResources } from "./automation-index.js"
 import { env } from "../env.js"
+import { getOrganizationFeatures } from "../features.js"
 import { getOrganizationContextForUser, listTeamsForMember } from "../orgs.js"
 import { executeLiveArtifactWorkflow, getWorkflowDetail, getWorkflowSnapshot } from "../workflows.js"
 import { artifactFreshness } from "../workflow-artifacts.js"
@@ -60,6 +66,7 @@ import {
   externalCapabilityErrorToolResult,
   externalCapabilitySuccessToolResult,
   searchCapabilityRegistry,
+  workflowExecutionAuditStatus,
   type ExecuteCapabilityToolResult,
 } from "./capability-registry.js"
 import { executeWorkflowAuthoringTest, workflowAuthoringTestInputSchema } from "./workflow-authoring-test.js"
@@ -212,7 +219,8 @@ function agentMcpInstructions(appServers: boolean): string {
       ? "For connection actions and saved Workflows, search once with one precise query; search again only if there is no usable match or execution reports unknown_capability. Reuse exact capabilities already supplied in this task or by a loaded skill. Builder tools such as create_skill, prepare_app, and create_app are not capability search results; call them directly. Use execute_capability only with exact names returned by search_capabilities. A successful search_capabilities call proves this connection is authorized: Never tell the user to reconnect OpenWork Cloud because a downstream connector failed."
       : "For connection actions and saved Workflows, search once with one precise query; search again only if there is no usable match or execution reports unknown_capability. Reuse exact capabilities already supplied in this task or by a loaded skill. Direct MCP tools are not capability search results; call them directly. Use execute_capability only with exact names returned by search_capabilities. A successful search_capabilities call proves this connection is authorized: Never tell the user to reconnect OpenWork Cloud because a downstream connector failed.",
     "Capabilities include native Google Workspace operations (Gmail read/search, Calendar list/create, Drive search/read, and Gmail draft creation) executed with the signed-in member's organization credentials, plus any MCP connections the organization has added. Allowlisted platform admins also discover namespaced OpenWork Admin capabilities here; other members cannot.",
-    "A remote session is the member's OpenWork Web instance: a native OpenWork chat running in the cloud, visible in the browser. When asked to do something \"on the remote session\", \"in the web\", or \"in the cloud\" (e.g. \"run a Slack search for messages on the remote session\"), do not do the work here: execute remote-session:create with the whole request as prompt (or remote-session:send to an existing sessionId), then poll remote-session:read and relay the reply. target \"desktop\" runs it on the member's connected desktop instead and returns a commandId: poll remote-session:read with that commandId until state is failed or expired, or session.status is idle (relay session.finalText) or error (relay session.lastError). When session.status is waiting, tell the person to answer the session.waitingFor prompt (permission or question) in their OpenWork desktop. session stays null on desktops that do not report progress. For a desktop session, remote-session:read with its sessionId returns the transcript (page with from and nextCursor), remote-session:send sends a follow-up (then poll with the commandId again), and remote-session:stop stops it; if one of these returns state pending with a requestId, read that requestId later. remote-session:list with target desktop lists the member's desktop sessions. When the create result has resultPostedInThread: true (a Slack run), OpenWork itself posts the outcome to that Slack thread: tell the person so and end your turn instead of polling. For later status questions, call remote-session:read with the commandId instead of guessing.",
+    "A remote session offloads work to a native chat on OpenWork Cloud, an OpenWork desktop, or an opted-in OpenCode client. The default target is the member's OpenWork Web instance, running in the cloud and visible in the browser. When asked to do something \"on the remote session\", \"in the web\", or \"in the cloud\" (e.g. \"run a Slack search for messages on the remote session\"), do not do the work here: execute remote-session:create with the whole request as prompt (or remote-session:send to an existing sessionId), then poll remote-session:read and relay the reply. target \"desktop\" runs it on the member's connected desktop instead and returns a commandId: poll remote-session:read with that commandId until state is failed or expired, or session.status is idle (relay session.finalText) or error (relay session.lastError). When session.status is waiting, tell the person to answer the session.waitingFor prompt (permission or question) in their OpenWork desktop. session stays null on desktops that do not report progress. For a desktop session, remote-session:read with its sessionId returns the transcript (page with from and nextCursor), remote-session:send sends a follow-up (then poll with the commandId again), and remote-session:stop stops it; if one of these returns state pending with a requestId, read that requestId later. remote-session:list with target desktop lists the member's desktop sessions. When the request names a specific computer, workspace, or model, first execute remote-session:targets (includeModels true when a model matters), then pass its computerId, workspaceId, and model to remote-session:create with target \"desktop\"; remote-session:read with commandId reports which computer took it. When the create result has resultPostedInThread: true (a Slack run), OpenWork itself posts the outcome to that Slack thread: tell the person so and end your turn instead of polling. For later status questions, call remote-session:read with the commandId instead of guessing.",
+    "For an opted-in OpenCode client or another registered computer, call remote-session:targets first and use remote-session:create with target registered and its computerId (plus workspaceId/model when needed). This does not provision Cloud. Follow the same commandId/read/send/stop flow as desktop sessions. Native OpenCode reads expose recent context, not guaranteed history before compaction. Never blindly repeat a create whose outcome is unknown: inspect its commandId first; ambiguous_creation means a native session might exist and needs local inspection. Slack and chat use these same MCP capabilities and owner-scoped receipts; do not invent a separate bot registration or approval bypass.",
     "Use create_skill to create one private Cloud skill in a new Plugin, and update_skill to publish a new immutable version of an existing skill. Both return text and structured skill details; do not route these flows through execute_capability, postPlugins, or postConfigObjectsVersions.",
     "Skills have direct tools: list_skills returns every built-in and marketplace skill this member may use, and get_skill returns one skill's SKILL.md by its name or exact capability. Prefer them over keyword search for skills; search_capabilities with type skills and execute_capability still return the same skills, and the skill:// resources are unchanged.",
     "Built-in remote skills create-skill, share-plugin, add-to-marketplace, and add-user-to-marketplace are always listed by list_skills and in the skill index. Retrieve and follow the matching one with get_skill (or by executing its exact capability); do not invent a local copy.",
@@ -221,8 +229,8 @@ function agentMcpInstructions(appServers: boolean): string {
     appServers
       ? "A match with kind mcp_app is a standard MCP App: an App built in OpenWork, which is also its own MCP server, or an App from a connected MCP server. Execute that exact match through execute_capability and let compatible hosts render its ui:// resource. Never import, convert, or browse for a standalone HTML URL instead; standalone URL-imported Apps are not part of this release."
       : "A match with kind mcp_app is a standard MCP App from a connected MCP server: execute that exact match through execute_capability and let compatible hosts render its ui:// resource. Never import, convert, or browse for a standalone HTML URL instead; standalone URL-imported Apps are not part of this release.",
-    "To add a public GitHub plugin to an organization marketplace, search for the marketplace list, GitHub plugin import preview, GitHub plugin marketplace import, and resolved marketplace detail capabilities. Preview first; do not recreate the plugin by hand. Before importing, confirm the target marketplace, selected skill/server keys, and who can use them. Do not choose one authentication type for every server: the import route resolves known presets and plugin declarations, and the request authType is only a fallback for unknown servers.",
-    "After importing, retrieve the resolved marketplace detail and report each plugin's cloudReadiness. An import or plugin binding is not proof that an MCP connection is usable: relay needs_admin_setup or needs_signin as the next human action instead of claiming the connection is ready.",
+    "To add a public GitHub plugin to an organization marketplace, search for the marketplace list, GitHub plugin import preview, GitHub plugin marketplace import, and resolved marketplace detail capabilities. Preview first; do not recreate the plugin by hand. Before importing, confirm the target marketplace, selected skill/server keys, and who can use them; omitting selectedSkillKeys imports every supported skill. A marketplace repository (for example a Claude Cowork marketplace) lists each plugin in the preview: import one plugin per call with its folder URL (https://github.com/<owner>/<repo>/tree/<branch>/<plugin folder>). Importing the same plugin again from the same repository updates it in place (mode: updated, with updatedSkills and unchanged), so a migration can be re-run safely; skills and MCP servers deleted upstream since the last import are removed from the plugin and listed in removed, while components added by hand are kept. Do not choose one authentication type for every server: the import route resolves known presets and plugin declarations, and the request authType is only a fallback for unknown servers. Claude-specific connectors are mapped to what OpenWork already knows: each preview server reports mapsTo (a preset, or native Google Workspace / Microsoft 365) and reuse (the organization's existing connection it will use); tell the person it uses their existing <reuse.connectionName> connection instead of promising a new one. Servers skipped as native_connector are Claude-only; relay connecting that provider in OpenWork as the next step.",
+    "After importing, retrieve the resolved marketplace detail and report each plugin's cloudReadiness. An import or plugin binding is not proof that an MCP connection is usable: relay needs_admin_setup or needs_signin as the next human action instead of claiming the connection is ready. Connectors from Claude/Cowork plugins are optional: their skills work immediately, and get_skill lists each optional connection with how to connect it.",
     "Do not invent OAuth-client, credential, or local-extension setup. Organization connections are managed in the OpenWork Cloud dashboard / Settings > Connect; when a connection or marketplace readiness state requires administrator setup or member sign-in, relay that exact action.",
     "External MCP matches include the provider-advertised argumentsSchema, schemaDigest, and invocation.argumentsField. Put an object matching argumentsSchema in execute_capability.body and copy schemaDigest into execute_capability.schemaDigest. OpenWork always attempts the downstream provider call even when local schema checks find a mismatch; schemaGuidance is advisory (returned as openwork/schemaGuidance alongside provider results): if the provider succeeded, accept the result and do not retry because of the warning; if it failed, use the warning to correct the arguments or search again.",
     "If the provider returns invalid_capability_arguments, correct the listed issues and retry once with changed arguments; never retry the same arguments unchanged. If it returns unknown_capability, call search_capabilities again before retrying.",
@@ -253,7 +261,7 @@ async function mcpRequestInfo(request: Request): Promise<{ method: string | null
 export const AGENT_SKILL_INDEX_URI = "skill://index.json"
 export const AGENT_SKILL_INDEX_SCHEMA = "https://schemas.agentskills.io/discovery/0.2.0/schema.json"
 
-export function buildAgentSkillIndex(skills: RemoteSkillDescriptor[]) {
+export function buildAgentSkillIndex(skills: RemoteSkillDescriptor[], modelDiscovery = false) {
   return {
     $schema: AGENT_SKILL_INDEX_SCHEMA,
     skills: skills.map((skill) => ({
@@ -261,6 +269,7 @@ export function buildAgentSkillIndex(skills: RemoteSkillDescriptor[]) {
       type: "skill-md" as const,
       title: skill.title,
       description: skill.description,
+      modelDiscovery,
       url: skill.location,
       capability: skill.capability,
       ...(skill.marketplaceName ? { marketplaceName: skill.marketplaceName } : {}),
@@ -275,6 +284,7 @@ export async function readRemoteSkillSource(input: {
   organizationId: string
   member: Awaited<ReturnType<typeof resolveMcpMemberIdentity>>
   marketplaceEnabled?: boolean
+  usageVia: CapabilityUsageVia
 }): Promise<RemoteSkillSource> {
   const builtinResult = executeBuiltinSkillCapability(input.skill.capability)
   if (builtinResult) return { content: builtinResult.content, provenance: builtinResult.provenance }
@@ -286,11 +296,18 @@ export async function readRemoteSkillSource(input: {
     pluginId: marketplace.pluginId,
     configObjectId: marketplace.configObjectId,
     enabled: input.marketplaceEnabled,
+    usageVia: input.usageVia,
   })
-  if (!marketplaceResult.ok || marketplaceResult.result.kind !== "skill" || typeof marketplaceResult.result.content !== "string") {
+  if (!marketplaceResult.ok || marketplaceResult.result.kind !== "skill") return null
+  const result = marketplaceResult.result
+  if (typeof result.content !== "string") {
+    // Listed but withheld until its plugin is set up: say what unblocks it.
+    if (typeof result.status === "string" && typeof result.hint === "string") {
+      return { blocked: { status: result.status, message: result.hint, action: result.action ?? null } }
+    }
     return null
   }
-  return { content: marketplaceResult.result.content, provenance: marketplaceResult.result.provenance }
+  return { content: result.content, provenance: result.provenance }
 }
 
 const EXECUTE_CAPABILITY_TIMEOUT_MESSAGE = `The capability call exceeded ${EXECUTE_CAPABILITY_TIMEOUT_MS / 1_000}s. Retry once; if it times out again, narrow the request (fewer results, tighter query) and tell the user the service is slow — do NOT tell them to reconfigure or reconnect.`
@@ -366,7 +383,7 @@ export async function executeCapabilityWithBudget<T extends ExecuteCapabilityToo
   }
 }
 
-export function createAgentMcpServer(options: { appServers?: boolean } = {}): McpServer {
+export function createAgentMcpServer(options: { appServers?: boolean; remoteSessionEvents?: boolean } = {}): McpServer {
   return new McpServer({
     name: "openwork-den-api-agent",
     version: "1.0.0",
@@ -374,9 +391,10 @@ export function createAgentMcpServer(options: { appServers?: boolean } = {}): Mc
     capabilities: {
       ...workflowArtifactAppServerCapabilities,
       tools: { listChanged: true },
-      resources: { listChanged: true },
+      resources: { listChanged: true, ...(options.remoteSessionEvents ? { subscribe: true } : {}) },
     },
-    instructions: options.appServers === false ? LEGACY_AGENT_MCP_INSTRUCTIONS : AGENT_MCP_INSTRUCTIONS,
+    instructions: [options.appServers === false ? LEGACY_AGENT_MCP_INSTRUCTIONS : AGENT_MCP_INSTRUCTIONS,
+      ...(options.remoteSessionEvents ? [REMOTE_SESSION_RECEIPT_INSTRUCTIONS] : [])].join("\n"),
   })
 }
 
@@ -386,6 +404,7 @@ export function registerAgentSkillResources(input: {
   organizationId: string
   member: Awaited<ReturnType<typeof resolveMcpMemberIdentity>>
   marketplaceEnabled?: boolean
+  modelDiscovery?: boolean
 }) {
   input.server.registerResource("agent-skills-index", AGENT_SKILL_INDEX_URI, {
     title: "Available Agent Skills",
@@ -395,7 +414,7 @@ export function registerAgentSkillResources(input: {
     contents: [{
       uri: AGENT_SKILL_INDEX_URI,
       mimeType: "application/json",
-      text: JSON.stringify(buildAgentSkillIndex(input.skills)),
+      text: JSON.stringify(buildAgentSkillIndex(input.skills, input.modelDiscovery)),
     }],
   }))
   for (const skill of input.skills) {
@@ -409,9 +428,13 @@ export function registerAgentSkillResources(input: {
         organizationId: input.organizationId,
         member: input.member,
         marketplaceEnabled: input.marketplaceEnabled,
+        usageVia: "skill_resource",
       })
       if (!source) {
         throw new ProtocolError(ProtocolErrorCode.InvalidRequest, "Skill is no longer available")
+      }
+      if ("blocked" in source) {
+        throw new ProtocolError(ProtocolErrorCode.InvalidRequest, source.blocked.message)
       }
       return {
         contents: [{
@@ -448,6 +471,7 @@ export function registerAgentMcpRoutes<T extends { Variables: RequestIdVariables
   const handlers = createScopedAgentMcpHttpHandlers(
     (error) => agentMcpLogger.warn("Agent MCP transport error", { error }),
   )
+  const receiptSubscriptions = createRemoteSessionReceiptSubscriptions()
 
   app.get("/.well-known/oauth-protected-resource/mcp/agent", protectedResourceMetadataRoute("agent"), publicRoute, (c) =>
     c.json(protectedResourceMetadata(c.req.raw, "agent")))
@@ -485,18 +509,21 @@ export function registerAgentMcpRoutes<T extends { Variables: RequestIdVariables
     })
     const notificationScope = `${principal.organizationId}\0${principal.userId}`
     const organizationId = normalizeDenTypeId("organization", principal.organizationId)
-    const organizationRows = await db
-      .select({ metadata: OrganizationTable.metadata })
-      .from(OrganizationTable)
-      .where(eq(OrganizationTable.id, organizationId))
-      .limit(1)
-    const organizationMetadata = organizationRows[0]?.metadata
+    const organizationFeatures = await getOrganizationFeatures(organizationId)
     const connectMcpAppHostSupported = supportsConnectMcpAppHost(
       c.req.header(CONNECT_MCP_APP_HOST_CAPABILITY_HEADER),
     ) && principal.scopes.has(DEN_MCP_APP_HOST_SCOPE)
     const requestInfo = await mcpRequestInfo(c.req.raw)
     const method = requestInfo.method
     const redirectUriBase = resolvePublicOrigin(c.req.raw, env.apiPublicUrl)
+    // Direct service mutations below are audited for the verified token caller
+    // (organization claim + active member), never for tool arguments.
+    const auditPrincipal = mcpAuditPrincipal({
+      organizationId,
+      userId: principal.userId,
+      memberId: memberIdentity?.orgMembershipId,
+      credentialId: mcpPrincipalCredentialId(principal),
+    })
     const capabilityContext = createCapabilityRegistryContext({
       app: app as unknown as Hono,
       env: c.env,
@@ -506,13 +533,13 @@ export function registerAgentMcpRoutes<T extends { Variables: RequestIdVariables
       member: memberIdentity,
       redirectUriBase,
       generatedArtifactViewsEnabled: env.generatedArtifactViewsEnabled,
-      organizationMetadata,
-      mcpConnectionsGatingEnabled: env.mcpConnectionsGatingEnabled,
+      organizationFeatures,
+      audit: auditPrincipal,
     })
     const { externalMcpConnectionsEnabled } = capabilityContext
-    // Building your own Apps is per-organization and default-off; MCP Apps
+    // Building your own Apps follows the organization feature map; MCP Apps
     // from connected MCP servers work either way.
-    const appServersEnabled = appMcpServersEnabled(organizationMetadata)
+    const appServersEnabled = appMcpServersEnabled(organizationFeatures)
     // Resolved once per request, and only by the methods that need it: the
     // skill resources at discovery time, and list_skills / get_skill on call.
     let remoteSkillsPromise: Promise<RemoteSkillDescriptor[]> | null = null
@@ -577,17 +604,26 @@ export function registerAgentMcpRoutes<T extends { Variables: RequestIdVariables
       // Without the connection count, offer every App rather than call them all past the limit.
       return connections ? apps.slice(0, connectMcpServerIndexAppCapacity(connections.length)) : apps
     })()
-    const server = createAgentMcpServer({ appServers: appServersEnabled })
+    const receiptScope = { organizationId, createdByUserId: normalizeDenTypeId("user", principal.userId) }
+    const receiptStores = { commandStore: databaseRemoteSessionCommandStore, requestStore: databaseRemoteSessionRequestStore }
+    const remoteSessionEventsEnabled = Boolean(memberIdentity && organizationFeatures.remoteSessionEvents)
+    const server = createAgentMcpServer({ appServers: appServersEnabled, remoteSessionEvents: remoteSessionEventsEnabled })
+    if (remoteSessionEventsEnabled) registerRemoteSessionReceiptResources({ server, ...receiptStores, ...receiptScope })
     registerAgentConnectionActionApp(server, { organizationId: principal.organizationId, member: memberIdentity })
     if (appServersEnabled) {
       const appActor = (): PluginArchActorContext => {
         if (!libraryContext) throw new AppBuilderError("mcp_membership_revoked", "The OpenWork Cloud membership for this connection is unavailable.")
         return libraryContext
       }
+      const appAuditPrincipal = () => {
+        if (!auditPrincipal) throw new AppBuilderError("mcp_membership_revoked", "The OpenWork Cloud membership for this connection is unavailable.")
+        return auditPrincipal
+      }
       const appOperation = async <Result,>(run: () => Promise<Result>): Promise<Result> => {
         try {
           return await run()
         } catch (error) {
+          if (error instanceof AuditUnavailableError) throw new AppBuilderError("audit_unavailable", AUDIT_UNAVAILABLE_TOOL_MESSAGE)
           if (error instanceof McpAppError) throw new AppBuilderError(error.code, error.message)
           if (error instanceof PluginArchAuthorizationError) throw new AppBuilderError(error.error, error.message, error.reason)
           if (error instanceof PluginArchRouteFailure) {
@@ -608,8 +644,14 @@ export function registerAgentMcpRoutes<T extends { Variables: RequestIdVariables
             appActor()
             return appAuthoringStarter(request, tools)
           }),
-          create: (request) => appOperation(() => createMcpApp({ ...request, context: appActor(), resolveTools })),
-          update: (request) => appOperation(() => updateMcpApp({ ...request, context: appActor(), resolveTools })),
+          create: (request) => appOperation(() => {
+            const context = appActor()
+            return runMcpServiceAction("mcp_app.create", appAuditPrincipal(), null, () => createMcpApp({ ...request, context, resolveTools }))
+          }),
+          update: (request) => appOperation(() => {
+            const context = appActor()
+            return runMcpServiceAction("mcp_app.update", appAuditPrincipal(), serviceAuditResourceId(request.appId), () => updateMcpApp({ ...request, context, resolveTools }))
+          }),
           read: (request) => appOperation(() => readMcpApp({ ...request, context: appActor() })),
         },
         canOpen: async (appId) => (await loadOpenableApps()).some((app) => app.appId === appId),
@@ -649,6 +691,7 @@ export function registerAgentMcpRoutes<T extends { Variables: RequestIdVariables
       registerAgentSkillResources({
         server,
         skills: await loadRemoteSkills(),
+        modelDiscovery: organizationFeatures.implicitCloudSkills,
         organizationId: principal.organizationId,
         member: memberIdentity,
         marketplaceEnabled: externalMcpConnectionsEnabled,
@@ -770,6 +813,7 @@ export function registerAgentMcpRoutes<T extends { Variables: RequestIdVariables
         organizationId: principal.organizationId,
         member: memberIdentity,
         marketplaceEnabled: externalMcpConnectionsEnabled,
+        usageVia: "get_skill",
       }),
     })
 
@@ -783,7 +827,8 @@ export function registerAgentMcpRoutes<T extends { Variables: RequestIdVariables
             message: `Creating a skill requires the ${DEN_MCP_WRITE_SCOPE} scope.`,
           }
         }
-        if (!libraryContext) {
+        const skillContext = libraryContext
+        if (!skillContext || !auditPrincipal) {
           return {
             ok: false,
             error: "mcp_membership_revoked",
@@ -791,15 +836,17 @@ export function registerAgentMcpRoutes<T extends { Variables: RequestIdVariables
           }
         }
         try {
-          await requirePluginArchCapability(libraryContext, "plugin.create")
-          await requirePluginArchCapability(libraryContext, "config_object.create")
-          const plugin = await createPluginBundle({
-            context: libraryContext,
-            name: pluginName,
-            components: [{ type: "skill", value: { rawSourceText: skillMarkdown } }],
+          const plugin = await runMcpServiceAction("plugin.bundle.create", auditPrincipal, null, async () => {
+            await requirePluginArchCapability(skillContext, "plugin.create")
+            await requirePluginArchCapability(skillContext, "config_object.create")
+            return createPluginBundle({
+              context: skillContext,
+              name: pluginName,
+              components: [{ type: "skill", value: { rawSourceText: skillMarkdown } }],
+            })
           })
           const memberships = await listPluginMemberships({
-            context: libraryContext,
+            context: skillContext,
             pluginId: plugin.id,
             includeConfigObjects: true,
             onlyActive: true,
@@ -829,6 +876,7 @@ export function registerAgentMcpRoutes<T extends { Variables: RequestIdVariables
             },
           }
         } catch (error) {
+          if (error instanceof AuditUnavailableError) return { ok: false, error: "audit_unavailable", message: AUDIT_UNAVAILABLE_TOOL_MESSAGE }
           if (error instanceof PluginArchRouteFailure || error instanceof PluginArchAuthorizationError) {
             return { ok: false, error: error.error, message: error.message }
           }
@@ -843,7 +891,8 @@ export function registerAgentMcpRoutes<T extends { Variables: RequestIdVariables
             message: `Updating a skill requires the ${DEN_MCP_WRITE_SCOPE} scope.`,
           }
         }
-        if (!libraryContext) {
+        const skillContext = libraryContext
+        if (!skillContext || !auditPrincipal) {
           return {
             ok: false,
             error: "mcp_membership_revoked",
@@ -852,21 +901,28 @@ export function registerAgentMcpRoutes<T extends { Variables: RequestIdVariables
         }
         try {
           const configObjectId = normalizeDenTypeId("configObject", skillId)
-          const existing = await getConfigObjectDetail(libraryContext, configObjectId)
-          if (existing.objectType !== "skill") {
+          const versioned = await runMcpServiceAction("skill.version.create", auditPrincipal, serviceAuditResourceId(configObjectId), async () => {
+            const existing = await getConfigObjectDetail(skillContext, configObjectId)
+            if (existing.objectType !== "skill") return { created: false as const, objectType: existing.objectType }
+            return {
+              created: true as const,
+              detail: await createConfigObjectVersion({
+                context: skillContext,
+                configObjectId,
+                reason,
+                value: { rawSourceText: skillMarkdown },
+              }),
+            }
+          }, { result: (value) => value.created ? null : 400 })
+          if (!versioned.created) {
             return {
               ok: false,
               error: "not_a_skill",
-              message: `Config object "${skillId}" is a ${existing.objectType}, not a skill.`,
+              message: `Config object "${skillId}" is a ${versioned.objectType}, not a skill.`,
             }
           }
-          const detail = await createConfigObjectVersion({
-            context: libraryContext,
-            configObjectId,
-            reason,
-            value: { rawSourceText: skillMarkdown },
-          })
-          const memberships = await listConfigObjectPlugins({ context: libraryContext, configObjectId })
+          const detail = versioned.detail
+          const memberships = await listConfigObjectPlugins({ context: skillContext, configObjectId })
           const pluginId = memberships.items.find((membership) => membership.removedAt === null)?.pluginId
             ?? memberships.items[0]?.pluginId
           if (!pluginId) {
@@ -899,6 +955,7 @@ export function registerAgentMcpRoutes<T extends { Variables: RequestIdVariables
             },
           }
         } catch (error) {
+          if (error instanceof AuditUnavailableError) return { ok: false, error: "audit_unavailable", message: AUDIT_UNAVAILABLE_TOOL_MESSAGE }
           if (error instanceof PluginArchRouteFailure || error instanceof PluginArchAuthorizationError) {
             return { ok: false, error: error.error, message: error.message }
           }
@@ -922,7 +979,7 @@ export function registerAgentMcpRoutes<T extends { Variables: RequestIdVariables
       dataMode?: "live" | "snapshot"
       timeZone?: string
     }) => {
-      if (!artifactContext) {
+      if (!artifactContext || !auditPrincipal) {
         return {
           ok: false as const,
           error: "workflow_not_found",
@@ -934,11 +991,11 @@ export function registerAgentMcpRoutes<T extends { Variables: RequestIdVariables
           if (receiptId || !expectedOutputSchemaDigest) {
             return { ok: false as const, error: "invalid_arguments", message: "Live apps require a view schema and do not accept receipt overrides." }
           }
-          const execution = await executeLiveArtifactWorkflow({
+          const execution = await runMcpServiceAction("workflow.execute", auditPrincipal, serviceAuditResourceId(configObjectId), () => executeLiveArtifactWorkflow({
             context: artifactContext, configObjectId, expectedOutputSchemaDigest, timeZone,
             buildTools: () => buildCapabilityToolTree(capabilityContext),
             describeUnavailable: (missing) => liveArtifactConnectionFailure(capabilityContext, missing),
-          })
+          }), { result: workflowExecutionAuditStatus, error: serviceErrorStatus })
           if (!execution.ok) return execution
           if (!execution.receiptId) return { ok: false as const, error: "workflow_receipt_unavailable", message: "The live result could not be retained." }
           receiptId = execution.receiptId
@@ -1008,6 +1065,9 @@ export function registerAgentMcpRoutes<T extends { Variables: RequestIdVariables
           },
         }
       } catch (error) {
+        if (error instanceof AuditUnavailableError) {
+          return { ok: false as const, error: "audit_unavailable", message: AUDIT_UNAVAILABLE_TOOL_MESSAGE }
+        }
         if (error instanceof PluginArchAuthorizationError) {
           return {
             ok: false as const,
@@ -1047,7 +1107,8 @@ export function registerAgentMcpRoutes<T extends { Variables: RequestIdVariables
     // This server deploys independently from Desktop. Do not advertise or
     // serve bridge-dependent generated views until the compatible Desktop
     // MCP Apps host has been released and the operator enables the rollout.
-    if (artifactContext && env.generatedArtifactViewsEnabled) {
+    if (artifactContext && auditPrincipal && env.generatedArtifactViewsEnabled) {
+      const artifactAuditPrincipal = auditPrincipal
       const loadGeneratedResource = async ({ artifactViewId, revisionId }: { artifactViewId: string; revisionId: string }) => {
         const { revision } = await loadArtifactViewRevision({ context: artifactContext, artifactViewId, revisionId })
         if (revision.build_status !== "ready" || !revision.compiled_html || !revision.resource_digest) {
@@ -1062,9 +1123,12 @@ export function registerAgentMcpRoutes<T extends { Variables: RequestIdVariables
         loadResource: loadGeneratedResource,
         loadData: loadWorkflowArtifact,
         readSource: (request) => readArtifactViewSource({ context: artifactContext, ...request }),
-        save: (request) => saveArtifactViewRevision({ context: artifactContext, ...request }),
-        activate: (request) => activateArtifactViewRevision({ context: artifactContext, ...request }),
-        retire: (request) => retireArtifactView({ context: artifactContext, ...request }),
+        save: (request) => runMcpServiceAction("artifact_view.save", artifactAuditPrincipal, serviceAuditResourceId(request.artifactViewId),
+          () => saveArtifactViewRevision({ context: artifactContext, ...request }), { error: serviceErrorStatus }),
+        activate: (request) => runMcpServiceAction("artifact_view.activate", artifactAuditPrincipal, serviceAuditResourceId(request.artifactViewId),
+          () => activateArtifactViewRevision({ context: artifactContext, ...request }), { error: serviceErrorStatus }),
+        retire: (request) => runMcpServiceAction("artifact_view.deactivate", artifactAuditPrincipal, serviceAuditResourceId(request.artifactViewId),
+          () => retireArtifactView({ context: artifactContext, ...request }), { error: serviceErrorStatus }),
         notifyCatalogChanged: () => {
           handlers.notify.toolsChanged(notificationScope)
           handlers.notify.resourcesChanged(notificationScope)
@@ -1102,15 +1166,41 @@ export function registerAgentMcpRoutes<T extends { Variables: RequestIdVariables
       },
       async (request) => executeCapabilityWithBudget({
         capability: EXECUTE_CAPABILITY_SCRIPT_TOOL_NAME,
-        invoke: () => executeWorkflowAuthoringTest(request, {
-          organizationId,
-          orgMembershipId: memberIdentity?.orgMembershipId,
-          buildTools: () => buildCapabilityToolTree(capabilityContext),
-          recordRun: (receipt) => recordWorkflowRun(db, receipt),
-        }),
+        invoke: async (): Promise<ExecuteCapabilityToolResult> => {
+          if (!auditPrincipal) {
+            return { isError: true, content: textContent(JSON.stringify({ error: "membership_required", message: "Workflow tests require an active organization membership." })) }
+          }
+          try {
+            return await runMcpServiceAction("workflow_run.record", auditPrincipal, null, () => executeWorkflowAuthoringTest(request, {
+              organizationId,
+              orgMembershipId: memberIdentity?.orgMembershipId,
+              buildTools: () => buildCapabilityToolTree(capabilityContext),
+              recordRun: (receipt) => recordWorkflowRun(db, receipt),
+            }), { result: toolResultStatus })
+          } catch (error) {
+            if (error instanceof AuditUnavailableError) return auditUnavailableToolResult()
+            throw error
+          }
+        },
       }),
     )
 
-    return await handlers.fetch(notificationScope, c.req.raw, server)
+    const receiptStreamKey = Symbol("remote-session-receipt-stream")
+    return await receiptSubscriptions.fetch({
+      request: c.req.raw,
+      method,
+      scopeKey: notificationScope,
+      enabled: remoteSessionEventsEnabled,
+      expiresAt: typeof principal.payload.exp === "number" ? principal.payload.exp * 1_000 : 0,
+      read: (uri) => readRemoteSessionReceipt({ ...receiptStores, ...receiptScope, uri }),
+      revalidate: async (hasReceipts, signal) => {
+        const current = await verifyMcpSubscriptionRequest(c.req.raw.headers, getMcpResourceContext(c.req.raw, "agent", requestId), signal)
+        signal.throwIfAborted()
+        if (!current || current.userId !== principal.userId || current.organizationId !== principal.organizationId) return false
+        return !hasReceipts || (await getOrganizationFeatures(organizationId)).remoteSessionEvents
+      },
+      notify: (uri) => handlers.notify.resourceUpdated(notificationScope, uri, receiptStreamKey),
+      serve: (request) => handlers.fetch(notificationScope, request, server, receiptStreamKey),
+    })
   })
 }

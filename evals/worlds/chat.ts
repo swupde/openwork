@@ -193,13 +193,20 @@ export async function configureProvider(
   // Wait for navigation before starting the model-readiness evaluation;
   // scheduling location.reload() can run that evaluation in the old document.
   await reload(app);
+  // Provider data is visibility-gated. OAuth or another fixture window can
+  // retain foreground focus across reload, so activate the configured target
+  // before observing its model picker, just as a person opening the app does.
+  await app.client.send("Page.bringToFront");
   // The display name the app gives the configured model once its provider list
   // contains it; a fixture provider declares it in opencode.json, a live one is
   // read from the engine catalog.
-  const configuredModel = recordValue(recordValue(recordValue(opencode, "provider"), providerId), "models");
+  const configuredProvider = recordValue(recordValue(opencode, "provider"), providerId);
+  const configuredModel = recordValue(configuredProvider, "models");
   const configuredNameValue = recordValue(recordValue(configuredModel, modelId), "name");
   const configuredName = typeof configuredNameValue === "string" ? configuredNameValue : null;
-  const ready = await seed.evalIn(app, browserScript(async (workspaceId, engine, providerId, modelId, configuredName) => {
+  const providerNameValue = recordValue(configuredProvider, "name");
+  const providerName = typeof providerNameValue === "string" ? providerNameValue : null;
+  const ready = await seed.evalIn(app, browserScript(async (workspaceId, engine, providerId, modelId, configuredName, providerName) => {
     const deadline = Date.now() + 60000;
     const expectedRef = providerId + "/" + modelId;
     let observed = "";
@@ -232,18 +239,29 @@ export async function configureProvider(
           // list contains the configured model, and the stored default must
           // have survived boot rather than being replaced by an organization
           // model while that list was still loading.
-          const name = configuredName ?? catalogName ?? modelId;
-          const chip = document.querySelector<HTMLElement>('button[aria-label="Change model"]');
+          const configured = configuredName ?? catalogName ?? modelId;
+          // The app never shows an opaque gateway id as a name: it reads "<Provider> model" instead.
+          const name = /^(gwm|ipr)_/.test(configured) ? (providerName ? providerName + " model" : "Model") : configured;
+          // Retained conversations keep their composers mounted. Read the
+          // model a person can actually see, not a hidden earlier workspace's
+          // first button (which can legitimately still say "Select model").
+          const chip = [...document.querySelectorAll<HTMLElement>('button[aria-label="Change model"]')].find((element) => {
+            const rect = element.getBoundingClientRect();
+            const style = getComputedStyle(element);
+            return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.top < innerHeight
+              && rect.right > 0 && rect.left < innerWidth && style.display !== "none"
+              && style.visibility !== "hidden" && !element.closest('[aria-hidden="true"]');
+          });
           const chipText = chip?.innerText.trim() ?? "";
           const stored = localStorage.getItem("openwork.defaultModel");
-          observed = JSON.stringify({ composerModel: chipText, storedDefault: stored, expected: { name, ref: expectedRef } });
+          observed = JSON.stringify({ composerModel: chipText, storedDefault: stored, focused: document.hasFocus(), visibility: document.visibilityState, route: location.hash, expected: { name, ref: expectedRef } });
           if (stored === expectedRef && chipText.startsWith(name)) return true;
         }
       } catch {}
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
     return observed || false;
-  }, [workspaceId, engine, providerId, modelId, configuredName]), { awaitPromise: true, timeoutMs: 120_000 });
+  }, [workspaceId, engine, providerId, modelId, configuredName, providerName]), { awaitPromise: true, timeoutMs: 120_000 });
   if (ready !== true) {
     throw new Error(`Selected ${engine} engine did not become ready after provider configuration`
       + (typeof ready === "string" ? `; last observed ${ready}` : "."));
@@ -667,7 +685,6 @@ async function seedModelPicker(seed: Seed, options: { disabledAutoDesktop?: bool
   const app = options.disabledAutoDesktop
     ? await seed.desktop({ name: "model-picker-disabled-auto", den, as: "admin", env: {
       OPENWORK_ELECTRON_USE_MOCK_KEYCHAIN: "1", OPENWORK_DEV_MODE: "1",
-      OPENWORK_DEV_FREE_RELEASE_SECRET: "fixture-free-release-secret-000000000000000000",
       OPENWORK_FREE_INFERENCE_ORIGIN: new URL(witness.url).origin,
       OPENWORK_DEV_FREE_CONTROL_PLANE: den.ref.apiUrl,
       ...(options.disableAutoByEnvironment ? { OPENWORK_DISABLE_FREE_INFERENCE: "1" } : {}),
@@ -732,6 +749,13 @@ async function seedModelPicker(seed: Seed, options: { disabledAutoDesktop?: bool
 
 export function modelPicker(seed: Seed) {
   return seedModelPicker(seed);
+}
+
+/** The picker world plus the chord that opens the command palette on this platform. */
+export async function commandPaletteModels(seed: Seed) {
+  const world = await seedModelPicker(seed);
+  const paletteKey = await seed.evalIn(world.app, () => /Mac|iPhone|iPad|iPod/.test(navigator.platform) ? "Meta+K" : "Control+K");
+  return { ...world, paletteKey };
 }
 
 async function seedDisabledAutoPicker(seed: Seed, disableAutoByEnvironment: boolean) {

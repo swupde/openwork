@@ -30,7 +30,7 @@ src/
     └── domains/               Feature-scoped code, one folder per product domain
         ├── session/           chat/ surface/ sync/ composer, sidebar/, panel/, terminal/,
         │                      artifacts/, modals/, …
-        ├── workspace/         Create/rename/share workspace flows
+        ├── workspace/         Create/rename workspace flows
         ├── settings/          state/ + pages/ + modals/ (settings shell)
         ├── connections/       MCP + provider auth UI
         ├── cloud/             Den sign-in and cloud surfaces
@@ -61,14 +61,15 @@ Toasts are rendered with `sonner` (`@/components/ui/sonner`), mounted once via
 src/index.react.tsx                       React entry
   └─ QueryClientProvider + PlatformProvider
      └─ react-app/shell/providers.tsx     (AppProviders composition)
-        ServerProvider
-        └─ GlobalSDKProvider
-           └─ GlobalSyncProvider
-              └─ LocalProvider
-                 └─ react-app/shell/app-root.tsx → routes
-                    ├─ shell/session-route.tsx   → domains/session
-                    ├─ shell/settings-route.tsx  → domains/settings, connections
-                    └─ domains/{workspace,cloud,onboarding} flows
+        BootStateProvider
+        └─ ServerProvider
+           └─ DenAuthProvider
+              └─ ConnectLink / DesktopConfig / BrandTheme / RestrictionNotice
+                 └─ LocalProvider
+                    └─ react-app/shell/app-root.tsx → routes
+                       ├─ shell/session-route.tsx   → domains/session
+                       ├─ shell/settings-route.tsx  → domains/settings, connections
+                       └─ domains/{workspace,cloud,onboarding} flows
 ```
 
 ## State ownership

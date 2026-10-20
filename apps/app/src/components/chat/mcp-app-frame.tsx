@@ -21,6 +21,7 @@ import {
 } from "@/app/lib/openwork-server"
 import { useOptionalMessageList } from "./message-list-provider"
 import { createMcpAppActions, type McpAppOrigin } from "./mcp-app-origin"
+import { McpAppSignInPrompts, useMcpAppSignIn } from "./mcp-app-sign-in"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { t } from "@/i18n"
@@ -357,6 +358,9 @@ export function McpAppSandboxView({ origin, app, resolveLiveActions, toolName, i
   onErrorRef.current = onError
   const onReadyRef = useRef(onReady)
   onReadyRef.current = onReady
+  const signIn = useMcpAppSignIn(result)
+  const reportToolResultRef = useRef(signIn.reportToolResult)
+  reportToolResultRef.current = signIn.reportToolResult
   const toolDeliveryRef = useRef({ inputArguments, result })
   const deliverToolDataRef = useRef<(() => Promise<void>) | null>(null)
   const replacementInput = updateMode === "replace" ? inputArguments : null
@@ -526,8 +530,11 @@ export function McpAppSandboxView({ origin, app, resolveLiveActions, toolName, i
           if (disposed || failed) throw new Error("This artifact view has closed or changed.")
         }
         const userInteraction = _meta?.["openwork/userInteraction"] === true
-        if (connectionController) return await connectionController.callTool(actions, app, name, args, userInteraction)
-        return standardMcpToolResult(await actions.callTool(name, args, userInteraction))
+        const toolResult = connectionController
+          ? await connectionController.callTool(actions, app, name, args, userInteraction)
+          : standardMcpToolResult(await actions.callTool(name, args, userInteraction))
+        if (!disposed && !failed) reportToolResultRef.current(toolResult)
+        return toolResult
       } catch (cause) {
         if (cause instanceof OpenworkServerError && ["missing_launch_context", "stale_launch_context", "inactive_session"].includes(cause.code)) {
           fail("MCP_APP_LAUNCH_CONTEXT_STALE", "resource-resolution", cause, "Reopen the artifact in its original conversation before trying again.")
@@ -756,29 +763,38 @@ export function McpAppSandboxView({ origin, app, resolveLiveActions, toolName, i
     }
   }, [app, replacementInput, openworkServerClient, replacementResult, toolName, workspaceId, readOnly, origin, origin.sessionId, origin.engine, presentation, updateMode, connectionController, retryAttempt, resolveLiveActions])
 
-  if (error) return <McpAppDiagnosticNotice error={error} notice={unavailableNotice} onRetry={onRetry ?? (() => {
+  const reload = onRetry ?? (() => {
     setError(null)
     setRetryAttempt((attempt) => attempt + 1)
-  })} />
+  })
+  if (error) return <McpAppDiagnosticNotice error={error} notice={unavailableNotice} onRetry={reload} />
   return (
-    <div
-      className={cn(
-        presentation === "dashboard" ? "overflow-hidden" : "mt-3 overflow-hidden rounded-xl bg-background",
-        presentation !== "dashboard" && app.prefersBorder && "border border-border",
-      )}
-      data-mcp-app-resource={app.resourceUri}
-    >
-      <iframe
-        ref={iframeRef}
-        title={`${toolName} interactive view`}
-        sandbox="allow-scripts"
-        referrerPolicy="no-referrer"
-        className="block w-full border-0 bg-transparent"
-        inert={readOnly && Boolean(resolveLiveActions) || undefined}
-        aria-busy={readOnly && Boolean(resolveLiveActions) || undefined}
-        style={{ height: normalizeMcpAppHeight(height, MIN_HEIGHT) }}
-      />
-    </div>
+    <>
+      <McpAppSignInPrompts prompts={signIn.prompts} appTitle={signIn.appTitle} scope={app.resourceUri}
+        className={presentation === "dashboard" ? undefined : "mt-3"}
+        onSignedIn={(connectionId) => {
+          signIn.signedIn(connectionId)
+          reload()
+        }} />
+      <div
+        className={cn(
+          presentation === "dashboard" ? "overflow-hidden" : "mt-3 overflow-hidden rounded-xl bg-background",
+          presentation !== "dashboard" && app.prefersBorder && "border border-border",
+        )}
+        data-mcp-app-resource={app.resourceUri}
+      >
+        <iframe
+          ref={iframeRef}
+          title={`${toolName} interactive view`}
+          sandbox="allow-scripts"
+          referrerPolicy="no-referrer"
+          className="block w-full border-0 bg-transparent"
+          inert={readOnly && Boolean(resolveLiveActions) || undefined}
+          aria-busy={readOnly && Boolean(resolveLiveActions) || undefined}
+          style={{ height: normalizeMcpAppHeight(height, MIN_HEIGHT) }}
+        />
+      </div>
+    </>
   )
 }
 
@@ -869,7 +885,6 @@ function EmbeddedMcpAppFrame({ part, origin: surfaceOrigin }: { part: DynamicToo
 
   useEffect(() => {
     let cancelled = false
-    let previewActive = true
     const live = Promise.withResolvers<{ origin: McpAppOrigin; app: OpenworkMcpAppResource }>()
     // Discovery failure retires the preview through the existing error state.
     void live.promise.catch(() => undefined)
@@ -889,7 +904,6 @@ function EmbeddedMcpAppFrame({ part, origin: surfaceOrigin }: { part: DynamicToo
     consumedRetryToken.current = resolveToken
     const cancelDiscovery = scheduleCachedMcpAppDiscovery(origin, part.toolName, launch, manual,
         (resolved) => {
-          previewActive = false
           launchId = resolved?.launchId
           if (cancelled) { release(); return }
           // A preserved MCP result is neutral transport data. A null resolution
@@ -903,7 +917,6 @@ function EmbeddedMcpAppFrame({ part, origin: surfaceOrigin }: { part: DynamicToo
           else live.reject(new Error("This tool no longer advertises an App."))
         },
         (cause) => {
-          previewActive = false
           live.reject(cause)
           if (cancelled) return
           checkpoints.push(`resolve-failed+${Math.round(performance.now() - startedAt)}ms`)
@@ -926,14 +939,17 @@ function EmbeddedMcpAppFrame({ part, origin: surfaceOrigin }: { part: DynamicToo
           resolvedFor.current = resolution
           setApp(cached)
           setPreviewActions(() => async () => {
-            const current = await live.promise
-            if (!previewActive || cancelled) throw new Error("This artifact view has closed or changed.")
-            return current
+            await live.promise
+            // Live discovery always retires this cached document: the same
+            // commit mounts a replacement with its own lease. A startup call
+            // that waited here belongs to the retiring document, so leave it
+            // pending until teardown instead of rejecting it into an error
+            // the guest would render as a broken view.
+            return new Promise<never>(() => undefined)
           })
         })
     return () => {
       cancelled = true
-      previewActive = false
       cancelDiscovery()
       release()
     }

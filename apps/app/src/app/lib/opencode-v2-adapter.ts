@@ -1,4 +1,5 @@
 import type {
+  Agent,
   ApiError,
   ConfigProvidersResponse,
   FilePart,
@@ -23,7 +24,7 @@ import { isDesktopRuntime } from "./runtime-env";
 import type { McpStatusMap, OpencodeEvent } from "../types";
 import { normalizeDirectoryPath } from "../utils";
 import { dispatchProviderCatalogChanged } from "./provider-events";
-import { composeV2Prompt, splitV2Prompt, wrapPastedText } from "./v2-prompt-context";
+import { attachmentMarker, attachmentNoteFilenames, composeV2Prompt, splitV2Prompt, wrapPastedText, type PromptAttachment } from "./v2-prompt-context";
 
 type RequestOptions = {
   signal?: AbortSignal;
@@ -75,7 +76,12 @@ function partText(part: PromptPart): string | null {
  * transcript can show the words without them (see v2-prompt-context).
  */
 export function v2PromptText(parts: readonly PromptPart[]): string {
+  const attached = new Set(parts.flatMap((part) => {
+    const text = partText(part);
+    return text !== null && part.synthetic === true ? attachmentNoteFilenames(text) : [];
+  }));
   const words = parts.flatMap((part) => {
+    if (part.type === "file" && typeof part.filename === "string" && attached.has(part.filename)) return [attachmentMarker(part.filename)];
     const text = partText(part);
     if (text === null || part.synthetic === true) return [];
     return [isPastedText(part) ? wrapPastedText(text) : text];
@@ -485,6 +491,12 @@ function toolMetadata(
   callID: string,
   associations: TaskSessionAssociations,
 ): Record<string, unknown> {
+  // Engine progress replaces a running call's saved metadata, so a reload can
+  // find only the results plugin's per-call details. Rebuild the call list.
+  if (tool === "execute" && !Array.isArray(metadata.toolCalls) && Array.isArray(metadata.openworkToolDetails)) {
+    return { ...metadata, toolCalls: metadata.openworkToolDetails.flatMap((detail) => isRecord(detail) && typeof detail.tool === "string"
+      ? [{ tool: detail.tool, status: detail.status, ...(detail.input === undefined ? {} : { input: detail.input }) }] : []) };
+  }
   if (tool !== "subagent") return metadata;
   const explicit = readString(metadata, "sessionId")?.trim() || readString(metadata, "sessionID")?.trim();
   if (explicit) rememberTaskSession(associations, parentSessionID, messageID, callID, explicit);
@@ -790,19 +802,24 @@ function mapV2ReplyModel(value: Record<string, unknown>) {
 function mapV2UserPart(part: Part): Part[] {
   if (part.type !== "text") return [part];
   const { segments, context, attachments } = splitV2Prompt(part.text);
-  if (!context && !segments.some((segment) => segment.kind === "pasted")) return [part];
-  const words = segments.map((segment, index): Part => ({
-    ...part,
-    id: index === 0 ? part.id : `${part.id}:${index}`,
-    text: segment.text,
-    ...(segment.kind === "pasted" ? { metadata: { openworkPastedText: true } } : {}),
-  }));
+  if (!context && !segments.some((segment) => segment.kind !== "text")) return [part];
+  // A marked attachment shows where it was attached; the rest follow the words.
+  const unplaced: PromptAttachment[] = [...attachments];
+  const words = segments.map((segment, index): Part => {
+    const id = index === 0 ? part.id : `${part.id}:${index}`;
+    if (segment.kind !== "attachment") {
+      return { ...part, id, text: segment.text, ...(segment.kind === "pasted" ? { metadata: { openworkPastedText: true } } : {}) };
+    }
+    const at = unplaced.findIndex((item) => item.filename === segment.filename);
+    const placed = at < 0 ? [] : unplaced.splice(at, 1);
+    return { ...part, id, text: "", synthetic: true, ...(placed.length ? { metadata: { openworkAttachments: placed } } : {}) };
+  });
   return context === null ? words : [...words, {
     ...part,
     id: `${part.id}:context`,
     text: context,
     synthetic: true,
-    ...(attachments.length ? { metadata: { openworkAttachments: attachments } } : {}),
+    ...(unplaced.length ? { metadata: { openworkAttachments: unplaced } } : {}),
   }];
 }
 
@@ -824,7 +841,10 @@ function mapV2Message(
   const role = messageRole(value);
   const nativeParts = mapV2MessageParts(value, id, resolvedSessionID, created, taskSessions);
   const parts = role === "user" ? nativeParts.flatMap(mapV2UserPart) : nativeParts;
-  const error = readRecord(value, "error");
+  const rawError = readRecord(value, "error");
+  // v2 marks a stopped step with { type: "aborted", message: "Step interrupted" }.
+  // The person stopped it themselves, so it is not a failure worth a row.
+  const error = readString(rawError, "type") === "aborted" ? undefined : rawError;
   return {
     info: {
       id,
@@ -970,6 +990,30 @@ function mapV2Model(value: unknown): Model | null {
     options: {},
     headers: {},
     release_date: released === undefined ? "" : new Date(released).toISOString(),
+  };
+}
+
+/**
+ * Map a native v2 `/api/agent` row onto the v1 SDK `Agent` the picker expects.
+ * Use the API `id` as `name` — selection and `POST …/session/:id/agent` speak ids
+ * (`build`, `plan`), not the display title (`Build`, `Plan`).
+ */
+export function mapV2Agent(value: unknown): Agent | null {
+  if (!isRecord(value)) return null;
+  const id = readString(value, "id");
+  if (!id) return null;
+  const mode = readString(value, "mode");
+  if (mode !== "subagent" && mode !== "primary" && mode !== "all") return null;
+  const description = readString(value, "description");
+  const color = readString(value, "color");
+  return {
+    name: id,
+    mode,
+    hidden: value.hidden === true,
+    permission: [],
+    options: {},
+    ...(description ? { description } : {}),
+    ...(color ? { color } : {}),
   };
 }
 
@@ -1247,7 +1291,27 @@ export function createV2EventTranslationState(): V2EventTranslationState {
 
 function updateToolStreamMetadata(stream: ToolStream, properties: Record<string, unknown>): void {
   const metadata = readRecord(properties, "metadata") ?? readRecord(properties, "structured");
-  if (metadata) stream.metadata = metadata;
+  if (!metadata) return;
+  const previous = stream.metadata;
+  if (stream.tool !== "execute") { stream.metadata = metadata; return; }
+  stream.metadata = { ...previous, ...metadata };
+  // Native progress reports call lists as invocation-ordered prefixes. A
+  // later partial update must not erase retained results or regress a call.
+  for (const key of ["toolCalls", "openworkToolDetails"]) {
+    const oldCalls = previous[key];
+    const newCalls = metadata[key];
+    if (!Array.isArray(oldCalls) || !Array.isArray(newCalls)) continue;
+    stream.metadata[key] = Array.from({ length: Math.max(oldCalls.length, newCalls.length) }, (_, ordinal) => {
+      const old = oldCalls[ordinal];
+      const next = newCalls[ordinal];
+      if (!isRecord(old)) return next;
+      if (!isRecord(next)) return old;
+      if (old.tool !== next.tool || (key === "openworkToolDetails"
+        && (old.invocationId !== next.invocationId || old.ordinal !== next.ordinal))) return old;
+      if ((old.status === "completed" || old.status === "error") && next.status === "running") return old;
+      return { ...old, ...next };
+    });
+  }
 }
 
 export function translateV2Event(
@@ -1926,6 +1990,52 @@ export function createClientV2(
     return { payload: await readPayload(response), request: transportRequest, response };
   };
 
+  // The engine fails every prompt whose agent it does not define, such as
+  // v1's `openwork` kept by migrated chats and their forks, or a saved v1
+  // pick. Those run on the default agent, which the engine lists first.
+  // Agents are re-read only for a name the latest read did not answer, and a
+  // chat is checked once per client, so later sends cost no request.
+  let agentCatalog: Agent[] = [];
+  let agentsMissingFromCatalog = new Set<string>();
+  const readAgentCatalog = async (signal?: AbortSignal): Promise<TransportResult> => {
+    const result = await request("GET", "/api/agent", undefined, signal);
+    if (result.response.ok) {
+      agentCatalog = responseItems(result.payload).flatMap((item) => {
+        const agent = mapV2Agent(item);
+        return agent ? [agent] : [];
+      });
+      agentsMissingFromCatalog = new Set();
+    }
+    return result;
+  };
+  const checkedAgentSessions = new Set<string>();
+  const resolvePromptAgent = async (
+    sessionID: string,
+    picked: string | undefined,
+    signal?: AbortSignal,
+  ): Promise<{ agent?: string; known: boolean } | { failed: TransportResult }> => {
+    if (!picked && checkedAgentSessions.has(sessionID)) return { known: true };
+    let current: string | undefined;
+    if (!picked) {
+      const session = await request("GET", `/api/session/${encodeURIComponent(sessionID)}`, undefined, signal);
+      if (!session.response.ok) return { failed: session };
+      current = readString(responseData(session.payload), "agent");
+    }
+    const wanted = picked ?? current;
+    if (!wanted) return { known: true };
+    if (!agentCatalog.some((agent) => agent.name === wanted) && !agentsMissingFromCatalog.has(wanted)) {
+      const agents = await readAgentCatalog(signal);
+      if (!agents.response.ok) return { failed: agents };
+      if (agentCatalog.length && !agentCatalog.some((agent) => agent.name === wanted)) agentsMissingFromCatalog.add(wanted);
+    }
+    // A starting engine can list no agents yet; keep the choice then.
+    if (!agentCatalog.length) return { agent: picked, known: false };
+    const agent = agentCatalog.some((candidate) => candidate.name === wanted)
+      ? wanted
+      : agentCatalog.find((candidate) => candidate.mode !== "subagent" && !candidate.hidden)?.name ?? "build";
+    return { agent: agent === current ? undefined : agent, known: true };
+  };
+
   const listSessionPermissions = async (
     parameters: SessionParameters,
     options?: RequestOptions,
@@ -2028,7 +2138,7 @@ export function createClientV2(
     parameters: DirectoryParameters & { sessionID?: string } = {}, options?: RequestOptions,
   ): Promise<FieldsResult<QuestionRequest[]>> => {
     const path = parameters.sessionID
-      ? `/api/session/${encodeURIComponent(parameters.sessionID)}/form` : "/api/form/request";
+      ? `/api/session/${encodeURIComponent(parameters.sessionID)}/form` : "/api/form";
     const result = await request("GET", path, undefined, options?.signal);
     if (!result.response.ok) return failedResult(result);
     const questions = responseItems(result.payload).flatMap((item) => {
@@ -2064,7 +2174,7 @@ export function createClientV2(
     const question = questionFormsByID.get(parameters.requestID);
     if (!question) return {
       error: { name: "QuestionNotFound", requestID: parameters.requestID },
-      request: new Request(`${baseUrl}/api/form/request`),
+      request: new Request(`${baseUrl}/api/form`),
       response: new Response(null, { status: 404 }),
     };
     const answer = parameters.answers ? Object.fromEntries(question.fields.map((field, index) => {
@@ -2072,8 +2182,8 @@ export function createClientV2(
         field.options.find((option) => option.label === label)?.value ?? label);
       return [field.key, field.multiple ? values : values[0] ?? ""];
     })) : undefined;
-    const result = await request("POST",
-      `/api/session/${encodeURIComponent(question.request.sessionID)}/form/${encodeURIComponent(parameters.requestID)}/${answer ? "reply" : "cancel"}`,
+    const result = await request(answer ? "POST" : "DELETE",
+      `/api/session/${encodeURIComponent(question.request.sessionID)}/form/${encodeURIComponent(parameters.requestID)}${answer ? "/reply" : ""}`,
       answer ? { answer } : undefined, options?.signal);
     if (!result.response.ok) return failedResult(result);
     questionFormsByID.delete(parameters.requestID);
@@ -2273,20 +2383,34 @@ export function createClientV2(
           return unsupportedResult(baseUrl, "skill.attachment", message);
         }
       }
-      const modelResult = await request(
-        "POST",
-        `/api/session/${encodeURIComponent(parameters.sessionID)}/model`,
-        { model: {
-          providerID: parameters.model.providerID,
-          id: parameters.model.modelID,
-          ...(parameters.variant === undefined ? {} : { variant: parameters.variant }),
-        } },
-        options?.signal,
-      );
+      const [modelResult, agentResolution] = await Promise.all([
+        request(
+          "POST",
+          `/api/session/${encodeURIComponent(parameters.sessionID)}/model`,
+          { model: {
+            providerID: parameters.model.providerID,
+            id: parameters.model.modelID,
+            ...(parameters.variant === undefined ? {} : { variant: parameters.variant }),
+          } },
+          options?.signal,
+        ),
+        resolvePromptAgent(parameters.sessionID, parameters.agent, options?.signal),
+      ]);
       if (!modelResult.response.ok) return failedResult(modelResult);
+      if ("failed" in agentResolution) return failedResult(agentResolution.failed);
+      if (agentResolution.agent) {
+        const agentResult = await request(
+          "POST",
+          `/api/session/${encodeURIComponent(parameters.sessionID)}/agent`,
+          { agent: agentResolution.agent },
+          options?.signal,
+        );
+        if (!agentResult.response.ok) return failedResult(agentResult);
+      }
+      if (agentResolution.known) checkedAgentSessions.add(parameters.sessionID);
       if (parameters.system !== undefined) {
         const instructions = await request("PUT",
-          `/api/session/${encodeURIComponent(parameters.sessionID)}/instructions/entries/openwork-context`,
+          `/api/experimental/session/${encodeURIComponent(parameters.sessionID)}/instructions/entries/openwork-context`,
           { value: parameters.system }, options?.signal);
         if (!instructions.response.ok) return failedResult(instructions);
       }
@@ -2328,8 +2452,8 @@ export function createClientV2(
       }
       if (!parameters.title) return getSession(parameters, options);
       const result = await request(
-        "POST",
-        `/api/session/${encodeURIComponent(parameters.sessionID)}/rename`,
+        "PATCH",
+        `/api/session/${encodeURIComponent(parameters.sessionID)}`,
         { title: parameters.title },
         options?.signal,
       );
@@ -2376,7 +2500,7 @@ export function createClientV2(
       parameters: SessionParameters,
       options?: RequestOptions,
     ): Promise<FieldsResult<Session>> => {
-      const result = await request("POST", `/api/session/${encodeURIComponent(parameters.sessionID)}/revert/clear`, undefined, options?.signal);
+      const result = await request("DELETE", `/api/session/${encodeURIComponent(parameters.sessionID)}/revert`, undefined, options?.signal);
       return result.response.ok ? getSession(parameters, options) : failedResult(result);
     },
     summarize: async (): Promise<FieldsResult<boolean>> => unsupportedResult(baseUrl, "session.summarize"),
@@ -2434,11 +2558,11 @@ export function createClientV2(
   const adapter = {
     global: {
       health: async (options?: RequestOptions): Promise<FieldsResult<{ healthy: boolean; version: string }>> => {
-        const result = await request("GET", "/api/health", undefined, options?.signal);
+        const result = await request("GET", "/api/info", undefined, options?.signal);
         if (!result.response.ok) return failedResult(result);
         const data = responseData(result.payload);
         return successfulResult(result, {
-          healthy: isRecord(data) && data.healthy === true,
+          healthy: isRecord(data) && typeof data.version === "string" && typeof data.pid === "number",
           version: readString(data, "version") ?? "v2",
         });
       },
@@ -2461,7 +2585,13 @@ export function createClientV2(
       list: (parameters?: DirectoryParameters, options?: RequestOptions) => listProviders(parameters, options),
     },
     app: {
-      agents: async (): Promise<FieldsResult<never[]>> => localResult(baseUrl, "/api/agent", []),
+      agents: async (
+        _parameters: DirectoryParameters = {},
+        options?: RequestOptions,
+      ): Promise<FieldsResult<Agent[]>> => {
+        const result = await readAgentCatalog(options?.signal);
+        return result.response.ok ? successfulResult(result, agentCatalog) : failedResult(result);
+      },
     },
     command: {
       list: async (): Promise<FieldsResult<never[]>> => localResult(baseUrl, "/api/command", []),

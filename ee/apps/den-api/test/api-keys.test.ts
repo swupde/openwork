@@ -1,7 +1,9 @@
-import { beforeAll, expect, test } from "bun:test"
+import { afterAll, beforeAll, expect, mock, test } from "bun:test"
+import { createMockDenAuth } from "./fork-auth-fixture.js"
 
 function seedRequiredEnv() {
-  process.env.DATABASE_URL = process.env.DATABASE_URL ?? "mysql://root:password@127.0.0.1:3306/openwork_test"
+  process.env.DATABASE_URL = "mysql://fixture:fixture@127.0.0.1:1/not_connected"
+  process.env.DB_MODE = "mysql"
   process.env.DEN_DB_ENCRYPTION_KEY = process.env.DEN_DB_ENCRYPTION_KEY ?? "x".repeat(32)
   process.env.BETTER_AUTH_SECRET = process.env.BETTER_AUTH_SECRET ?? "y".repeat(32)
   process.env.BETTER_AUTH_URL = process.env.BETTER_AUTH_URL ?? "http://127.0.0.1:8790"
@@ -11,8 +13,14 @@ let apiKeyModule: typeof import("../src/api-keys.js")
 
 beforeAll(async () => {
   seedRequiredEnv()
+  mock.module("../src/auth.js", createMockDenAuth)
+  mock.module("../src/db.js", () => ({
+    db: new Proxy({}, { get: () => { throw new Error("API key policy tests must not access a database.") } }),
+  }))
   apiKeyModule = await import("../src/api-keys.js")
 })
+
+afterAll(() => mock.restore())
 
 test("organization API key TTL is finite", () => {
   expect(apiKeyModule.DEN_API_KEY_EXPIRES_IN_DAYS).toBe(90)
