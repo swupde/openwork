@@ -537,7 +537,7 @@ export function registerAgentMcpRoutes<T extends { Variables: RequestIdVariables
       audit: auditPrincipal,
     })
     const { externalMcpConnectionsEnabled } = capabilityContext
-    // Building your own Apps is per-organization and default-off; MCP Apps
+    // Building your own Apps follows the organization feature map; MCP Apps
     // from connected MCP servers work either way.
     const appServersEnabled = appMcpServersEnabled(organizationFeatures)
     // Resolved once per request, and only by the methods that need it: the

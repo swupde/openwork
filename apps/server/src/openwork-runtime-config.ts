@@ -58,7 +58,7 @@ export async function buildOpenworkRuntimeConfigObject(
   const runtimeConfig = config ? await readGlobalRuntimeOpencodeConfig(config) : {};
   const result = buildOpenworkRuntimeConfigObjectFromSnapshot(runtimeConfig);
   const workspace = config && workspaceId
-    ? config.workspaces.find((entry) => entry.id === workspaceId && entry.workspaceType !== "remote" && entry.path.trim())
+    ? config.workspaces.find((entry) => entry.id === workspaceId && (entry.workspaceType ?? "local") === "local" && entry.path.trim())
     : undefined;
   if (!config || !workspace) return result;
 
@@ -194,7 +194,7 @@ const managedRuntimeWorkspaceIds = new WeakMap<ServerConfig, string>();
 
 function managedRuntimeWorkspaceId(config: ServerConfig): string | undefined {
   const cached = managedRuntimeWorkspaceIds.get(config);
-  if (cached && config.workspaces.some((workspace) => workspace.id === cached && workspace.workspaceType !== "remote" && workspace.path.trim())) {
+  if (cached && config.workspaces.some((workspace) => workspace.id === cached && (workspace.workspaceType ?? "local") === "local" && workspace.path.trim())) {
     return cached;
   }
   const workspaceId = findManagedEngineWorkspace(config.workspaces)?.id;

@@ -1,3 +1,4 @@
+import { createMockDenAuth } from "./fork-auth-fixture.js"
 import { afterAll, beforeAll, beforeEach, expect, mock, spyOn, test } from "bun:test"
 import {
   ConfigObjectTable,
@@ -15,6 +16,7 @@ import type { WorkflowAuthoringSourceInput } from "../src/workflow-authoring-rec
 import type { BuiltCodemodeTools } from "../src/mcp/codemode-tools.js"
 import type { PluginArchActorContext } from "../src/routes/org/plugin-system/access.js"
 import type { SaveWorkflowInput } from "../src/workflows.js"
+import { resolveFeatures } from "@openwork/features"
 
 type Workflows = typeof import("../src/workflows.js")
 type RoleRequest = Parameters<typeof import("../src/routes/org/plugin-system/access.js").requirePluginArchResourceRole>[0]
@@ -69,7 +71,7 @@ beforeAll(async () => {
   process.env.DEN_DB_ENCRYPTION_KEY ??= "x".repeat(32)
   process.env.BETTER_AUTH_SECRET ??= "y".repeat(32)
   process.env.BETTER_AUTH_URL ??= "http://127.0.0.1:8790"
-  mock.module("../src/auth.js", () => ({ auth: {} }))
+  mock.module("../src/auth.js", createMockDenAuth)
   mock.module("../src/db.js", () => ({ db: database }))
   const access = await import("../src/routes/org/plugin-system/access.js")
   mock.module("../src/routes/org/plugin-system/access.js", () => ({
@@ -142,6 +144,7 @@ async function fixture(options: { mode?: "adhoc" | "live"; currentInput?: unknow
         createdAt: now, joinedAt: now, isOwner: false,
       },
       invitations: [], members: [], roles: [], teams: [],
+      features: resolveFeatures({ deployment: "self_hosted", locks: {}, rollouts: {}, overrides: {} }),
     },
   }
   const buildTools = async (): Promise<BuiltCodemodeTools> => { toolBuilds += 1; return { tools: {}, manifest: [] } }

@@ -286,7 +286,7 @@ describe("runtime provider env names", () => {
       apiKeys: { AZURE_RESOURCE_NAME: "resource", AZURE_API_KEY: "secret" },
     }
     const runtime = toRuntimeProviderEnv(stored)
-    expect(runtime.providerConfig).toEqual({ id: "azure", env: ["LPR_120JV_AZURE_RESOURCE_NAME", "LPR_120JV_AZURE_API_KEY"] })
+    expect(runtime.providerConfig).toEqual({ id: "azure", env: ["LPR_120JV_AZURE_RESOURCE_NAME", "LPR_120JV_AZURE_API_KEY"], options: { apiKey: "{env:LPR_120JV_AZURE_API_KEY}", resourceName: "{env:LPR_120JV_AZURE_RESOURCE_NAME}" } })
     expect(runtime.apiKeys).toEqual({ LPR_120JV_AZURE_RESOURCE_NAME: "resource", LPR_120JV_AZURE_API_KEY: "secret" })
     expect(stored.providerConfig.env).toEqual(["AZURE_RESOURCE_NAME", "AZURE_API_KEY"])
     expect(Object.keys(stored.apiKeys)).toEqual(["AZURE_RESOURCE_NAME", "AZURE_API_KEY"])

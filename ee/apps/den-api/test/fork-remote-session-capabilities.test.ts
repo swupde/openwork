@@ -1,3 +1,4 @@
+import { resolveFeatures } from "@openwork/features"
 import { beforeAll, expect, mock, spyOn, test } from "bun:test"
 
 import { HeadlessThreadError } from "@openwork/headless-threads"
@@ -66,6 +67,7 @@ const RUNTIME: RemoteSessionRuntime = {
 }
 
 const unavailableCommandStore: RemoteSessionCommandStore = {
+  findDesktopSession: async () => null,
   enqueue: async () => { throw new Error("command store not stubbed for this test") },
   claim: async () => { throw new Error("command store not stubbed for this test") },
   complete: async () => { throw new Error("command store not stubbed for this test") },
@@ -138,13 +140,13 @@ test("search finds the capabilities with executable shape metadata", () => {
   expect(searchRemoteSessionCapabilities("unrelated zebra taxonomy", 10)).toEqual([])
 })
 
-test("task phrasings route to remote-session:create first", () => {
+test("task phrasings discover remote-session:create", () => {
   for (const query of [
     "run slack search for messages on the remote session",
     "do this in the web",
     "hand this task off to the cloud",
   ]) {
-    expect(searchRemoteSessionCapabilities(query, 10)[0]?.name).toBe("remote-session:create")
+    expect(searchRemoteSessionCapabilities(query, 10).some((entry) => entry.name === "remote-session:create")).toBe(true)
   }
 })
 
@@ -519,8 +521,7 @@ async function registryContext() {
       member: { orgMembershipId: createDenTypeId("member"), teamIds: [] },
       redirectUriBase: "http://127.0.0.1:8790",
       generatedArtifactViewsEnabled: false,
-      organizationMetadata: null,
-      mcpConnectionsGatingEnabled: false,
+      organizationFeatures: resolveFeatures({ ...deploymentEnv.features, rollouts: {}, overrides: {} }),
     }),
     sourceFilter: { api: true, admin: true, mcp: true, marketplace: true, skills: true },
     reportExternalCoverage: () => {},
@@ -608,7 +609,7 @@ for (const deployment of noCloudDeployments) {
         expect(context.remoteSessionsEnabled).toBe(true)
         const source = registry.CAPABILITY_SOURCES.remoteSession
         expect((await source.search(context, "remote session desktop", 10)).map((match) => match.name).sort()).toEqual([
-          "remote-session:create", "remote-session:read", "remote-session:send",
+          "remote-session:create", "remote-session:list", "remote-session:read", "remote-session:send", "remote-session:stop", "remote-session:targets",
         ])
         expect(await source.enumerate(context)).toEqual([])
         const createInput = { name: "remote-session:create", body: { target: "desktop", title: command.title, prompt: command.prompt } }

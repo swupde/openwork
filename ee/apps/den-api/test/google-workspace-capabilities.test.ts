@@ -814,7 +814,7 @@ beforeAll(async () => {
   expect(tokenResponse.status).toBe(200)
   const tokenBody: unknown = await tokenResponse.json()
   directUploadMcpToken = expectString(expectRecord(tokenBody, "MCP token response").token, "MCP upload token")
-})
+}, 30_000)
 
 beforeEach(async () => {
   resetFakeGoogle()

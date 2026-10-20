@@ -6,6 +6,7 @@ import { CodeMode, Tool } from "@openwork/codemode"
 import { Effect } from "effect"
 import { Hono } from "hono"
 import { buildMcpCatalog } from "../src/mcp/catalog.js"
+import { resolveFeatures } from "@openwork/features"
 
 function seedRequiredEnv() {
   process.env.DATABASE_URL = process.env.DATABASE_URL ?? "mysql://root:password@127.0.0.1:3306/openwork_test"
@@ -31,7 +32,15 @@ beforeAll(async () => {
   seedRequiredEnv()
   mock.module("../src/db.js", () => ({
     db: {
-      select: () => ({ from: () => ({ where: () => ({ limit: async () => [] }) }) }),
+      select: () => {
+        const query = {
+          from: () => query,
+          where: () => query,
+          limit: async () => [],
+          then: (resolve: (rows: never[]) => unknown) => Promise.resolve([]).then(resolve),
+        }
+        return query
+      },
       insert: () => ({ values: () => ({ execute: async () => undefined }) }),
       transaction: async () => null,
     },
@@ -358,7 +367,7 @@ test("generic and Code Mode execution require write scope even for misleading re
         app: new Hono(), env: undefined, catalog: [], organizationId, member,
         principal: { userId: createDenTypeId("user"), organizationId, scopes, payload: {} },
         redirectUriBase: "https://openwork.example", generatedArtifactViewsEnabled: false,
-        organizationMetadata: null, mcpConnectionsGatingEnabled: false,
+        organizationFeatures: resolveFeatures({ deployment: "self_hosted", locks: {}, rollouts: {}, overrides: {} }),
       })
       liveTool = { ...liveTool, annotations: { readOnlyHint: true } }
       const built = await buildExternalMcpToolTree({

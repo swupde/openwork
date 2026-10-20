@@ -1,3 +1,4 @@
+import { createMockDenAuth } from "./fork-auth-fixture.js"
 import { afterAll, beforeAll, beforeEach, expect, mock, test } from "bun:test"
 import { Tool } from "@openwork/codemode"
 import {
@@ -7,6 +8,7 @@ import {
 import { createDenTypeId, normalizeDenTypeId } from "@openwork-ee/utils/typeid"
 import { Effect } from "effect"
 import { Hono, type MiddlewareHandler } from "hono"
+import { resolveFeatures } from "@openwork/features"
 import { artifactRuntime } from "../src/artifact-runtime.js"
 import { artifactDigest } from "../src/workflow-artifacts.js"
 import { recordWorkflowRun } from "../src/workflow-runs.js"
@@ -107,11 +109,13 @@ const database = {
 }
 
 beforeAll(async () => {
+  // Exercise the supported legacy Workflow-view lane; App building makes it read-only.
+  process.env.DEN_APP_MCP_SERVERS_ENABLED = "false"
   process.env.DATABASE_URL ??= "mysql://fixture:fixture@127.0.0.1:3306/not_connected"
   process.env.DEN_DB_ENCRYPTION_KEY ??= "x".repeat(32)
   process.env.BETTER_AUTH_SECRET ??= "y".repeat(32)
   process.env.BETTER_AUTH_URL ??= "http://127.0.0.1:8790"
-  mock.module("../src/auth.js", () => ({ auth: {} }))
+  mock.module("../src/auth.js", createMockDenAuth)
   mock.module("../src/db.js", () => ({ db: database }))
   db = (await import("../src/db.js")).db
   const access = await import("../src/routes/org/plugin-system/access.js")
@@ -127,7 +131,7 @@ beforeAll(async () => {
     c.set("session", null)
     await next()
   }
-  mock.module("../src/mcp/auth.js", () => ({ getMcpResourceContext: () => ({}), verifyMcpRequest: async () => null }))
+  mock.module("../src/mcp/auth.js", () => ({ mcpPrincipalCredentialId: () => null, verifyMcpSubscriptionRequest: async () => null, getMcpResourceContext: () => ({}), verifyMcpRequest: async () => null }))
   const middleware = await import("../src/middleware/index.js")
   mock.module("../src/middleware/index.js", () => ({ ...middleware, ...validation, orgMemberRoute: () => memberRoute }))
   const orgs = await import("../src/orgs.js")
@@ -168,6 +172,7 @@ beforeEach(() => {
       currentMember: { id: memberId, userId: createDenTypeId("user"), role: "member", directRole: "member", adminTeams: [],
         createdAt: now, joinedAt: now, isOwner: false },
       invitations: [], members: [], roles: [], teams: [],
+      features: resolveFeatures({ deployment: "self_hosted", locks: {}, rollouts: {}, overrides: {} }),
     },
   }
   put(MemberTable, { id: memberId, role: "member" })

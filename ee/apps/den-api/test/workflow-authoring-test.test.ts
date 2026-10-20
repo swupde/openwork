@@ -1,3 +1,4 @@
+import { createMockDenAuth } from "./fork-auth-fixture.js"
 import { afterAll, beforeAll, expect, mock, test } from "bun:test"
 import { Tool } from "@openwork/codemode"
 import { createDenTypeId } from "@openwork-ee/utils/typeid"
@@ -15,7 +16,7 @@ beforeAll(async () => {
   process.env.DEN_DB_ENCRYPTION_KEY ??= "x".repeat(32)
   process.env.BETTER_AUTH_SECRET ??= "y".repeat(32)
   process.env.BETTER_AUTH_URL ??= "http://127.0.0.1:8790"
-  mock.module("../src/auth.js", () => ({ auth: {} }))
+  mock.module("../src/auth.js", createMockDenAuth)
   execute = (await import("../src/mcp/workflow-authoring-test.js")).executeWorkflowAuthoringTest
 })
 

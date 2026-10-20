@@ -241,6 +241,18 @@ describe("openwork runtime config file", () => {
     expect(mcp.other).toBeUndefined();
   });
 
+  test("legacy remote workspace state cannot receive local execution directory access", async () => {
+    const { root, config } = await setup();
+    // Older persisted configurations can outlive the narrowed local-only type.
+    config.workspaces.push({
+      id: "legacy_remote", path: join(root, "legacy-remote"), workspaceType: "remote",
+    } as unknown as ServerConfig["workspaces"][number]);
+
+    const parsed = JSON.parse(await buildOpenworkRuntimeConfig(config, "legacy_remote"));
+    expect(parsed.permission.external_directory).toBeUndefined();
+    expect(parsed.agent.openwork.prompt).not.toContain("legacy-remote");
+  });
+
   test("builds byte-stable config for repeated snapshots", async () => {
     const { config } = await setup();
     await writeRuntimeOpencodeConfig(config, "ws_1", (current) => ({
