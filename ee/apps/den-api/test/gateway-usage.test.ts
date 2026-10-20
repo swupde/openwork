@@ -24,7 +24,7 @@ const execute = spyOn(client, "execute").mockImplementation(async (statement) =>
   return { headers: [], types: {}, rows, fields: [], size: rows.length, statement, insertId: "0", rowsAffected: 0, time: 0 }
 })
 mock.module("../src/db.js", () => ({ db }))
-mock.module("../src/middleware/index.js", () => ({ orgMemberRoute: () => {}, queryValidator: () => {} }))
+mock.module("../src/middleware/index.js", () => ({ orgMemberRoute: () => {}, orgPermissionRoute: () => {}, queryValidator: () => {} }))
 mock.module("../src/llm/models-dev.js", () => ({ getModelsDevProviders: async () => [] }))
 const { readGatewayUsage } = await import("../src/routes/org/gateway-usage.js")
 

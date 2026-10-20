@@ -1,3 +1,7 @@
+import { PRIVILEGED_SESSION_MAX_AGE_MS } from "../src/privileged-session.js"
+import { createMockDenAuth } from "./fork-auth-fixture.js"
+import type { PermissionKey } from "@openwork/types/den/permissions"
+import { resolveFeatures } from "@openwork/features"
 import { afterAll, beforeEach, expect, mock, test } from "bun:test"
 import { createDenTypeId } from "@openwork-ee/utils/typeid"
 import { Hono, type MiddlewareHandler } from "hono"
@@ -8,11 +12,12 @@ import { assertManagedModelsAllowed } from "@openwork/types/den/managed-models-p
 // No database client is created. Reaching storage is an explicit test sentinel.
 let storageCalls = 0
 const storageReached = () => { storageCalls++; throw new Error("fixture_storage_reached") }
-mock.module("../src/db.js", () => ({ db: { select: storageReached, transaction: storageReached } }))
+mock.module("../src/db.js", () => ({ db: { select: storageReached, transaction: storageReached, $with: storageReached } }))
 // This suite isolates deployment admission, not cookie authentication. Keep
 // Better Auth's startup seeding away from the deliberately throwing DB sentinel;
 // inference-provider-oauth.test.ts covers the real signed-cookie boundary.
-mock.module("../src/session.js", () => ({ readSignedSessionCookieToken: async () => null }))
+mock.module("../src/auth.js", createMockDenAuth)
+mock.module("../src/session.js", () => ({ readSignedSessionCookieToken: async () => null, readInternalMcpPrincipalCredentialId: () => null, readInternalCapabilityConnectorId: () => null }))
 
 process.env.DATABASE_URL = "mysql://fixture:fixture@127.0.0.1:3306/not_connected"
 process.env.DEN_DB_ENCRYPTION_KEY = "fixture-encryption-key-not-a-secret-32"
@@ -26,6 +31,10 @@ process.env.INFERENCE_PROXY_BASE_URL = "https://models.example.test"
 
 const organizationId = createDenTypeId("organization")
 const memberId = createDenTypeId("member")
+const { memberPermissionsForOrganizationContext, resolveMemberPermissionsMiddleware } = await import("../src/middleware/member-permissions.js")
+
+const { requireOrgPermission } = await import("../src/middleware/route-access.js")
+
 let authenticated = true
 let role = "owner"
 let fresh = true
@@ -34,14 +43,22 @@ const memberRoute: MiddlewareHandler = async (c, next) => {
   if (!authenticated) return c.json({ error: "unauthorized" }, 401)
   c.set("organizationContext", {
     organization: { id: organizationId, metadata: { capabilities: { gatewayDashboard: dashboard } } },
-    currentMember: { id: memberId, role, isOwner: role === "owner" },
+    currentMember: { id: memberId, userId: createDenTypeId("user"), role, directRole: role, adminTeams: [], isOwner: role === "owner" },
+    features: resolveFeatures({ deployment: "self_hosted", locks: {}, rollouts: {}, overrides: {} }),
   })
-  c.set("session", { createdAt: new Date(Date.now() - (fresh ? 0 : 3_600_000)) })
+  c.set("session", { createdAt: new Date(Date.now() - (fresh ? 0 : PRIVILEGED_SESSION_MAX_AGE_MS + 60_000)) })
   await next()
 }
 mock.module("../src/middleware/index.js", () => ({
   ...validation,
   orgMemberRoute: () => memberRoute,
+  orgPermissionRoute: (key: PermissionKey): MiddlewareHandler => async (c, next) => {
+    if (!authenticated) return c.json({ error: "unauthorized" }, 401)
+    await memberRoute(c, async () => {})
+    return requireOrgPermission(key)(c, next)
+  },
+  memberPermissionsForOrganizationContext,
+  resolveMemberPermissionsMiddleware,
   userSessionRoute: () => memberRoute,
   publicRoute: async (_c: unknown, next: () => Promise<void>) => next(),
 }))
@@ -59,6 +76,8 @@ registerOrgInferenceProviderRoutes(app)
 
 beforeEach(() => {
   env.gatewayEnabled = false
+  // Isolate deployment admission from the optional audit persistence boundary.
+  env.auditCaptureEnabled = false
   authenticated = true
   role = "owner"
   fresh = true

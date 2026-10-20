@@ -34,20 +34,20 @@ async function beforeCreate(metadata: unknown) {
   throw new Error("Organization hook not registered")
 }
 
-test.each([true, false, null, "true", 1])("public creation cannot set platform-managed gatewayDashboard to %s", async (value) => {
-  const metadata = { capabilities: { gatewayDashboard: value } }
+test.each([true, false, null, "true", 1])("public creation drops client-supplied feature authority for %s", async (value) => {
+  const metadata = { label: "retained", capabilities: { gatewayDashboard: value, mcpConnections: value, permissions: value } }
   for (const input of [metadata, JSON.stringify(metadata)]) {
-    await expect(beforeCreate(input)).rejects.toMatchObject({
-      status: "FORBIDDEN",
-      body: { message: "capabilities.gatewayDashboard is reserved for internal platform administration." },
-    })
+    await expect(beforeCreate(input)).resolves.toEqual({ data: { metadata: { label: "retained" } } })
   }
 })
 
-test("ordinary metadata and other capability overrides retain their existing behavior", async () => {
-  for (const metadata of [undefined, null, {}, { label: "test" }, { capabilities: {} }, { capabilities: { inference: false, desktop: true } }]) {
+test("ordinary metadata remains accepted and empty capability objects are removed", async () => {
+  for (const metadata of [undefined, null, {}, { label: "test" }]) {
     await expect(beforeCreate(metadata)).resolves.toBeUndefined()
     if (metadata !== undefined) await expect(beforeCreate(JSON.stringify(metadata === null ? {} : metadata))).resolves.toBeUndefined()
+  }
+  for (const capabilities of [{}, { inference: false, desktop: true }]) {
+    await expect(beforeCreate({ label: "test", capabilities })).resolves.toEqual({ data: { metadata: { label: "test" } } })
   }
 })
 
@@ -58,6 +58,14 @@ test("existing malformed metadata and dpaSigned denials are preserved", async ()
   for (const metadata of [{ dpaSigned: true }, JSON.stringify({ dpaSigned: false })]) {
     await expect(beforeCreate(metadata)).rejects.toMatchObject({
       status: "FORBIDDEN", body: { message: "dpaSigned is reserved for internal platform administration." },
+    })
+  }
+})
+
+test("public creation cannot select its own organization plan", async () => {
+  for (const metadata of [{ plan: "enterprise" }, JSON.stringify({ plan: "free" })]) {
+    await expect(beforeCreate(metadata)).rejects.toMatchObject({
+      status: "FORBIDDEN", body: { message: "plan is reserved for internal platform administration." },
     })
   }
 })

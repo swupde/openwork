@@ -192,6 +192,9 @@ beforeAll(async () => {
     // Remote sessions require OpenWork Web access for the organization; this
     // spec proves the wire and guardrails, so the entitlement is granted inline.
     getOpenWorkWebAccess: async () => ({ hasAccess: true }),
+    registeredTargetsEnabled: async () => false,
+    cloudAvailable: () => true,
+    commandStore: { ...DEFAULT_REMOTE_SESSION_DEPS.commandStore, findDesktopSession: async () => null },
     resolveRuntime: async () => ({ ok: true, runtime }),
     createClient: DEFAULT_REMOTE_SESSION_DEPS.createClient,
   };
