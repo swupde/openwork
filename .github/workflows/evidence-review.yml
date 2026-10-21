@@ -25,6 +25,7 @@ jobs:
   progress:
     if: >-
       github.repository == 'different-ai/openwork' &&
+      github.repository == 'different-ai/openwork' &&
       github.event_name == 'workflow_run' &&
       github.event.action != 'completed' &&
       github.event.workflow_run.name == 'PR change proof' &&
@@ -58,6 +59,7 @@ jobs:
       group: evidence-review-publish-${{ github.repository }}-${{ github.event.workflow_run.pull_requests[0].number || inputs.run_id || github.run_id }}
       cancel-in-progress: false
     if: >-
+      github.repository == 'different-ai/openwork' &&
       github.repository == 'different-ai/openwork' &&
       always() &&
       ((github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) ||

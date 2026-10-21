@@ -801,6 +801,7 @@ beforeAll(async () => {
     providerId: "google-workspace",
     clientId: "gws-caps-client",
     clientSecret: "gws-caps-secret",
+    extra: { features: ["calendarRead", "gmailDraft", "driveFile", "driveRead"] },
     createdByOrgMembershipId: memberId,
   })
   const tokenResponse = await app.request("http://den-api.local/v1/mcp/token", {
@@ -2136,24 +2137,20 @@ test("native Google file update replaces whole Docs, Sheets, and Slides content"
   }
 })
 
-test("fork Google routes enforce the organization Connect policy before calling Google", async () => {
-  await db.insert(schema.OrganizationFeatureTable).values({ organization_id: organizationId, feature_key: "mcpConnections", enabled: false, source: "admin" })
+test("Google Drive reads require the admin-enabled scope even when the member still holds it", async () => {
+  await db.update(schema.OrgOAuthClientTable).set({ extra: { features: ["driveFile"] } }).where(drizzle.and(
+    drizzle.eq(schema.OrgOAuthClientTable.organizationId, organizationId),
+    drizzle.eq(schema.OrgOAuthClientTable.providerId, "google-workspace"),
+  ))
   try {
-    const cases = [
-      { path: "/v1/capabilities/google-workspace/calendar-agenda?day=tomorrow&timeZone=Europe%2FBerlin", init: undefined },
-      { path: "/v1/capabilities/google-workspace/native-files", init: { method: "POST", body: { type: "document", name: "Blocked", text: "Blocked" } } },
-      { path: "/v1/capabilities/google-workspace/native-file/native_doc_existing", init: { method: "PATCH", body: { type: "document", text: "Blocked" } } },
-    ]
-    for (const item of cases) {
-      const response = await request(item.path, item.init)
-      expect(response.status).toBe(403)
-      expect(await response.json()).toMatchObject({ error: "policy_blocked" })
-    }
+    const response = await request("/v1/capabilities/google-workspace/drive-files?query=restricted")
+    expect(response.status).toBe(409)
+    expect(await response.json()).toMatchObject({ error: "needs_connection" })
     expect(googleCallCount).toBe(0)
   } finally {
-    await db.delete(schema.OrganizationFeatureTable).where(drizzle.and(
-      drizzle.eq(schema.OrganizationFeatureTable.organization_id, organizationId),
-      drizzle.eq(schema.OrganizationFeatureTable.feature_key, "mcpConnections"),
+    await db.update(schema.OrgOAuthClientTable).set({ extra: { features: ["calendarRead", "gmailDraft", "driveFile", "driveRead"] } }).where(drizzle.and(
+      drizzle.eq(schema.OrgOAuthClientTable.organizationId, organizationId),
+      drizzle.eq(schema.OrgOAuthClientTable.providerId, "google-workspace"),
     ))
   }
 })
@@ -2472,7 +2469,7 @@ test("Google Workspace capability tools are discoverable and keep readable names
   expect(searchCapabilities(catalog, "add meet link existing event", 10)[0]?.name).toBe("patchCapabilitiesGoogleWorkspaceCalendarEvent")
   const driveMatch = searchCapabilities(catalog, "drive files", 10)[0]
   expect(driveMatch?.name).toBe("getCapabilitiesGoogleWorkspaceDriveFiles")
-  expect(driveMatch?.queryParams).toEqual(["query", "maxResults", "pageToken", "modifiedAfter", "folderId"])
+  expect(driveMatch?.queryParams).toEqual(["query", "maxResults", "pageToken", "orderBy", "filesOnly", "modifiedAfter", "folderId"])
   expect(catalog.some((tool) => tool.name === "postCapabilitiesGoogleWorkspaceDriveFiles")).toBe(false)
   expect(catalog.some((tool) => tool.name.includes("DirectUploads"))).toBe(false)
   expect(searchCapabilities(catalog, "share drive file", 10)[0]?.name).toBe("postCapabilitiesGoogleWorkspaceDriveFileShare")

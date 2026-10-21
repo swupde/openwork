@@ -675,6 +675,14 @@ test("migrations replay to exported schema and config object version inserts", {
     await applyStatements(exportedConnection, exportStatements)
     await ensureSchemaRepairs(executorFor(exportedConnection))
 
+    // Upstream retired these ORM exports but explicitly preserves their data in
+    // 0148_free_auto_behavior. Compare them with the immutable original DDL too;
+    // do not hide an arbitrary extra table or column from the parity assertion.
+    const legacyDashboardSql = await readFile(join(migrationsFolder, "0078_premium_mastermind.sql"), "utf8")
+    const legacyDashboardStatements = splitSqlStatements(legacyDashboardSql.replaceAll("--> statement-breakpoint", ""))
+    assert.deepEqual(legacyDashboardStatements.map(createTableName).filter(Boolean).sort(), ["dashboard", "dashboard_access_grant"])
+    await applyStatements(exportedConnection, legacyDashboardStatements)
+
     await assertSchemasMatch(exportedConnection, migratedConnection)
     await runRegressionInsert(migratedConnection)
     await runOAuthScopeRegressionInserts(migratedConnection)

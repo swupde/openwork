@@ -72,13 +72,21 @@ function toolCallProviderMetadata(part: ToolPart): ProviderMetadata {
     ? stateMetadata.sessionId.trim()
     : null;
   const appBuilder = /(?:^|_)(?:search_capabilities|prepare_app|create_app|update_app)$/.test(part.tool);
-  const toolStartedAt = (appBuilder || part.tool === "task" || part.metadata?.openworkV2CodeMode === true) && "time" in part.state && typeof part.state.time?.start === "number"
+  // A task started or followed up on another computer keeps its start time after it returns.
+  const remoteSession = /(?:^|_)execute_capability$/.test(part.tool) && isRecord(part.state.input)
+    && typeof part.state.input.name === "string" && part.state.input.name.startsWith("remote-session:");
+  const toolStartedAt = (appBuilder || remoteSession || part.tool === "task" || part.metadata?.openworkV2CodeMode === true) && "time" in part.state && typeof part.state.time?.start === "number"
     && Number.isFinite(part.state.time.start)
     ? part.state.time.start
     : null;
   const toolCompletedAt = appBuilder && "time" in part.state && "end" in part.state.time && typeof part.state.time.end === "number"
     && Number.isFinite(part.state.time.end) ? part.state.time.end : null;
+  const fileDestination = part.tool === "write" && typeof stateMetadata.filepath === "string" ? stateMetadata.filepath
+    : part.tool === "edit" && isRecord(stateMetadata.filediff) && typeof stateMetadata.filediff.file === "string" ? stateMetadata.filediff.file : null;
+  const workspacePaths = isJsonValue(stateMetadata.openworkWorkspacePaths) ? stateMetadata.openworkWorkspacePaths : null;
   const openwork = {
+    ...(fileDestination ? { fileDestination } : {}),
+    ...(workspacePaths ? { workspacePaths } : {}),
     ...(part.id !== part.callID ? { sourcePartId: part.id } : {}),
     ...(mcpResult ? { mcpResult } : {}),
     ...(childSessionId ? { childSessionId } : {}),

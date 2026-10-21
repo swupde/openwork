@@ -1,3 +1,4 @@
+import { createMockDenAuth } from "./fork-auth-fixture.js"
 import { afterAll, beforeAll, expect, mock, spyOn, test } from "bun:test"
 import { createDenTypeId } from "@openwork-ee/utils/typeid"
 import type { Tool as McpTool } from "@modelcontextprotocol/sdk/types.js"
@@ -30,6 +31,7 @@ let parseNativeCapabilityName: typeof import("../src/mcp/native-capabilities.js"
 
 beforeAll(async () => {
   seedRequiredEnv()
+  mock.module("../src/auth.js", createMockDenAuth)
   mock.module("../src/db.js", () => ({
     db: {
       select: () => {
@@ -60,7 +62,7 @@ beforeAll(async () => {
   sanitizeNamespaceSegment = codemodeTools.sanitizeNamespaceSegment
   stripUndefinedEntries = codemodeTools.stripUndefinedEntries
   parseNativeCapabilityName = nativeCapabilities.parseNativeCapabilityName
-})
+}, 30_000)
 
 afterAll(() => mock.restore())
 

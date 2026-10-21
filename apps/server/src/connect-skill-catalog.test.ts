@@ -213,16 +213,16 @@ describe("OpenWork Connect skill catalog", () => {
       });
     };
 
-    const skills = await readMcpSkillIndex({
+    const index = await readMcpSkillIndex({
       type: "remote",
       url: "https://connect.example/mcp/agent",
       enabled: true,
       headers: { Authorization: "Bearer secret" },
     }, fetcher);
 
-    expect(skills).toHaveLength(1);
-    expect(skills?.[0]?.capability).toBe("skill:skill_customer_briefing");
-    expect(skills?.[0]).toMatchObject({
+    expect(index?.skills).toHaveLength(1);
+    expect(index?.skills[0]?.capability).toBe("skill:skill_customer_briefing");
+    expect(index?.skills[0]).toMatchObject({
       title: "Customer Briefing",
       description: "Prepare customer briefings.",
       marketplaceName: "Go To Market",
@@ -266,14 +266,14 @@ describe("OpenWork Connect skill catalog", () => {
       });
     };
 
-    const skills = await readMcpSkillIndex({
+    const index = await readMcpSkillIndex({
       type: "remote",
       url: "https://connect.example/mcp/agent",
       enabled: true,
     }, fetcher);
 
-    expect(skills).toHaveLength(1);
-    expect(skills?.[0]?.capability).toBe("plugin:plg_test:cfg_test");
+    expect(index?.skills).toHaveLength(1);
+    expect(index?.skills[0]?.capability).toBe("plugin:plg_test:cfg_test");
   });
 
   test("reads the skill catalog from server-scoped Connect MCP config", async () => {

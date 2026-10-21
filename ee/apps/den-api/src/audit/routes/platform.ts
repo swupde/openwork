@@ -19,7 +19,7 @@ function platform(method: AuditRouteMethod, path: string, action: string, kind: 
   return route(method, path, "platform", action, kind, type, idParam, notes)
 }
 
-/** Side-effect-free platform GET (pure metadata, docs, discovery or session read): successes need the platformAuditReads feature. */
+/** Side-effect-free platform GET (pure metadata, docs, discovery or session read). */
 function readOnly(path: string, action: string, kind: string, type: string, idParam: string | null, notes?: string): AuditRouteDeclaration {
   return { ...platform("GET", path, action, kind, type, idParam, notes), readOnly: true }
 }
@@ -96,6 +96,8 @@ export const platformAuditRoutes: readonly AuditRouteDeclaration[] = [
   readOnly("/v1/orgs/sso/singleton", "auth.sso_singleton.read", "platform.discovery", "deployment", null),
   readOnly("/v1/auth/bootstrap/status", "auth.bootstrap.status.read", "platform.discovery", "deployment", null),
   readOnly("/v1/features", "feature.deployment.list", "platform.discovery", "feature", null, "Public deployment-wide feature state (kill switch and operator locks, never organization overrides) for people without an organization; side-effect free."),
+  readOnly("/v1/install-config", "install_config.public.read", "install.distribution", "install_config", null, "Public deployment setup for desktop builds resolving pasted install links; any token is ignored and no organization is identified. Side-effect free."),
+  readOnly("/v1/install/:platform", "install_page.redirect", "install.distribution", "install_artifact", "platform", "Redirects older token download links to the normal install page; side-effect free."),
 
   // OAuth authorization server (better-auth endpoints registered by Den)
   handler("GET", "/api/auth/oauth2/authorize", "tenant_change", "oauth.authorize", "oauth.authorization", "oauth_client", "Den route forwarding to better-auth. When the signed-in user has an MCP consent organization (postLogin.consentReferenceId, the session's active organization) the request is attributed there after the endpoint ran (phase after, src/audit/better-auth.ts) once their active membership is verified; actor = user + memberId. Issuing the authorization code is request evidence only (never the code). No session, no MCP scope or a failed request: platform evidence. The request policy hook may update oauthClient.scopes on this GET."),
@@ -142,9 +144,13 @@ export const platformAuditRoutes: readonly AuditRouteDeclaration[] = [
   platform("POST", "/internal/audit/usage/refresh", "audit.usage.refresh", "platform.maintenance", "audit_usage", null, "Called by the den-audit-usage cron (Helm CronJob, Render cron job). Recomputes every organization's audit_state totals from stored rows; no organization activity, so platform evidence only."),
 
   // Global platform admin
+  platform("GET", "/v1/admin/services", "platform.service_readiness.read", "platform.admin", "service_readiness", null, `${ADMIN} Cached diagnostics; stale-while-revalidate schedules read-only outbound probes through bounded durable admission (not a pure metadata read). No credentials or upstream error bodies.`),
+  platform("POST", "/v1/admin/services/check", "platform.service_readiness.check", "platform.admin", "service_readiness", null, `${ADMIN} Queues read-only deployment probes, globally rate limited; request evidence only. Never sends messages, invokes inference or provisions resources.`),
   platform("GET", "/v1/admin/overview", "platform.overview.read", "platform.admin", "platform_report", null, ADMIN),
+  platform("GET", "/v1/admin/dashboard", "platform.dashboard.read", "platform.admin", "platform_report", null, ADMIN),
   platform("GET", "/v1/admin/metrics", "platform.metrics.read", "platform.admin", "platform_report", null, ADMIN),
   platform("GET", "/v1/admin/free-auto/usage", "platform.free_auto_usage.read", "platform.admin", "platform_report", null, ADMIN),
+  platform("GET", "/v1/admin/free-auto/conversions", "platform.free_auto_conversions.read", "platform.admin", "platform_report", null, ADMIN),
   platform("GET", "/v1/admin/organizations", "platform.organization.list", "platform.admin", "organization", null, ADMIN),
   platform("GET", "/v1/admin/users", "platform.user.list", "platform.admin", "user", null, ADMIN),
   platform("GET", "/v1/admin/users/:userId/inference-usage", "platform.user.inference_usage.read", "platform.admin", "user", "userId", ADMIN),

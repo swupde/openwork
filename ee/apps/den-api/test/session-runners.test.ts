@@ -64,7 +64,7 @@ const modernCapabilities: AutomationDesktopRunnerCapability[] = [
   REMOTE_SESSION_ONLY_RUNNER_CAPABILITY, REMOTE_SESSION_RECOVERY_RUNNER_CAPABILITY,
 ]
 
-function fixtures(options: { active?: boolean; capabilities?: AutomationDesktopRunnerCapability[]; featureEnabled?: boolean } = {}) {
+function fixtures(options: { active?: boolean; capabilities?: AutomationDesktopRunnerCapability[] } = {}) {
   const calls: string[] = []
   const service = {
     async registerDesktopRunner() {},
@@ -73,7 +73,7 @@ function fixtures(options: { active?: boolean; capabilities?: AutomationDesktopR
     async saveDesktopRunnerInventory() { return true },
   }
   const commandStore: RemoteSessionCommandStore = {
-    async enqueue() { return command }, async get() { return command }, async latestSettled() { return null },
+    async enqueue() { return command }, async get() { return command }, async getMany() { return [command] }, async latestSettled() { return null },
     async findDesktopSession() { return null }, async listDesktopSessions() { return [] }, async markTurnStarted() { calls.push("reset") },
     async listPendingForRunner() { calls.push("pending-command"); return [{ ...command, id: "command_pending", status: "pending" }] },
     async listRecoverableForRunner(input) { assert.deepEqual(input.runnerId, scope.runnerId); calls.push("recover-command"); return [command] },
@@ -90,7 +90,8 @@ function fixtures(options: { active?: boolean; capabilities?: AutomationDesktopR
   }
   const app = new Hono()
   registerSessionRunnerRoutes(app, {
-    service, commandStore, requestStore, featureEnabled: async () => options.featureEnabled ?? true,
+    service, commandStore, requestStore,
+    async readEnginePolicy() { return { upgrade: false } },
     automationService: {
       async discoverDesktopRunnerWork() { calls.push("automation-discovery"); return [{ runId: "automation_unit", executionTarget: "desktop" }] },
       async runnerNotifications() { return [] },
@@ -194,15 +195,6 @@ test("released runners discover only pending remote work, never recovery claims"
   assert.equal(calls.includes("recover-command"), false)
   assert.equal(calls.includes("recover-request"), false)
   assert.equal(calls.includes("automation-discovery"), false)
-})
-
-test("killing discovery still drains sticky claims and control receipts", async () => {
-  const { app, headers, calls } = fixtures({ featureEnabled: false })
-  const response = await app.request("/v1/session-runners/work", { headers })
-  assert.equal(response.status, 200)
-  assert.deepEqual((await response.json()).items, [{ kind: "remote_session_request", requestId: request.id }, { kind: "remote_session_create", commandId: command.id }])
-  assert.equal(calls.includes("pending-command"), false)
-  assert.equal((await app.request(`/v1/remote-session-commands/${command.id}/complete`, { method: "POST", headers, body: JSON.stringify({ status: "delivered", sessionId: "ses_unit", workspaceId: "workspace_unit" }) })).status, 200)
 })
 
 test("every runner request rechecks active owner authority", async () => {

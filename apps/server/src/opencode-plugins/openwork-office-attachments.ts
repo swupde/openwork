@@ -11,7 +11,7 @@ import {
   officeKindFromMimeOrFilename,
   type OfficeKind,
 } from "@openwork/workbook";
-import { openWorkspaceFileForReading, openWorkspaceFileForWriting } from "./workspace-file-identity.js";
+import { openWorkspaceFileForReading, openWorkspaceFileForWriting } from "../workspace-file-identity.js";
 
 import { OPENWORK_RUNTIME_STORAGE_ENV, runtimeWorkspaceFilesRoot } from "../runtime-workspace-files.js";
 

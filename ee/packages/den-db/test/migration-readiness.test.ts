@@ -543,7 +543,10 @@ describe("Den DB migration readiness wiring", () => {
     const denApiBuild = readRepoFile("ee/apps/den-api/scripts/build.mjs")
     const startLine = denApiPackage.split("\n").find((line) => line.includes('"start"')) ?? ""
 
-    assert.match(denApiPackage, /"build:workspace-dependencies": "pnpm --filter '@openwork-ee\/den-api\^\.\.\.' --if-present run build"/)
+    assert.equal(JSON.parse(denApiPackage).scripts["build:workspace-dependencies"], "node ../../../scripts/build-workspace-dependencies.mjs @openwork-ee/den-api")
+    const dependencyBuilder = readRepoFile("scripts/build-workspace-dependencies.mjs")
+    assert.match(dependencyBuilder, /packageName}\^\.\.\./)
+    assert.match(dependencyBuilder, /"--if-present", "run", "build"/)
     assert.match(denApiBuild, /run\(pnpmCommand, \["run", "build:workspace-dependencies"\]\)/)
     assert.match(denApiBuild, /verifyProductionWorkspaceExports\(\)/)
     assert.match(startLine, /"start": "node dist\/main\.js"/)
@@ -614,7 +617,7 @@ describe("Den DB migration readiness wiring", () => {
     const journal = readFileSync(path.join(packageDir, "dist", "drizzle", "meta", "_journal.json"), "utf8")
 
     assert.match(runner, /drizzle-orm\/mysql2\/migrator/)
-    assert.match(snapshot, /^CREATE TABLE `account`/)
+    assert.match(snapshot, /(?:^|\n)CREATE TABLE `account`/)
     assert.equal(snapshot.includes("Reading schema files"), false, "schema snapshot contains SQL only")
     assert.match(journal, /"entries"/)
     assert.match(journal, /"0040_rapid_lady_bullseye"/)

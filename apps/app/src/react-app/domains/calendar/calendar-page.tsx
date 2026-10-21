@@ -13,6 +13,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { cn } from "@/lib/utils"
 import { CloudSignInBanner, CloudSignInBannerIcon } from "@/react-app/domains/cloud/cloud-sign-in-banner"
 import { useDenAuth } from "@/react-app/domains/cloud/den-auth-provider"
+import { useOrgFeatureState } from "@/react-app/domains/cloud/use-org-feature"
 import { automationExecutionThreadRoute } from "@/react-app/domains/automations/automation-cloud-thread"
 import {
   describeAutomationError,
@@ -52,7 +53,6 @@ import { CalendarMonthGrid, CalendarTimeGrid, type CalendarSelection } from "./c
 import {
   calendarProviderPresence,
   useAutomationRunsInRange,
-  useCalendarFeature,
   useCalendarDefaultModelName,
   useCalendarMeetings,
   useCalendarTransport,
@@ -182,10 +182,9 @@ export function CalendarPage(props: {
 
   const { year, month, day } = anchor
   const range = useMemo(() => calendarRange(view, { year, month, day }, timeZone, WEEK_STARTS_ON), [day, month, timeZone, view, year])
-  const feature = useCalendarFeature(denContext)
-  const polish = useCalendarFeature(denContext, "calendarPolish").data === true
+  const feature = useOrgFeatureState("automationCalendar")
   const enabled = feature.data === true
-  const organizationDefaultName = useCalendarDefaultModelName(denContext, polish && enabled).data
+  const organizationDefaultName = useCalendarDefaultModelName(denContext, enabled).data
   const listQuery = useAutomationListQuery(denContext)
   const automationItems = listQuery.data?.items
   const runsQuery = useAutomationRunsInRange(denContext, range, automationItems, enabled && layers.automations)
@@ -390,7 +389,6 @@ export function CalendarPage(props: {
         <div className="relative flex h-[max(24rem,calc(100dvh-10rem))] min-w-0 shrink-0 flex-col lg:h-auto lg:min-h-0 lg:flex-1">
           {view === "month" ? (
             <CalendarMonthGrid
-              polish={polish}
               range={range}
               timeZone={timeZone}
               now={now}
@@ -403,7 +401,6 @@ export function CalendarPage(props: {
             />
           ) : (
             <CalendarTimeGrid
-              polish={polish}
               range={range}
               timeZone={timeZone}
               now={now}
@@ -425,7 +422,6 @@ export function CalendarPage(props: {
         </div>
         {creating ? (
           <CreateAutomationCard
-            polish={polish}
             organizationDefaultName={organizationDefaultName}
             key={creating.slot.at}
             anchor={creating}
@@ -455,7 +451,6 @@ export function CalendarPage(props: {
         ) : null}
         {selectedAutomation ? (
           <AutomationDetailPanel
-            polish={polish}
             organizationDefaultName={organizationDefaultName}
             key={selectedAutomation.automation.id}
             item={selectedAutomation}

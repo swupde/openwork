@@ -235,3 +235,38 @@ selection retains the four existing deployment images. New headless/Workbot
 images and upstream cloud deployment automation are not adopted. Source
 integration and CI evidence do not establish production deployment or a
 published desktop update.
+
+
+## v0.18.59 reconciliation (2026-10-21)
+
+The reviewed upstream release is `v0.18.59` at
+`0c60c8a6dd22db83a6c68552c00cabe601ec1f77`. All 142 deployed SQL files,
+journal tags/timestamps, and historical snapshots remain byte-for-byte intact.
+Official migrations `0142`–`0151` append as fork `0143`–`0152`; their SQL bytes
+and timestamps are unchanged. New snapshot links include the fork's nullable,
+no-default pending OAuth timestamp. A regression pins the complete deployed
+142-entry prefix before checking the ten appended migrations.
+
+The native organization/team default model is included without a client fork.
+Desktop applies it only to OpenCode v2: a deliberate workspace selection wins,
+then the resolved team/organization default, then the app-wide preference.
+The API validates model availability and administrator permission before saving.
+
+The native usage-rollup migration (fork `0144`) replaces three raw event fields
+(`tool_name`, `via`, `dedupe_key`) with the supported rollup/source model. Release
+rehearsal must keep the full original dump, verify its restore before migration,
+and compare every surviving field after migration. Historical `0130` remains
+unchanged rather than backporting upstream's later MariaDB portability edits.
+Upstream also removes the retired Dashboard ORM exports while explicitly
+preserving `dashboard` and `dashboard_access_grant` in migration `0148`.
+Schema parity checks all active tables plus those two retained tables against
+their original `0078` DDL, including indexes; they never drop historical data
+or ignore arbitrary schema differences.
+
+The agent MCP keeps upstream's compact instructions plus detailed guidance
+resource; both retain search-once and exact capability reuse. First-party
+read-only Workflow restrictions and desktop policy enforcement stay in place.
+Google Drive reads additionally require the connector's administrator-enabled
+read scope, even when the account still carries a previously granted token.
+Retained fixtures use the native permission, audit, and MCP resource contracts.
+The six-workflow, standard-runner and four-image release boundaries still apply.

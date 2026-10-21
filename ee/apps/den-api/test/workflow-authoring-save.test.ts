@@ -76,6 +76,7 @@ beforeAll(async () => {
   const access = await import("../src/routes/org/plugin-system/access.js")
   mock.module("../src/routes/org/plugin-system/access.js", () => ({
     ...access,
+    resolvePluginArchResourceRole: async () => pluginRole,
     requirePluginArchResourceRole: async (request: RoleRequest) => {
       roles.push(request)
       const actual = request.resourceKind === "plugin" ? pluginRole : workflowRole

@@ -228,6 +228,14 @@ function getMockCachedSession(requestedToken: string) {
 
 beforeAll(async () => {
   seedRequiredEnv()
+  // Authentication/deployment fixtures use catalog defaults; permission-set persistence has its own suite.
+  const effective = await import("../src/permissions/effective.js")
+  mock.module("../src/permissions/resolve.js", () => ({
+    resolveMemberPermissionsFromContext: async (context: { currentMember: { isOwner: boolean; role: string } }) => effective.memberPermissionsFromGrants({
+      isOwner: context.currentMember.isOwner, isAdmin: context.currentMember.role === "admin",
+      grants: effective.codeDefaultPermissionGrants({ isAdmin: context.currentMember.role === "admin" }),
+    }),
+  }))
 
   mock.module("../src/auth.js", () => ({
     auth: {

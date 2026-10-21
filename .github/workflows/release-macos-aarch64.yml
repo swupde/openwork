@@ -437,6 +437,7 @@ jobs:
     needs: [resolve-production, resolve-benchmark]
     if: |
       github.repository == 'different-ai/openwork' &&
+      github.repository == 'different-ai/openwork' &&
       always() &&
       (needs.resolve-production.result == 'success' || needs.resolve-benchmark.result == 'success')
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -488,6 +489,7 @@ jobs:
     name: Build + publish Electron (${{ matrix.artifact }})
     needs: [resolve-release, verify-release]
     if: |
+      github.repository == 'different-ai/openwork' &&
       github.repository == 'different-ai/openwork' &&
       always() &&
       needs.resolve-release.result == 'success' &&
@@ -919,6 +921,7 @@ jobs:
     needs: [resolve-release, verify-release]
     if: |
       github.repository == 'different-ai/openwork' &&
+      github.repository == 'different-ai/openwork' &&
       always() &&
       needs.resolve-release.result == 'success' &&
       needs.verify-release.result == 'success' &&
@@ -1012,6 +1015,7 @@ jobs:
     # desktop artifacts should never be held back by it.
     if: |
       github.repository == 'different-ai/openwork' &&
+      github.repository == 'different-ai/openwork' &&
       always() &&
       needs.resolve-release.result == 'success' &&
       needs.verify-release.result == 'success' &&
@@ -1083,6 +1087,7 @@ jobs:
     # production release, and the implicit success() would skip this job.
     if: |
       github.repository == 'different-ai/openwork' &&
+      github.repository == 'different-ai/openwork' &&
       always() &&
       needs.publish-release.result == 'success' &&
       needs.publish-release.outputs.published_stable == 'true'
@@ -1111,6 +1116,7 @@ jobs:
     name: Prepare openwork-server npm package
     needs: [resolve-release, verify-release]
     if: |
+      github.repository == 'different-ai/openwork' &&
       github.repository == 'different-ai/openwork' &&
       always() &&
       needs.resolve-release.result == 'success' &&
@@ -1216,6 +1222,7 @@ jobs:
     # runs and publish-npm silently skips (v0.18.51, v0.18.52).
     if: |
       github.repository == 'different-ai/openwork' &&
+      github.repository == 'different-ai/openwork' &&
       always() &&
       needs.resolve-release.result == 'success' &&
       needs.prepare-npm.result == 'success' &&
@@ -1275,6 +1282,7 @@ jobs:
     name: Publish openwork-server
     needs: [resolve-release, verify-release, prepare-npm, verify-npm-hosts]
     if: |
+      github.repository == 'different-ai/openwork' &&
       github.repository == 'different-ai/openwork' &&
       always() &&
       needs.resolve-release.result == 'success' &&
@@ -1358,6 +1366,7 @@ jobs:
     needs: [resolve-release, verify-release, publish-npm]
     if: |
       github.repository == 'different-ai/openwork' &&
+      github.repository == 'different-ai/openwork' &&
       always() &&
       needs.resolve-release.result == 'success' &&
       needs.verify-release.result == 'success' &&
@@ -1373,6 +1382,7 @@ jobs:
     name: Publish AUR
     needs: [resolve-release, publish-electron-unix, publish-release]
     if: |
+      github.repository == 'different-ai/openwork' &&
       github.repository == 'different-ai/openwork' &&
       always() &&
       needs.resolve-release.result == 'success' &&

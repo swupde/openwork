@@ -1,10 +1,10 @@
-import { and, asc, desc, eq, gt, gte, isNotNull, lt, lte, or, sql } from "@openwork-ee/den-db/drizzle"
+import { and, asc, desc, eq, gt, gte, inArray, isNotNull, lt, lte, or, sql } from "@openwork-ee/den-db/drizzle"
 import { AuditEventResourceTable, AuditEventTable, AuditOperationTable, AuditStateTable } from "@openwork-ee/den-db/schema"
 import { parseStoredAuditEnvelope, readAuditPolicy, type AuditDatabase, type AuditTx } from "@openwork-ee/den-db/audit-log"
 import { normalizeDenTypeId, typeId } from "@openwork-ee/utils/typeid"
 import { auditEventsResponseSchema, auditOperationOutcomeSchema, auditOperationsResponseSchema, auditOriginSchema, auditUsageResponseSchema, type AuditOperationSummary } from "@openwork/types/den/audit"
 import { z } from "zod"
-import { initializeAuditPolicyInTx, requireAuditFeature } from "./capture.js"
+import { initializeAuditPolicyInTx, readAuditAvailability } from "./capture.js"
 import { AUDIT_CURSOR_TTL_MS, AuditReadError, auditFilterHash, readAuditCursor, signAuditCursor, type AuditCursor, type AuditCursorBinding } from "./cursors.js"
 
 const safeText = (maximum: number) => z.string().min(1).max(maximum).regex(/^[^\u0000-\u001f\u007f]+$/)
@@ -88,7 +88,7 @@ function operationFilters(reader: AuditReader, organizationId: string, visibleBe
 }
 
 async function snapshot(reader: AuditReader, binding: AuditCursorBinding, cursor?: AuditCursor): Promise<Snapshot> {
-  await requireAuditFeature(reader, binding.organizationId)
+  await readAuditAvailability(reader, binding.organizationId)
   if (cursor) return { visibleBefore: cursor.visibleBefore, issuedAt: cursor.issuedAt, expiresAt: cursor.expiresAt }
   const issuedAt = Date.now()
   const settle = binding.mode === "export-csv" || binding.mode === "export-ndjson" ? AUDIT_EXPORT_SETTLE_MS : 0
@@ -100,6 +100,46 @@ function nextCursor(binding: AuditCursorBinding, state: Snapshot, position: Audi
 }
 function bindingFor(context: QueryContext, mode: AuditCursor["mode"], filters: Filters = {}, operationId: string | null = null): AuditCursorBinding {
   return { organizationId: normalizeDenTypeId("organization", context.organizationId), mode, filterHash: auditFilterHash(filters), operationId: operationId === null ? null : normalizeDenTypeId("auditOperation", operationId) }
+}
+
+const MAX_REFERENCES_PER_EVENT = 256
+type OperationId = typeof AuditOperationTable.$inferSelect.id
+type EventId = typeof AuditEventTable.$inferSelect.id
+type SummaryReference = { type: string; id: string; relationship: "target" | "parent" | "related"; label: string | null }
+
+// The summary of an operation shows its first event's action and stored references.
+// Loads them for a whole page in two queries instead of two per operation.
+async function readFirstEvents(reader: AuditReader, organization: string, visibleBefore: Date, operationIds: OperationId[]) {
+  const organizationId = normalizeDenTypeId("organization", organization)
+  const firstEvents = new Map<string, { id: EventId; action: string }>()
+  const references = new Map<string, SummaryReference[]>()
+  if (!operationIds.length) return { firstEvents, references }
+  const firstIds = reader.select({ operationId: AuditEventTable.operation_id, firstId: sql<string>`min(${AuditEventTable.id})`.as("first_id") }).from(AuditEventTable)
+    .where(and(eventScope(organizationId, visibleBefore), inArray(AuditEventTable.operation_id, operationIds)))
+    .groupBy(AuditEventTable.operation_id).as("first_event")
+  const firstRows = await reader.select({ operationId: AuditEventTable.operation_id, id: AuditEventTable.id, action: AuditEventTable.action }).from(firstIds)
+    .innerJoin(AuditEventTable, and(eq(AuditEventTable.org_id, organizationId), eq(AuditEventTable.id, firstIds.firstId), eq(AuditEventTable.operation_id, firstIds.operationId)))
+  for (const row of firstRows) if (row.operationId) firstEvents.set(row.operationId, { id: row.id, action: row.action })
+  const eventIds = [...firstEvents.values()].map((event) => event.id)
+  if (!eventIds.length) return { firstEvents, references }
+  // Each event stores at most 256 references, so a page needs at most 256 per
+  // event; reading one more row than that proves some event is over the cap.
+  const refs = await reader.select({
+    operationId: AuditEventResourceTable.operation_id, eventId: AuditEventResourceTable.event_id,
+    type: AuditEventResourceTable.resource_type, id: AuditEventResourceTable.resource_id, relationship: AuditEventResourceTable.relationship, label: AuditEventResourceTable.label,
+  }).from(AuditEventResourceTable).where(and(
+    eq(AuditEventResourceTable.organization_id, organizationId), inArray(AuditEventResourceTable.event_id, eventIds), inArray(AuditEventResourceTable.operation_id, operationIds),
+  )).orderBy(asc(AuditEventResourceTable.event_id), asc(AuditEventResourceTable.id)).limit(eventIds.length * MAX_REFERENCES_PER_EVENT + 1)
+  if (refs.length > eventIds.length * MAX_REFERENCES_PER_EVENT) throw new AuditReadError("audit_storage_inconsistent")
+  for (const { operationId, eventId, ...ref } of refs) {
+    // Only references stored against the operation that owns the first event, as before.
+    if (firstEvents.get(operationId)?.id !== eventId) continue
+    const list = references.get(eventId) ?? []
+    list.push(ref)
+    if (list.length > MAX_REFERENCES_PER_EVENT) throw new AuditReadError("audit_storage_inconsistent")
+    references.set(eventId, list)
+  }
+  return { firstEvents, references }
 }
 
 export async function listAuditOperations(context: QueryContext, query: z.infer<typeof auditOperationsQuerySchema>) {
@@ -119,15 +159,14 @@ export async function listAuditOperations(context: QueryContext, query: z.infer<
     exists(reader.select({ id: AuditEventTable.id }).from(AuditEventTable).where(and(eventJoin(context.organizationId), eventScope(context.organizationId, visibleBefore))).limit(1)),
     position ? or(lt(AuditOperationTable.first_recorded_at, new Date(position.startedAt)), and(eq(AuditOperationTable.first_recorded_at, new Date(position.startedAt)), lt(AuditOperationTable.id, position.operationId))) : undefined,
   )).orderBy(desc(AuditOperationTable.first_recorded_at), desc(AuditOperationTable.id)).limit(limit + 1)
+  const page = rows.slice(0, limit)
+  const { firstEvents, references } = await readFirstEvents(reader, binding.organizationId, visibleBefore, page.map((row) => row.id))
   const operations: AuditOperationSummary[] = []
   let lastPosition: AuditCursor["position"] | undefined
-  for (const row of rows.slice(0, limit)) {
-    const [first] = await reader.select({ id: AuditEventTable.id, action: AuditEventTable.action }).from(AuditEventTable).where(and(eventScope(context.organizationId, visibleBefore), eq(AuditEventTable.operation_id, row.id))).orderBy(asc(AuditEventTable.id)).limit(1)
+  for (const row of page) {
+    const first = firstEvents.get(row.id)
     if (!first) throw new AuditReadError("audit_storage_inconsistent")
-    const refs = await reader.select({ type: AuditEventResourceTable.resource_type, id: AuditEventResourceTable.resource_id, relationship: AuditEventResourceTable.relationship, label: AuditEventResourceTable.label }).from(AuditEventResourceTable).where(and(
-      eq(AuditEventResourceTable.organization_id, binding.organizationId), eq(AuditEventResourceTable.operation_id, row.id), eq(AuditEventResourceTable.event_id, first.id),
-    )).orderBy(asc(AuditEventResourceTable.id)).limit(257)
-    if (refs.length > 256) throw new AuditReadError("audit_storage_inconsistent")
+    const refs = references.get(first.id) ?? []
     operations.push({ ...row, startedAt: row.startedAt.toISOString(), action: first.action, resources: refs.map(({ label, ...ref }) => ({ ...ref, ...(label === null ? {} : { label }) })) })
     lastPosition = { operationId: row.id, eventId: first.id, startedAt: row.startedAt.toISOString() }
   }
@@ -172,8 +211,8 @@ async function eventPage(context: QueryContext, query: Page, binding: AuditCurso
 export async function readAuditUsage(context: Pick<QueryContext, "database" | "organizationId">, captureEnabled: boolean) {
   const organizationId = normalizeDenTypeId("organization", context.organizationId)
   return context.database.transaction(async (tx) => {
-    const { entitlement, featureEnabled } = await requireAuditFeature(tx, organizationId)
-    const captureAvailable = featureEnabled && captureEnabled
+    const { entitlement } = await readAuditAvailability(tx, organizationId)
+    const captureAvailable = captureEnabled
     // GET usage can provision a ready org.
     await initializeAuditPolicyInTx(tx, organizationId, captureAvailable)
     const [state] = await tx.select({ retainedOperations: AuditStateTable.retained_operations, eventCount: AuditStateTable.event_count, logicalBytes: AuditStateTable.logical_bytes, measuredAt: AuditStateTable.updated_at }).from(AuditStateTable).where(eq(AuditStateTable.organization_id, organizationId)).limit(1)

@@ -606,7 +606,6 @@ for (const deployment of noCloudDeployments) {
         throw new Error("No Cloud client should be created")
       })
       try {
-        expect(context.remoteSessionsEnabled).toBe(true)
         const source = registry.CAPABILITY_SOURCES.remoteSession
         expect((await source.search(context, "remote session desktop", 10)).map((match) => match.name).sort()).toEqual([
           "remote-session:create", "remote-session:list", "remote-session:read", "remote-session:send", "remote-session:stop", "remote-session:targets",
@@ -670,23 +669,21 @@ for (const deployment of noCloudDeployments) {
   })
 }
 
-test("a deployment without desktop or Cloud runtime hides remote-session capabilities", async () => {
+test("registered targets remain discoverable without a desktop or Cloud runtime", async () => {
   await withDeployment({ orgMode: "multi_org", provisionerMode: "stub", runtimeEnabled: false }, async () => {
     const { registry, context } = await registryContext()
-    expect(context.remoteSessionsEnabled).toBe(false)
-    expect(await registry.CAPABILITY_SOURCES.remoteSession.search(context, "remote session", 10)).toEqual([])
-    context.principal.scopes = new Set(["mcp:read"])
-    const executed = await registry.executeCapability(context, { name: "remote-session:create", body: {} })
+    expect((await registry.CAPABILITY_SOURCES.remoteSession.search(context, "remote session", 10)).map((match) => match.name)).toContain("remote-session:targets")
+    context.principal.scopes = new Set(["mcp:read", "mcp:write"])
+    const executed = await registry.executeCapability(context, { name: "remote-session:create", body: { target: "cloud" } })
     expect(executed.isError).toBe(true)
     const text = executed.content.find((part) => part.type === "text")
-    expect(text?.type === "text" ? text.text : "").toContain("unknown_capability")
+    expect(text?.type === "text" ? text.text : "").toContain("openwork_web_access_required")
   })
 })
 
 test("Cloud availability does not enable a disabled desktop runner", async () => {
   await withDeployment({ orgMode: "multi_org", provisionerMode: "daytona", daytonaApiKey: "witness-not-a-real-key", runtimeEnabled: false }, async () => {
     const { registry, context } = await registryContext()
-    expect(context.remoteSessionsEnabled).toBe(true)
     expect((await registry.CAPABILITY_SOURCES.remoteSession.search(context, "remote session cloud web", 10)).map((match) => match.name)).toContain("remote-session:create")
     const result = await executeRemoteSessionCapability(executeInput("create", { target: "desktop" }), {
       ...readyDeps({}),

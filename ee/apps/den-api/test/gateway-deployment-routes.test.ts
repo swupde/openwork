@@ -17,6 +17,15 @@ mock.module("../src/db.js", () => ({ db: { select: storageReached, transaction: 
 // Better Auth's startup seeding away from the deliberately throwing DB sentinel;
 // inference-provider-oauth.test.ts covers the real signed-cookie boundary.
 mock.module("../src/auth.js", createMockDenAuth)
+  // Authentication/deployment fixtures use catalog defaults; permission-set persistence has its own suite.
+  const effective = await import("../src/permissions/effective.js")
+  mock.module("../src/permissions/resolve.js", () => ({
+    resolveMemberPermissionsFromContext: async (context: { currentMember: { isOwner: boolean; role: string } }) => effective.memberPermissionsFromGrants({
+      isOwner: context.currentMember.isOwner, isAdmin: context.currentMember.role === "admin",
+      grants: effective.codeDefaultPermissionGrants({ isAdmin: context.currentMember.role === "admin" }),
+    }),
+  }))
+
 mock.module("../src/session.js", () => ({ readSignedSessionCookieToken: async () => null, readInternalMcpPrincipalCredentialId: () => null, readInternalCapabilityConnectorId: () => null }))
 
 process.env.DATABASE_URL = "mysql://fixture:fixture@127.0.0.1:3306/not_connected"

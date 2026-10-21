@@ -28,7 +28,7 @@ claimed. Raw PR material and historical images are not committed here.
 | Desktop Calendar | Readable initial hour, bounded creation/details, setup and blocked-state direction | `automation-calendar.e2e.test.ts` |
 | Den text and search | Readable sentence-case labels, long workspace heading, clear palette empty state | `den-dashboard-activity.e2e.test.ts`, `den-command-palette.e2e.test.ts` |
 | Shared save bars | Painted bottom inset and focus scroll clearance; Remove-only rows stay inline | `permissions-ui.e2e.test.ts`, `ai-gateway-cloud-sign-in.e2e.test.ts` |
-| Gateway | Consistent provider filtering, loading/error/empty recovery, access-removal confirmation, searchable team assignment | `litellm-preview-flag.e2e.test.ts`, `ai-gateway-admin-provider.e2e.test.ts`, `ai-gateway-cloud-sign-in.e2e.test.ts`, `ai-gateway-spend-limits.e2e.test.ts` |
+| Gateway | Consistent provider filtering, loading/error/empty recovery, access-removal confirmation, searchable team assignment | `ai-gateway-provider-catalog.e2e.test.ts`, `ai-gateway-admin-provider.e2e.test.ts`, `ai-gateway-cloud-sign-in.e2e.test.ts`, `ai-gateway-spend-limits.e2e.test.ts` |
 | Deployments | Explicit removal and cancel, consistent lanes, readable pending state, responsive consent | `managed-deployments.e2e.test.ts` |
 | Permissions and members | Readable tabs and identity, usable narrow rows, real team-admin controls and denied identities | `permissions-ui.e2e.test.ts`, `team-organization-admin-ui.e2e.test.ts` |
 | Analytics | Neutral zero-failure and plan-locked states, contextual reasons, compact filtering | `library-usage.e2e.test.ts`, `workflow-run-previews.e2e.test.ts` |
@@ -62,14 +62,12 @@ absence. Neither observation workaround weakens the actual UI claim.
 
 ## Rollout and deliberate retained behavior
 
-- `denFlatPageHeaders` is newly declared **off**, on cloud and self-hosted,
-  before its implementation. It changes only presentation; turning it off
-  restores the existing header without changing objects, permissions,
-  navigation, or running work. No production rollout is changed by this audit.
-- `auditLogsCompact` is declared **off** on cloud and self-hosted. It changes
-  only audit presentation, through Den's resolved feature map. Turning it off
-  restores the previous operation table and capture settings; recording,
-  retained evidence, filters, redaction and permission checks remain unchanged.
+- Compact page headers are now the only header presentation (the former
+  `denFlatPageHeaders` flag is retired). They change only presentation, not
+  objects, permissions, navigation, or running work.
+- Compact audit rows are now the only audit presentation (the former
+  `auditLogsCompact` flag is retired). Recording, retained evidence, filters,
+  redaction and permission checks are unchanged.
 - Other repairs preserve their existing feature gates and server contracts.
 - `Cloud default` is the organization's cloud-agent default, not the free
   `Auto` model. Explicit Automation model choices remain intact.
@@ -78,9 +76,8 @@ absence. Neither observation workaround weakens the actual UI claim.
 - A connector is not called `Ready` merely because it requires no sign-in:
   readiness needs an actual verified, retained health observation.
 - Stop is an intentional terminal outcome, not an error inviting an automatic
-  restart. Earlier work and the conversation remain available. With
-  `calendarPolish`, Run again explicitly creates a new task; the stopped task
-  stays stopped.
+  restart. Earlier work and the conversation remain available. Run again
+  explicitly creates a new task; the stopped task stays stopped.
 - Synthetic fixture names are not outside identities. Technical audit data
   stays available behind explicit disclosures and requested change details.
 - Native-scroll edge clipping after a person's deliberate scroll is distinct

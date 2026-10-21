@@ -22,8 +22,9 @@ hold:
 - No high or medium security findings. Low findings are noted, not blocking.
 - No confidentiality findings at any severity.
 - The PR does not change Warden itself: `.github/workflows/warden.yml`,
-  `.github/workflows/warden-clearance.yml`, `.github/scripts/warden-report.mjs`,
-  `.github/scripts/warden-clearance.mjs`, `warden.toml`, or `.warden/`.
+  `.github/workflows/warden-clearance.yml`, `.github/workflows/warden-quick.yml`,
+  `.github/scripts/warden-report.mjs`, `.github/scripts/warden-clearance.mjs`,
+  `.github/scripts/warden-fast.mjs`, `warden.toml`, or `.warden/`.
   `warden.yml` runs inside the PR's own review and could forge its result; the
   others would let one PR rewrite the reviewer for every later PR.
 
@@ -58,6 +59,50 @@ limit is incomplete, never clear, and its `warden-clear` check and comment say
 to split it. Findings from the part that was reviewed are still posted,
 marked as incomplete, so authors can act on them.
 
+## Review cost and generated files
+
+The effective standard policy is the repository-root `warden.toml`, not
+`.warden/warden.toml`. Its coalescing target is 12,000 characters instead of
+Warden 0.43.0's 8,000. Nearby hunks still need to be within 30 lines to merge;
+large hunks are still split. This amortizes repeated prompts and extraction
+calls without removing any eligible diff lines. Models, verification,
+findings thresholds, both skills and scan limits are unchanged. The separate
+contributor screen policy is unchanged too.
+
+Do not add blanket ignores for Drizzle metadata, generated SDK code or
+OpenAPI. The contract lane regenerates OpenAPI and SDK from source, but an
+OpenAPI-only PR currently selects the docs lane and does not run that check.
+Drizzle's historical snapshots and journal have no equivalent deterministic
+regeneration check. Schema declarations, migration SQL, routes and generators
+must remain reviewed, as must confidentiality. Existing Warden built-in
+ignores (including generated markers) and size-limit skips are not new
+exclusions; size-limit skips continue to make clearance incomplete.
+
+An offline sample of the 30 first-parent commits ending at `50f4d06b8` has
+46,342 changed lines; 29,789 (64.3%) are those generated paths. Applying the
+pinned CLI's actual filters and scan limits gives 787 → 757 initial analysis
+chunks per skill (3.8% fewer), with identical skips and eligible diff lines.
+Only one eligible generated-file chunk remains in this sample: most generated
+volume already hits size limits or built-in ignores, so raw diff proportions
+would greatly overstate possible savings. This is a call-count proxy, not a
+claim about billed tokens, total model calls or wall-clock duration.
+
+To reproduce without credentials or model calls, install
+`@sentry/warden@0.43.0` with `pnpm add --ignore-scripts` in a separate scratch
+package (not this workspace), then point at that package's installation:
+
+```sh
+export WARDEN_PACKAGE_ROOT=/path/to/scratch/node_modules/@sentry/warden
+node --test .warden/tests/chunking.test.mjs
+node .warden/scripts/measure-chunks.mjs 50f4d06b8
+node --test .github/scripts/warden-report.test.mjs
+```
+
+The offline tests use Warden's own config loader and chunker. The measurement
+asserts unchanged skips, files and diff-line order across the whole sample.
+The existing CI reporter tests also guard against newly added exclusions,
+missing skills or changed scan coverage; neither command calls a model.
+
 ## Local review
 
 With the model credentials configured, run the pinned CLI:
@@ -70,6 +115,59 @@ This reviews committed branch changes against `dev`. For an uncommitted
 iteration, `pnpm warden:check --staged` reviews the index. Local security and
 confidentiality findings still return a failure at every severity. Missing
 credentials, partial analysis, and model errors are incomplete reviews.
+
+## Fast feedback: re-review only what moved
+
+A full review of a large PR takes about 20 minutes, and every push restarts
+it. Two tools give feedback in a few minutes instead. Neither approves
+anything: clearance still comes only from the full review of the exact head.
+
+Both fingerprint each file's own change: the lines it adds and removes, plus
+mode and binary markers, without line numbers or surrounding context. Merging
+or rebasing `dev` keeps a file's fingerprint unless `dev` touched the change
+itself or a conflict was resolved inside it. Only files whose fingerprint
+changed since the last complete review are sent to Warden, with each skill
+limited to them through `paths`; findings for the other files carry over.
+
+**In CI**, `.github/workflows/warden-quick.yml` runs on every push to a
+same-repository PR. It finds the newest complete review of the PR (the full
+review's `warden-findings` artifact or an earlier quick review's
+`warden-quick-baseline`), checked against the run, PR and commit it claims.
+Like `warden.yml`, it runs only trusted code, policy and skills from the PR's
+base and never installs or runs PR code. Warden's agent gets no GitHub token,
+and credential-shaped text is redacted from what it writes. Results appear in
+the job summary and as annotations on the diff. Confidentiality findings
+appear only as a count.
+It does nothing for PRs under 15 files (the full review is already quick), for
+the first push (no review to compare against yet), or when more than half the
+files moved. A finished quick review becomes the next push's baseline; an
+incomplete one keeps the earlier findings and saves nothing.
+
+**Before pushing**, `pnpm warden:quick` does the same on your branch against
+your last local review, kept in `.git/warden-quick/`. The first run reviews
+the whole branch; a change to `warden.toml` or `.warden/skills` on `dev`
+starts over. The policy, skills and model catalog (`.warden/pi`) always come
+from `origin/dev`, never from the branch under review, so a branch can't steer
+the reviewer or send your key elsewhere.
+It exits 1 on high or medium security findings or any confidentiality finding,
+and 2 when it couldn't review (no `WARDEN_OPENAI_API_KEY`, model errors).
+To run it on every push from the checked-out branch, after
+`pnpm hooks:install`:
+
+```sh
+git config --local openwork.wardenPrePush true
+```
+
+The hook runs the reviewer script from `origin/dev`, not from the branch being
+pushed. It blocks a push only on findings CI's Warden would block on; skip it
+once with `git push --no-verify`. If the review can't finish, the push goes
+ahead. It only reviews when you push `HEAD`, and never commits or pushes.
+Like any `core.hooksPath` hook, the hook file itself comes from your checkout,
+so enable it only in checkouts whose branches you trust.
+
+Fast reviews see less of the PR at once than the full review, so an
+interaction between a moved file and an unchanged one can be missed until the
+full review runs. That is why they never clear a PR.
 
 ## Rollout
 

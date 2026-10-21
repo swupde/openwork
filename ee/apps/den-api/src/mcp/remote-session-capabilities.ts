@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto"
-import { createHeadlessThreadClient, toTranscript, type AgentSessionClient, type HeadlessThreadModel } from "@openwork/headless-threads"
+import { createHeadlessThreadClient, toTranscript, type AgentSessionClient, type HeadlessThreadClient, type HeadlessThreadModel } from "@openwork/headless-threads"
 import { and, eq, isNull } from "@openwork-ee/den-db/drizzle"
 import { MemberTable } from "@openwork-ee/den-db/schema/org"
 import { createDenTypeId, normalizeDenTypeId, type DenTypeId } from "@openwork-ee/utils/typeid"
@@ -8,14 +8,16 @@ import { desktopRunnerConnected } from "@openwork/automations"
 import {
   REMOTE_SESSION_CONTROL_RUNNER_CAPABILITY,
   REMOTE_SESSION_DESKTOP_RUNNER_CAPABILITY,
+  REMOTE_SESSION_STATUS_THREADS_MAX,
+  REMOTE_SESSION_STATUS_WAIT_MAX_MS,
   REMOTE_SESSION_TRANSCRIPT_PAGE_MAX,
+  remoteSessionStatusRequestSchema,
   type RemoteSessionRequestInput,
   desktopRunnerInventorySchema,
   type DesktopRunnerInventory,
 } from "@openwork/types/automations"
 import { db } from "../db.js"
 import { env } from "../env.js"
-import { organizationFeatureEnabled } from "../features.js"
 import { appLogger } from "../observability/logger.js"
 import {
   getOpenWorkWebRuntimeAccess,
@@ -44,6 +46,7 @@ import {
 import { cloudRuntimeAvailable } from "../workers/cloud-runtime.js"
 import { resolveCloudRuntimeAccess, type CloudWorkerAccess } from "../workers/worker-access.js"
 import { fetchPreviewNoRedirect, previewFetch } from "../workers/preview-fetch.js"
+import { readRemoteSessionStatus, type RemoteSessionStatusSources } from "./remote-session-status.js"
 import { scoreText, tokenize, type CapabilityMatch } from "./search.js"
 
 /**
@@ -53,7 +56,7 @@ import { scoreText, tokenize, type CapabilityMatch } from "./search.js"
  */
 
 export const REMOTE_SESSION_CAPABILITY_PREFIX = "remote-session:"
-export const REMOTE_SESSION_ACTIONS = ["create", "send", "read", "stop", "list", "targets"] as const
+export const REMOTE_SESSION_ACTIONS = ["create", "send", "read", "stop", "list", "targets", "status"] as const
 export type RemoteSessionAction = (typeof REMOTE_SESSION_ACTIONS)[number]
 
 export function remoteSessionCapabilityName(action: RemoteSessionAction): string {
@@ -132,6 +135,9 @@ const readBodySchema = z.object({
   }
 })
 
+/** The same arguments as the capabilities, for the member routes that call them. */
+export { readBodySchema as remoteSessionReadBodySchema, sendBodySchema as remoteSessionSendBodySchema, stopBodySchema as remoteSessionStopBodySchema }
+
 const LIST_DEFAULT_LIMIT = 20
 const listBodySchema = z.object({
   target: z.enum(["desktop", "registered"]),
@@ -146,6 +152,7 @@ const BODY_SCHEMAS: Record<RemoteSessionAction, z.ZodTypeAny> = {
   stop: stopBodySchema,
   list: listBodySchema,
   targets: targetsBodySchema,
+  status: remoteSessionStatusRequestSchema,
 }
 
 type RemoteSessionDefinition = {
@@ -252,6 +259,31 @@ const REMOTE_SESSION_DEFINITIONS: RemoteSessionDefinition[] = [
     },
   },
   {
+    action: "status",
+    summary:
+      `Follow remote sessions cheaply: one call returns the compact status (state starting, running, waiting, idle or error; waitingFor; computer; a short preview of the answer) of up to ${REMOTE_SESSION_STATUS_THREADS_MAX} sessions, by commandId for desktop or registered targets and by sessionId for Cloud. Pass back each version you received: an unchanged session returns only its ref and version. Pass waitMs (up to ${REMOTE_SESSION_STATUS_WAIT_MAX_MS}) to wait in one call until one changes instead of polling; it returns at once when every session has settled. Use remote-session:read for the transcript or the full answer.`,
+    searchExtraTokens: "remote session sessions status progress poll wait follow watch check done finished waiting question permission batch several many",
+    argumentsSchema: {
+      type: "object",
+      properties: {
+        threads: {
+          type: "array",
+          maxItems: REMOTE_SESSION_STATUS_THREADS_MAX,
+          items: {
+            type: "object",
+            properties: {
+              commandId: { type: "string", description: "Desktop or registered targets: the commandId from remote-session:create." },
+              sessionId: { type: "string", description: "Cloud: the sessionId from remote-session:create." },
+              version: { type: "string", description: "The version from your previous status of this session." },
+            },
+          },
+        },
+        waitMs: { type: "number", description: `Wait up to this long (max ${REMOTE_SESSION_STATUS_WAIT_MAX_MS}) for a change. Defaults to 0.` },
+      },
+      required: ["threads"],
+    },
+  },
+  {
     action: "list",
     summary:
       "List the sessions you started on your desktop with remote-session:create target \"desktop\", newest first, with title, sessionId, workspaceId, status, and updatedAt. Use a sessionId with remote-session:read, send, or stop.",
@@ -270,12 +302,13 @@ const REMOTE_SESSION_DEFINITIONS: RemoteSessionDefinition[] = [
 
 export type RemoteSessionCapabilityMatch = CapabilityMatch & { kind: "remote_session" }
 
-export function searchRemoteSessionCapabilities(query: string, limit = 5): RemoteSessionCapabilityMatch[] {
+export function searchRemoteSessionCapabilities(query: string, limit = 5, options: { status?: boolean } = {}): RemoteSessionCapabilityMatch[] {
   const queryTokens = tokenize(query)
   if (queryTokens.length === 0) return []
 
   const matches: RemoteSessionCapabilityMatch[] = []
   for (const definition of REMOTE_SESSION_DEFINITIONS) {
+    if (definition.action === "status" && !options.status) continue
     const name = remoteSessionCapabilityName(definition.action)
     const score = scoreText(
       tokenize(`remote session ${definition.action}`),
@@ -322,7 +355,9 @@ export type RemoteSessionRuntimeResult =
       retryAfterMs?: number
     }
 
-export type RemoteSessionThreadClient = Pick<AgentSessionClient, "createThread" | "sendTurn" | "getThreadSnapshot"> & Partial<Pick<AgentSessionClient, "abortThread">>
+export type RemoteSessionThreadClient = Pick<AgentSessionClient, "createThread" | "sendTurn" | "getThreadSnapshot">
+  & Partial<Pick<AgentSessionClient, "abortThread">>
+  & Partial<Pick<HeadlessThreadClient, "getThreadWaitingFor">>
 
 /** One of the member's desktops that can take remote sessions, with its latest inventory. */
 export type RemoteSessionDesktopRecord = {
@@ -342,7 +377,8 @@ export type RemoteSessionDesktopTargets = {
 
 export type RemoteSessionExecuteDeps = {
   getOpenWorkWebAccess: OpenWorkWebRuntimeAccessResolver
-  resolveRuntime: (scope: { organizationId: DenTypeId<"organization">; userId: string; provisionIfMissing?: boolean }) => Promise<RemoteSessionRuntimeResult>
+  /** readyBudgetMs bounds how long a starting runtime is awaited; 0 checks once. */
+  resolveRuntime: (scope: { organizationId: DenTypeId<"organization">; userId: string; provisionIfMissing?: boolean; readyBudgetMs?: number }) => Promise<RemoteSessionRuntimeResult>
   createClient: (runtime: RemoteSessionRuntime) => RemoteSessionThreadClient
   commandStore: RemoteSessionCommandStore
   desktopPresence: (scope: {
@@ -356,8 +392,6 @@ export type RemoteSessionExecuteDeps = {
     ownerMemberId: string
     runnerId: string
   }) => Promise<{ connected: boolean; controlCapable: boolean; registered?: boolean }>
-  /** The organization rollout, independently of Automations and Cloud hosting. */
-  registeredTargetsEnabled?: (scope: { organizationId: DenTypeId<"organization">; userId: string }) => Promise<boolean>
   /** How long a desktop request is awaited before returning its requestId. */
   requestWait?: { timeoutMs: number; pollMs: number }
   /**
@@ -412,16 +446,6 @@ function cloudRemoteSessionsAvailable(): boolean {
   return cloudHostingAvailable({ orgMode: env.orgMode, openworkWebEnabled: env.openworkWebEnabled }) && cloudRuntimeAvailable()
 }
 
-export function remoteSessionCapabilitiesEnabled(
-  registeredTargetsEnabled = false,
-): boolean {
-  return registeredTargetsEnabled || env.automations.runtimeEnabled || cloudRemoteSessionsAvailable()
-}
-
-async function registeredTargetsEnabled(scope: { organizationId: DenTypeId<"organization">; userId: string }): Promise<boolean> {
-  return organizationFeatureEnabled(scope.organizationId, "remoteSessionTargets")
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null
 }
@@ -470,13 +494,13 @@ export async function resolveRemoteSessionWorkspace(
 }
 
 async function defaultResolveRuntime(
-  scope: { organizationId: DenTypeId<"organization">; userId: string; provisionIfMissing?: boolean },
+  scope: { organizationId: DenTypeId<"organization">; userId: string; provisionIfMissing?: boolean; readyBudgetMs?: number },
 ): Promise<RemoteSessionRuntimeResult> {
   if (!cloudRemoteSessionsAvailable()) {
     return { ok: false, error: "cloud_not_available", message: CLOUD_NOT_AVAILABLE_MESSAGE, retryable: false }
   }
 
-  const deadline = Date.now() + READY_BUDGET_MS
+  const deadline = Date.now() + (scope.readyBudgetMs ?? READY_BUDGET_MS)
   for (;;) {
     const access = await resolveCloudRuntimeAccess({
       organizationId: scope.organizationId,
@@ -577,7 +601,6 @@ async function defaultDesktopTargets(scope: {
 }): Promise<RemoteSessionDesktopTargets> {
   const ownerMemberId = await activeMemberId(scope)
   if (!ownerMemberId) return { ownerMemberId: null, computers: [] }
-  const enabled = await registeredTargetsEnabled(scope)
   const rows = await automationRepository.listRemoteSessionDesktops({
     organizationId: scope.organizationId,
     ownerMemberId,
@@ -586,7 +609,7 @@ async function defaultDesktopTargets(scope: {
   })
   return {
     ownerMemberId,
-    computers: rows.filter((row) => enabled || !row.capabilities.includes("remote_session_only_v1")).map((row) => {
+    computers: rows.map((row) => {
       // Stored reports were validated on the way in; a row that no longer
       // parses (an older shape) reads as a desktop that reported nothing.
       const inventory = row.inventory ? desktopRunnerInventorySchema.safeParse(row.inventory) : null
@@ -643,7 +666,6 @@ export const DEFAULT_REMOTE_SESSION_DEPS: RemoteSessionExecuteDeps = {
     (await import("../slack-assistant/desktop-handoff.js")).linkDesktopCommandToSlack(input),
   desktopTargets: defaultDesktopTargets,
   cloudAvailable: cloudRemoteSessionsAvailable,
-  registeredTargetsEnabled,
 }
 
 const PLATFORM_LABELS: Record<RemoteSessionDesktopRecord["platform"], string> = {
@@ -973,6 +995,8 @@ export type RemoteSessionExecuteInput = {
   body: unknown
   /** Set when the call is made with a headless-run token Den minted (for example for a Slack run). */
   headlessRunTokenId?: string | null
+  /** Ends a waiting status call when the caller goes away. */
+  signal?: AbortSignal
 }
 
 /** The desktop took the command but its local OpenWork server or engine did not answer. */
@@ -1041,6 +1065,28 @@ async function linkToOriginatingRun(
   }
 }
 
+/** Status reads scoped to the caller: their commands, their computers, their Cloud. */
+function remoteSessionStatusSources(input: RemoteSessionExecuteInput, deps: RemoteSessionExecuteDeps): RemoteSessionStatusSources {
+  const scope = { organizationId: input.organizationId, userId: input.userId }
+  return {
+    commands: (commandIds) => deps.commandStore.getMany({ commandIds, organizationId: input.organizationId, createdByUserId: input.userId }),
+    async computerLabels() {
+      const targets = await (deps.desktopTargets ?? defaultDesktopTargets)(scope)
+      return new Map(targets.computers.map((computer) => [computer.computerId, computer.inventory?.computer.label ?? PLATFORM_LABELS[computer.platform]]))
+    },
+    async cloud() {
+      if (!(deps.cloudAvailable ?? cloudRemoteSessionsAvailable)()) return { error: { code: "cloud_not_available", message: CLOUD_NOT_AVAILABLE_MESSAGE } }
+      if (!(await deps.getOpenWorkWebAccess(input.organizationId)).hasAccess) {
+        return { error: { code: OPENWORK_WEB_ACCESS_REQUIRED_CODE, message: OPENWORK_WEB_ACCESS_REQUIRED_MESSAGE } }
+      }
+      // A status read never waits for a waking workspace: the caller asks again.
+      const runtime = await deps.resolveRuntime({ ...scope, readyBudgetMs: 0 })
+      if (runtime.ok) return { client: deps.createClient(runtime.runtime) }
+      return runtime.retryable ? null : { error: { code: runtime.error, message: runtime.message } }
+    },
+  }
+}
+
 async function executeRemoteSession(
   input: RemoteSessionExecuteInput,
   deps: RemoteSessionExecuteDeps,
@@ -1064,6 +1110,11 @@ async function executeRemoteSession(
       })),
       retryable: false,
     })
+  }
+
+  if (input.action === "status") {
+    const body = remoteSessionStatusRequestSchema.parse(parsedBody.data)
+    return jsonResult(await readRemoteSessionStatus(body, remoteSessionStatusSources(input, deps), { signal: input.signal }))
   }
 
   if (input.action === "list") {
@@ -1131,29 +1182,18 @@ async function executeRemoteSession(
 
   // Registered clients are an OpenWork offload surface, not an entitlement to
   // a Cloud worker. Keep Cloud and legacy desktop access rules unchanged.
-  const registeredEnabled = await (deps.registeredTargetsEnabled ?? registeredTargetsEnabled)({
-    organizationId: input.organizationId, userId: input.userId,
-  })
   const registeredCreate = input.action === "create" && createBodySchema.parse(parsedBody.data).target === "registered"
-  if (registeredCreate && !registeredEnabled) {
-    return errorResult({ error: "feature_disabled", message: "Remote session targets are not enabled for your organization.", retryable: false })
-  }
   if (input.action === "read" || input.action === "send" || input.action === "stop") {
     const session = await findDesktopSession(input, parsedBody.data, deps)
     if (session) {
       const runner = await deps.desktopRunner({ organizationId: input.organizationId, ownerMemberId: session.ownerMemberId, runnerId: session.runnerId })
       if (runner.registered) {
-        // Turning off a rollout must not hide history or prevent stopping an
-        // admitted task. A new turn, however, is new offloaded work.
-        if (input.action === "send" && !registeredEnabled) {
-          return errorResult({ error: "feature_disabled", message: "New remote turns are disabled; you can still read or stop this session.", retryable: false })
-        }
         return executeDesktopSessionAction(input, parsedBody.data, session, deps)
       }
     }
   }
   const webAccess = registeredCreate ? { hasAccess: false } : await deps.getOpenWorkWebAccess(input.organizationId)
-  if (input.action === "targets" && registeredEnabled) {
+  if (input.action === "targets") {
     const body = targetsBodySchema.parse(parsedBody.data)
     const targets = await (deps.desktopTargets ?? defaultDesktopTargets)({ organizationId: input.organizationId, userId: input.userId })
     return jsonResult(targetsPayload(targets, {
@@ -1175,24 +1215,10 @@ async function executeRemoteSession(
     if (desktopSession) return executeDesktopSessionAction(input, parsedBody.data, desktopSession, deps)
   }
 
-  if (input.action === "targets") {
-    const body = targetsBodySchema.parse(parsedBody.data)
-    const targets = env.automations.runtimeEnabled
-      ? await (deps.desktopTargets ?? defaultDesktopTargets)({ organizationId: input.organizationId, userId: input.userId })
-      : { ownerMemberId: null, computers: [] }
-    return jsonResult(targetsPayload(targets, {
-      includeModels: body.includeModels === true,
-      cloudAvailable: (deps.cloudAvailable ?? cloudRemoteSessionsAvailable)(),
-      now: Date.now(),
-    }))
-  }
-
   if (input.action === "create") {
     const body = createBodySchema.parse(parsedBody.data)
     if (body.target === "registered" || (body.target === "desktop" && (body.computerId !== undefined || body.workspaceId !== undefined))) {
-      const targets = registeredEnabled || env.automations.runtimeEnabled
-        ? await (deps.desktopTargets ?? defaultDesktopTargets)({ organizationId: input.organizationId, userId: input.userId })
-        : { ownerMemberId: null, computers: [] }
+      const targets = await (deps.desktopTargets ?? defaultDesktopTargets)({ organizationId: input.organizationId, userId: input.userId })
       // Registered admission has separate access rules. Never let that alias
       // select a legacy desktop that still requires Web access.
       const computers = body.target === "registered"

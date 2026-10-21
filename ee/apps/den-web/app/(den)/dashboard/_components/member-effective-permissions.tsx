@@ -4,17 +4,18 @@ import Link from "next/link";
 import { getPermissionDefinition, isPermissionKey } from "@openwork/types/den/permissions";
 import { DenButton } from "../../_components/ui/button";
 import { DenNotice } from "../../_components/ui/notice";
-import { getOrgAccessFlags, getPermissionSetRoute, orgFeatureEnabled, type DenOrgContext } from "../../_lib/den-org";
+import { getOrgAccessFlags, getPermissionSetRoute, type DenOrgContext } from "../../_lib/den-org";
 import { useOrgDashboard } from "../_providers/org-dashboard-provider";
 import { useMemberPermissions, type MemberPermissions } from "./permissions-data";
 import { PermissionAreaSection, PermissionRowsSkeleton, permissionAreas } from "./permissions-ui";
+import { permissionSourceRoleLabel } from "./team-roles";
 
 /**
  * Whether the signed-in member may see this member's effective permissions:
- * the feature is on, and they hold `permissions.view` or it is themselves.
+ * they hold `permissions.view` or it is themselves.
  */
 export function canViewMemberPermissions(orgContext: DenOrgContext | null, memberId: string): boolean {
-  if (!orgContext || !orgFeatureEnabled(orgContext, "permissions")) return false;
+  if (!orgContext) return false;
   if (orgContext.currentMember.id === memberId) return true;
   return viewerCanViewPermissions(orgContext);
 }
@@ -26,9 +27,11 @@ function viewerCanViewPermissions(orgContext: DenOrgContext): boolean {
 type Entry = MemberPermissions["permissions"][number];
 type Source = Entry["sources"][number];
 
-function SourceLink({ source, orgSlug, linked }: { source: Source; orgSlug: string | null; linked: boolean }) {
-  if (!source.setId || !linked) return <>{source.label}</>;
-  return <Link className="underline-offset-2 hover:text-gray-900 hover:underline" href={getPermissionSetRoute(orgSlug, source.setId)}>{source.label}</Link>;
+function SourceLink({ source, orgSlug, linked }: { source: Source; orgSlug: string | null; linked: boolean; }) {
+  // each source reads as the role that gives it.
+  const label = permissionSourceRoleLabel(source);
+  if (!source.setId || !linked) return <>{label}</>;
+  return <Link className="underline-offset-2 hover:text-gray-900 hover:underline" href={getPermissionSetRoute(orgSlug, source.setId)}>{label}</Link>;
 }
 
 /** "Effective permissions" for one member, each with where it comes from. */

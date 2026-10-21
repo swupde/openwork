@@ -85,6 +85,7 @@ jobs:
     needs: [authorize, ai-screen]
     if: >-
       github.repository == 'different-ai/openwork' &&
+      github.repository == 'different-ai/openwork' &&
       always() && needs.authorize.outputs.sha != '' &&
       (needs.authorize.outputs.needs_screen == 'false' || needs.ai-screen.outputs.verdict == 'clean')
     runs-on: ubuntu-latest
@@ -115,6 +116,7 @@ jobs:
     needs: [authorize, ai-screen]
     if: >-
       github.repository == 'different-ai/openwork' &&
+      github.repository == 'different-ai/openwork' &&
       always() && needs.authorize.outputs.sha != '' && needs.authorize.outputs.needs_review == 'true' &&
       (needs.authorize.outputs.needs_screen == 'false' || needs.ai-screen.outputs.verdict == 'clean')
     permissions:
@@ -136,6 +138,7 @@ jobs:
   warden-check:
     needs: [authorize, review]
     if: >-
+      github.repository == 'different-ai/openwork' &&
       github.repository == 'different-ai/openwork' &&
       always() && needs.authorize.outputs.sha != '' &&
       (needs.review.result == 'success' || needs.review.result == 'failure')

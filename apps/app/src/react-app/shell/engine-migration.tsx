@@ -1,6 +1,5 @@
 /** @jsxImportSource react */
 import { useEffect, useLayoutEffect, useRef, useState, type PropsWithChildren } from "react";
-import { useQuery } from "@tanstack/react-query";
 import { create } from "zustand";
 import { ChevronRight, LoaderCircle, TriangleAlert } from "lucide-react";
 import {
@@ -29,7 +28,7 @@ import { toast } from "@/components/ui/sonner";
 import { t } from "@/i18n";
 import { cn } from "@/lib/utils";
 import { resolveExtensionIconSrc } from "@/react-app/design-system/extension-icon-src";
-import { useAutomationsDenContext } from "@/react-app/domains/automations/use-automations";
+import { useOrgFeature, useOrgFeatureState } from "@/react-app/domains/cloud/use-org-feature";
 import { resolveOpenworkConnection } from "./openwork-connection";
 
 /**
@@ -69,6 +68,8 @@ type ProgressState = {
   runningTasks: number;
   /** Switch chats to v2 as soon as the copy completes (the upgrade flow). */
   switchWhenDone: boolean;
+  /** The host controller, not the renderer, owns this migration and its engine switch. */
+  serverManaged?: boolean;
 };
 
 type SwitchPrompt = {
@@ -120,6 +121,10 @@ function refusedForRunningTasks(cause: unknown): number | null {
 
 const formatCount = (value: number) => new Intl.NumberFormat().format(value);
 
+/** Chats dealt with so far: copied (whole or trimmed), already in v2, or left in v1. */
+const handledCount = (migration: EngineV2MigrationStatus) =>
+  migration.imported + migration.skipped + (migration.notCopied?.length ?? 0) + (migration.trimmed?.length ?? 0);
+
 /** The settings-row state line, e.g. "Migrated 2 chats; 1 already in v2." */
 export function engineMigrationMessage(migration: EngineV2MigrationStatus | undefined): string | undefined {
   if (!migration) return undefined;
@@ -128,7 +133,7 @@ export function engineMigrationMessage(migration: EngineV2MigrationStatus | unde
       return t("engine_migration.settings_starting");
     }
     return t("engine_migration.settings_running", {
-      done: formatCount(migration.imported + migration.skipped),
+      done: formatCount(handledCount(migration)),
       total: formatCount(migration.total),
     });
   }
@@ -138,11 +143,18 @@ export function engineMigrationMessage(migration: EngineV2MigrationStatus | unde
 }
 
 function migratedSummary(migration: EngineV2MigrationStatus) {
-  return t("engine_migration.migrated_summary", {
+  const summary = t("engine_migration.migrated_summary", {
     count: migration.imported,
     imported: formatCount(migration.imported),
     skipped: formatCount(migration.skipped),
   });
+  const left = migration.notCopied?.length ?? 0;
+  const trimmed = migration.trimmed?.length ?? 0;
+  return [
+    summary,
+    left ? t("engine_migration.not_copied", { count: left, left: formatCount(left) }) : "",
+    trimmed ? t("engine_migration.trimmed", { count: trimmed, trimmed: formatCount(trimmed) }) : "",
+  ].filter(Boolean).join(" ");
 }
 
 function updateConsent(client: EngineMigrationClient, patch: Partial<Omit<ConsentState, "client">>) {
@@ -219,11 +231,22 @@ export function observeEngineMigration(client: EngineMigrationClient, status: En
   const migration = status.migration;
   if (!migration) return;
   const { progress } = useEngineMigrationStore.getState();
+  const serverManaged = status.forceUpgradePending === true
+    || status.engineForced === true || status.engineOrigin === "forced";
   if (progress) {
-    updateProgress({ migration, selected: selectedChatEngine(status) });
+    updateProgress({
+      migration, selected: selectedChatEngine(status),
+      ...(serverManaged ? {
+        serverManaged: true, switchWhenDone: false,
+        ...(!progress.serverManaged ? { view: "banner" } : {}),
+      } : {}),
+    });
     return;
   }
-  if (migration.state === "running") presentMigration(client, status, "dialog");
+  if (migration.state === "running") {
+    presentMigration(client, status, serverManaged ? "banner" : "dialog");
+    if (serverManaged) updateProgress({ serverManaged: true, switchWhenDone: false });
+  }
 }
 
 export function continueEngineMigrationInBackground() {
@@ -292,6 +315,11 @@ export async function requestEngineSwitch(
     updateProgress({ selected: selectedChatEngine(next) });
     return next;
   } catch (cause) {
+    // v1 chats not yet in v2 would stop opening: copy them first, then switch.
+    if (cause instanceof OpenworkServerError && cause.code === "engine_migration_required") {
+      requestEngineMigration(client, "upgrade");
+      return null;
+    }
     toast.error(messageOf(cause, t("engine_migration.switch_failed")));
     return null;
   } finally {
@@ -318,7 +346,7 @@ function useElapsed(startedAt: string | undefined, running: boolean) {
 
 function MigrationProgressBar(props: { migration: EngineV2MigrationStatus }) {
   const { migration } = props;
-  const done = migration.imported + migration.skipped;
+  const done = handledCount(migration);
   const copying = migration.phase === "copying" || (migration.phase === undefined && done > 0);
   const elapsed = useElapsed(migration.startedAt, migration.state === "running");
   const value = copying && migration.total > 0 ? Math.min(100, Math.round((done / migration.total) * 100)) : null;
@@ -420,12 +448,17 @@ function MigrationProgressDialog(props: { progress: ProgressState }) {
                 : t("engine_migration.error_title")}
           </DialogTitle>
           <DialogDescription>
-            {running ? t("engine_migration.progress_note")
+            {running ? `${migration.resumed ? `${t("engine_migration.resumed_note")} ` : ""}${t("engine_migration.progress_note")}`
               : migration.state === "completed" ? migratedSummary(migration)
                 : migration.error}
           </DialogDescription>
         </DialogHeader>
         {running ? <MigrationProgressBar migration={migration} /> : null}
+        {migration.state === "completed" && migration.notCopied?.length ? (
+          <ul data-testid="engine-migration-not-copied" className="grid max-h-32 list-disc gap-1 overflow-y-auto ps-5 text-xs text-muted-foreground">
+            {migration.notCopied.map((chat) => <li key={chat.id} className="truncate">{chat.title || chat.id}</li>)}
+          </ul>
+        ) : null}
         {migration.state === "error" && progress.runningTasks > 0
           ? <RunningTasksAlert count={progress.runningTasks} body={t("engine_migration.running_tasks_retry")} />
           : migration.state === "error" ? <p className="text-xs text-muted-foreground">{t("engine_migration.error_note")}</p> : null}
@@ -542,7 +575,7 @@ function MigrationFloatingRegion(props: PropsWithChildren) {
 
 function MigrationBanner(props: { progress: ProgressState }) {
   const { migration } = props.progress;
-  const done = migration.imported + migration.skipped;
+  const done = handledCount(migration);
   const count = migration.phase === "copying" && migration.total > 0
     ? t("engine_migration.progress_copied", { done: formatCount(done), total: formatCount(migration.total) })
     : null;
@@ -595,6 +628,7 @@ function useMigrationLifecycle(progress: ProgressState | null) {
   const client = progress?.client;
   const state = progress?.migration.state;
   const view = progress?.view;
+  const serverManaged = progress?.serverManaged === true;
   useEffect(() => {
     if (!client || state !== "running") return;
     let disposed = false;
@@ -607,9 +641,10 @@ function useMigrationLifecycle(progress: ProgressState | null) {
     return () => { disposed = true; window.clearInterval(timer); };
   }, [client, state]);
   useEffect(() => {
-    // The upgrade flow switches on its own once every chat is copied.
+    // The upgrade flow switches on its own once every chat is copied. Chats left
+    // in v1 are shown first, with the usual choice to switch.
     const current = useEngineMigrationStore.getState().progress;
-    if (!current || state !== "completed" || !current.switchWhenDone) return;
+    if (!current || serverManaged || state !== "completed" || !current.switchWhenDone || current.migration.notCopied?.length) return;
     useEngineMigrationStore.setState({ progress: null });
     const switched = current.selected === "v2"
       ? Promise.resolve(true)
@@ -617,12 +652,19 @@ function useMigrationLifecycle(progress: ProgressState | null) {
     void switched.then((ok) => {
       if (ok) toast.success(t("engine_migration.upgraded_title"), { description: migratedSummary(current.migration) });
     });
-  }, [state]);
+  }, [state, serverManaged]);
   useEffect(() => {
     const current = useEngineMigrationStore.getState().progress;
-    if (!current || view !== "banner") return;
-    if (state === "error") {
-      // A failure needs a decision (retry or leave it), so bring the dialog back.
+    if (!current) return;
+    if (serverManaged) {
+      // Forced work stays nonblocking on failure too; retries and routing remain host-owned.
+      if (state === "completed" || state === "error") useEngineMigrationStore.setState({ progress: null });
+      return;
+    }
+    if (view !== "banner") return;
+    if (state === "error" || (state === "completed" && current.migration.notCopied?.length)) {
+      // A failure needs a decision (retry or leave it), and chats left in v1
+      // should be seen before switching, so bring the dialog back.
       showEngineMigrationProgress();
     } else if (state === "completed") {
       useEngineMigrationStore.setState({ progress: null });
@@ -633,30 +675,43 @@ function useMigrationLifecycle(progress: ProgressState | null) {
           : {}),
       });
     }
-  }, [state, view]);
+  }, [state, view, serverManaged]);
 }
 
-/** A renderer reload mid-migration (or another window starting one) is picked up once. */
+/** Status reads at startup keep trying this long: the local server may still be starting. */
+const DISCOVERY_ATTEMPTS = 30;
+const DISCOVERY_RETRY_MS = 2_000;
+
+/**
+ * A renderer reload mid-migration, a copy resumed after OpenWork restarted (or
+ * another window starting one) is picked up once the first status read lands.
+ */
 function useRunningMigrationDiscovery(enabled: boolean) {
   useEffect(() => {
     if (!enabled || !isDesktopRuntime()) return;
     let cancelled = false;
-    void (async () => {
+    let timer: number | undefined;
+    const attempt = async (remaining: number) => {
       try {
         const connection = await resolveOpenworkConnection();
-        if (cancelled || !connection.normalizedBaseUrl || !connection.resolvedToken) return;
-        const client = createOpenworkServerClient({
-          baseUrl: connection.normalizedBaseUrl,
-          token: connection.resolvedToken,
-          hostToken: connection.resolvedHostToken,
-        });
-        const status = await client.getEngineV2PreviewStatus();
-        if (!cancelled) observeEngineMigration(client, status);
+        if (cancelled) return;
+        if (connection.normalizedBaseUrl && connection.resolvedToken) {
+          const client = createOpenworkServerClient({
+            baseUrl: connection.normalizedBaseUrl,
+            token: connection.resolvedToken,
+            hostToken: connection.resolvedHostToken,
+          });
+          const status = await client.getEngineV2PreviewStatus();
+          if (!cancelled) observeEngineMigration(client, status);
+          return;
+        }
       } catch {
         // Engine controls report connection problems where they are used.
       }
-    })();
-    return () => { cancelled = true; };
+      if (!cancelled && remaining > 1) timer = window.setTimeout(() => void attempt(remaining - 1), DISCOVERY_RETRY_MS);
+    };
+    void attempt(DISCOVERY_ATTEMPTS);
+    return () => { cancelled = true; window.clearTimeout(timer); };
   }, [enabled]);
 }
 
@@ -687,23 +742,79 @@ export function shouldOfferEngineUpgrade(
     && options.snoozedUntil <= options.now;
 }
 
-/** `engineV2Upgrade` for the active organization; signed out or unreachable means off. */
-function useEngineUpgradeFeature(): boolean {
-  const context = useAutomationsDenContext();
-  const query = useQuery({
-    // Shares the cache with other org-feature reads (e.g. the Calendar).
-    queryKey: ["den", "org-features", context.organizationId],
-    queryFn: () => context.client!.getOrgFeatures(context.organizationId!),
-    enabled: context.ready && isDesktopRuntime(),
-    staleTime: 5 * 60_000,
-    select: (features) => features.engineV2Upgrade === true,
-  });
-  return query.data === true;
+type EngineUpgradeFeatures = {
+  ready: boolean;
+  offer: boolean;
+  upgrade: boolean;
+};
+
+/** Forward policy, including false transitions. The host alone starts, retries and switches engines. */
+function useDesktopEngineForcePolicy(features: EngineUpgradeFeatures) {
+  const { ready, upgrade } = features;
+  // A newer off write must land after an older in-flight upgrade write.
+  const policyWrites = useRef<Promise<void>>(Promise.resolve());
+  useEffect(() => {
+    if (!isDesktopRuntime() || !ready) return;
+    if (upgrade) {
+      useEngineMigrationStore.setState((state) =>
+        state.consent?.mode === "upgrade" && !state.consent.submitting ? { consent: null } : state);
+    }
+    let cancelled = false;
+    let timer: number | undefined;
+    let failures = 0;
+    let client: OpenworkServerClient | null = null;
+    let applied = false;
+    let previousEngine: ChatEngine | null = null;
+    const sync = async () => {
+      try {
+        if (!client) {
+          const connection = await resolveOpenworkConnection();
+          if (cancelled) return;
+          if (!connection.normalizedBaseUrl || !connection.resolvedHostToken) throw new Error("Local host is not ready");
+          client = createOpenworkServerClient({
+            baseUrl: connection.normalizedBaseUrl,
+            token: connection.resolvedToken,
+            hostToken: connection.resolvedHostToken,
+          });
+        }
+        const currentClient = client;
+        const write = applied ? null : policyWrites.current.then(() =>
+          cancelled ? null : currentClient.setEngineV2ForcePolicy({ upgrade }));
+        if (write) policyWrites.current = write.then(() => {}, () => {});
+        const status = write ? await write : await currentClient.getEngineV2PreviewStatus();
+        if (cancelled || !status) return;
+        applied = true;
+        failures = 0;
+        // Force migrations never request consent, and the renderer never switches on completion.
+        observeEngineMigration(client, status);
+        const engine = selectedChatEngine(status);
+        if ((previousEngine !== null && engine !== previousEngine)
+          || (previousEngine === null && (status.engineForced || status.engineOrigin === "reverted"))) {
+          window.dispatchEvent(new CustomEvent("openwork-engine-changed"));
+        }
+        previousEngine = engine;
+        // Off also needs observation while the host waits to revert a forced-owned engine.
+        if (upgrade || status.engineForced === true || status.forceUpgradePending === true) {
+          timer = window.setTimeout(() => void sync(), 1_000);
+        }
+      } catch {
+        // Retry transport/startup failures only. Migration attempts and their backoff belong to the host.
+        failures += 1;
+        if (!cancelled && failures < DISCOVERY_ATTEMPTS) {
+          client = null;
+          applied = false;
+          timer = window.setTimeout(() => void sync(), Math.min(30_000, DISCOVERY_RETRY_MS * 2 ** (failures - 1)));
+        }
+      }
+    };
+    void sync();
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [ready, upgrade]);
 }
 
 type UpgradeCandidate = { client: EngineMigrationClient; status: EngineV2PreviewStatus };
 
-/** Reads engine status once the feature is on, and again whenever the engine changes. */
+/** Discovers engine status through startup, and again whenever the engine changes. */
 function useEngineUpgradeCandidate(enabled: boolean): UpgradeCandidate | null {
   const [candidate, setCandidate] = useState<UpgradeCandidate | null>(null);
   useEffect(() => {
@@ -712,10 +823,12 @@ function useEngineUpgradeCandidate(enabled: boolean): UpgradeCandidate | null {
       return;
     }
     let cancelled = false;
-    const load = async () => {
+    let timer: number | undefined;
+    const load = async (remaining: number) => {
       try {
         const connection = await resolveOpenworkConnection();
-        if (cancelled || !connection.normalizedBaseUrl || !connection.resolvedToken) return;
+        if (cancelled) return;
+        if (!connection.normalizedBaseUrl || !connection.resolvedToken) throw new Error("Local host is not ready");
         const client = createOpenworkServerClient({
           baseUrl: connection.normalizedBaseUrl,
           token: connection.resolvedToken,
@@ -723,14 +836,17 @@ function useEngineUpgradeCandidate(enabled: boolean): UpgradeCandidate | null {
         });
         const status = await client.getEngineV2PreviewStatus();
         if (!cancelled) setCandidate({ client, status });
+        return;
       } catch {
-        // No notice when the local server can't be read; Advanced settings still works.
+        // The organization can resolve before the local host starts. Keep the
+        // optional offer discoverable without asking the person to reload.
       }
+      if (!cancelled && remaining > 1) timer = window.setTimeout(() => void load(remaining - 1), DISCOVERY_RETRY_MS);
     };
-    void load();
-    const reload = () => { void load(); };
+    const reload = () => { window.clearTimeout(timer); void load(DISCOVERY_ATTEMPTS); };
+    reload();
     window.addEventListener("openwork-engine-changed", reload);
-    return () => { cancelled = true; window.removeEventListener("openwork-engine-changed", reload); };
+    return () => { cancelled = true; window.clearTimeout(timer); window.removeEventListener("openwork-engine-changed", reload); };
   }, [enabled]);
   return candidate;
 }
@@ -759,15 +875,25 @@ function EngineUpgradeNotice(props: { candidate: UpgradeCandidate; onLater: () =
 }
 
 export function EngineMigrationOverlay(props: { discoverRunningMigration?: boolean }) {
+  const desktop = isDesktopRuntime();
   const consent = useEngineMigrationStore((state) => state.consent);
   const progress = useEngineMigrationStore((state) => state.progress);
   const switchPrompt = useEngineMigrationStore((state) => state.switchPrompt);
-  useMigrationLifecycle(progress);
-  useRunningMigrationDiscovery(props.discoverRunningMigration !== false);
-  const upgradeFeature = useEngineUpgradeFeature();
-  const candidate = useEngineUpgradeCandidate(upgradeFeature);
+  useMigrationLifecycle(desktop ? progress : null);
+  const forceUpgrade = useOrgFeatureState("engineV2ForceUpgrade", { desktopOnly: true });
+  const features = {
+    ready: forceUpgrade.resolved,
+    offer: useOrgFeature("engineV2Upgrade", { desktopOnly: true }),
+    upgrade: forceUpgrade.enabled,
+  };
+  useDesktopEngineForcePolicy(features);
+  useRunningMigrationDiscovery(desktop && props.discoverRunningMigration !== false);
+  const candidate = useEngineUpgradeCandidate(features.offer && !features.upgrade);
   const [snoozedUntil, setSnoozedUntil] = useState(readUpgradeSnooze);
-  const offerUpgrade = candidate !== null && !consent && !progress && !switchPrompt
+  // Local-engine consent and progress never apply to the web runtime, even if the store is populated.
+  if (!desktop) return null;
+  const offerUpgrade = features.offer && !features.upgrade
+    && candidate !== null && !consent && !progress && !switchPrompt
     && shouldOfferEngineUpgrade(candidate.status, { now: Date.now(), snoozedUntil });
   return (
     <>
@@ -777,7 +903,8 @@ export function EngineMigrationOverlay(props: { discoverRunningMigration?: boole
           onLater={() => { snoozeUpgrade(); setSnoozedUntil(readUpgradeSnooze()); }}
         />
       ) : null}
-      {consent ? <MigrationConsentDialog consent={consent} /> : null}
+      {consent && !(consent.mode === "upgrade" && features.upgrade)
+        ? <MigrationConsentDialog consent={consent} /> : null}
       {progress?.view === "dialog" ? <MigrationProgressDialog progress={progress} /> : null}
       {progress?.view === "banner" && progress.migration.state === "running" ? <MigrationBanner progress={progress} /> : null}
       {switchPrompt ? <EngineSwitchPrompt prompt={switchPrompt} /> : null}

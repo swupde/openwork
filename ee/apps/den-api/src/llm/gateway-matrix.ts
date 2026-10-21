@@ -18,6 +18,7 @@ import { effectiveGatewayGrants, memberGatewayTeams } from "./inference-provider
 import { liteLlmCatalogProvider, liteLlmStatus, readLiteLlmSettings } from "./litellm-settings.js"
 import { getModelsDevProvider, type ModelsDevProvider } from "./models-dev.js"
 import { readProviderEnvNames } from "./provider-credentials.js"
+import { gatewayGroupAssignmentsComplete } from "./gateway-model-assignments.js"
 
 export type GatewayTx = Parameters<Parameters<typeof db.transaction>[0]>[0]
 export type GatewayProvider = typeof GatewayProviderTable.$inferSelect
@@ -332,7 +333,14 @@ export async function reusableAwsCredential(tx: GatewayTx, target: GatewayProvid
   throw unavailable()
 }
 
-export async function writeGatewaySet(tx: GatewayTx, provider: GatewayProvider, input: GatewayCredentialSetPatch, target: GatewaySet["id"] | { createdByOrgMembershipId: GatewayMemberId }) {
+export async function writeGatewaySet(
+  tx: GatewayTx,
+  provider: GatewayProvider,
+  input: GatewayCredentialSetPatch,
+  target: GatewaySet["id"] | { createdByOrgMembershipId: GatewayMemberId },
+  /** Secure keys in chat: create a new organization set whose key a person adds afterwards. */
+  options: { awaitOrganizationKey?: boolean } = {},
+) {
   const setId = typeof target === "string" ? target : undefined
   let creatorId: GatewayMemberId | null = null
   if (!setId) {
@@ -381,7 +389,8 @@ export async function writeGatewaySet(tx: GatewayTx, provider: GatewayProvider, 
   if (credentials.some((row) => row.organization_id !== provider.organization_id || row.gateway_provider_id !== provider.id)) throw new GatewayWriteError(409, "credential_set_inconsistent")
   const orgCredential = credentials.find((row) => row.subject === "org" && row.org_membership_id === null)
   const credential = normalizeCredential(input, provider, mode === existing?.credential_mode ? orgCredential : undefined)
-  if (mode === "org" && !credential && (!existing || modeChanged || enabled && orgCredential?.status !== "active")) {
+  const awaitingKey = options.awaitOrganizationKey === true && !existing && mode === "org"
+  if (mode === "org" && !credential && !awaitingKey && (!existing || modeChanged || enabled && orgCredential?.status !== "active")) {
     throw new GatewayWriteError(400, "credential_required", "Provide a non-empty organization credential to create this set, switch to organization mode, or re-enable it without an active credential.")
   }
   if (modeChanged || clientChanged || disabled) await tx.delete(GatewayProviderOauthStateTable).where(eq(GatewayProviderOauthStateTable.credential_set_id, id))
@@ -454,8 +463,9 @@ export async function gatewaySummary(provider: GatewayProvider, memberId: Gatewa
   if (!member?.userId) throw new GatewayWriteError(403, "forbidden")
   // Read-only: never refreshes the catalog or locks the provider. Catalog sync
   // happens on provider/group writes and GET /v1/inference-providers/:id/models.
-  const models = (await db.select().from(GatewayProviderModelTable).where(eq(GatewayProviderModelTable.gateway_provider_id, provider.id)))
-    .filter((model) => (!provider.model_ids.length || provider.model_ids.includes(model.model_id))
+  const catalogModels = await db.select().from(GatewayProviderModelTable).where(eq(GatewayProviderModelTable.gateway_provider_id, provider.id))
+  const catalogModelsById = new Map(catalogModels.map((model) => [model.id, model]))
+  const models = catalogModels.filter((model) => (!provider.model_ids.length || provider.model_ids.includes(model.model_id))
       && !gatewayModelConfigurationError(provider.provider_config, [model.model_config]))
   const groups = await db.select().from(GatewayModelGroupTable).where(eq(GatewayModelGroupTable.gateway_provider_id, provider.id))
   const sets = await db.select().from(GatewayCredentialSetTable).where(eq(GatewayCredentialSetTable.gateway_provider_id, provider.id))
@@ -529,13 +539,25 @@ export async function gatewaySummary(provider: GatewayProvider, memberId: Gatewa
     })
   const usableModels: GatewayUsableModel[] = []
   const setSummariesById = new Map(setSummaries.map((set) => [set.id, set]))
+  let modelAssignmentsComplete = true
   for (const grant of grants) {
     const group = groupsById.get(grant.model_group_id)
     const set = setSummariesById.get(grant.credential_set_id)
-    if (!group || !set) continue
+    if (!group || !set) { modelAssignmentsComplete = false; continue }
     const targetModels = set.credentialStatus === "ready" ? usableModels : authorizationRequests.find((request) => request.credentialSetId === set.id)?.models
+    const groupModels = modelsByGroupId.get(group.id) ?? []
+    // Aggregate readiness can hide an omitted organization credential set (or
+    // an issued member key). Check every effective grant against its original
+    // links before treating this public projection as removal evidence.
+    if (!gatewayGroupAssignmentsComplete({
+      linkedModelIds: linkedModelIds.get(group.id) ?? [],
+      catalogModelsById,
+      allowedModelIds: provider.model_ids,
+      representedModelIds: new Set(groupModels.map((model) => model.id)),
+      hasTarget: targetModels !== undefined,
+    })) modelAssignmentsComplete = false
     if (!targetModels) continue
-    for (const model of modelsByGroupId.get(group.id) ?? []) {
+    for (const model of groupModels) {
       const id = createGatewayModelAlias({ modelGroupId: group.id, credentialSetId: grant.credential_set_id, gatewayProviderModelId: model.id })
       const name = model.name
       targetModels.push({ id, name, config: buildGatewayModelConfig({ id, name, config: model.model_config }), upstreamModelId: model.model_id, modelGroupId: group.id, modelGroupName: group.name, credentialSetId: set.id, credentialSetName: set.name })
@@ -549,7 +571,7 @@ export async function gatewaySummary(provider: GatewayProvider, memberId: Gatewa
     modelIds: provider.model_ids,
     pinnedModelIds: manage ? pinnedModelIds : publicGatewayPinnedModelIds(pinnedModelIds, usableModels),
     id: provider.id, providerId: provider.provider_id, name: provider.name, source: "openwork_gateway", credentialMode: sets.length > 0 && sets.every((set) => set.credential_mode === "member") ? "member" : "org", status: provider.status, createdAt: provider.created_at.toISOString(), updatedAt: provider.updated_at.toISOString(),
-    providerConfig: buildGatewayProviderConfig(provider, env.gatewayPublicBaseUrl), models: usableModels, authorizationRequests,
+    providerConfig: buildGatewayProviderConfig(provider, env.gatewayPublicBaseUrl), models: usableModels, authorizationRequests, modelAssignmentsComplete,
     credentialStatus: usableModels.length ? "ready" : authorizationRequests.length ? "member_auth_required" : "org_credential_missing", authUrl: authorizationRequests[0]?.authUrl ?? null,
   }
   if (typeof migration === "object" && migration !== null && "llmProviderId" in migration && typeof migration.llmProviderId === "string"

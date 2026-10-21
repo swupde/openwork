@@ -27,6 +27,12 @@ import {
 import { exchangeHandoffAndSignIn } from "../../../app/lib/den-handoff";
 import { connectionDiagnosticHistory, type ConnectionDiagnosticReason, type ConnectionDiagnosticSource } from "../../../app/lib/connection-diagnostic-history";
 import { readOrgSelectionPending } from "../../../app/lib/den-sign-in-intent";
+import {
+  classifyStartupError,
+  failStartup,
+  markStartupStep,
+  noteStartupDenSession,
+} from "../../../app/lib/startup-diagnostics";
 import { desktopBridge, readDesktopDistributionInfo } from "../../../app/lib/desktop";
 import {
   denSessionUpdatedEvent,
@@ -183,18 +189,20 @@ function pendingServerSwitchForDeepLink(input: {
   // control plane and activate the app in a single unattended step.
   if (bootstrap.source !== "file" && !input.isEnterpriseActivation) return null;
 
-  const currentApiBaseUrl = resolveDenBaseUrls(bootstrap).apiBaseUrl;
-  const newApiBaseUrl = resolveDenBaseUrls(input.denBaseUrl).apiBaseUrl;
-  const currentOrigin = denOriginComparisonKey(currentApiBaseUrl);
-  const newOrigin = denOriginComparisonKey(newApiBaseUrl);
+  // Handoff links identify Den's web origin. Its configured API may live on
+  // another origin; compare the same identity used by the handoff transaction.
+  const currentWebBaseUrl = resolveDenBaseUrls(bootstrap).baseUrl;
+  const newWebBaseUrl = resolveDenBaseUrls(input.denBaseUrl).baseUrl;
+  const currentOrigin = denOriginComparisonKey(currentWebBaseUrl);
+  const newOrigin = denOriginComparisonKey(newWebBaseUrl);
   if (!currentOrigin || !newOrigin || currentOrigin === newOrigin) return null;
 
   return {
     grant: input.grant,
     denBaseUrl: input.denBaseUrl,
     isEnterpriseActivation: input.isEnterpriseActivation,
-    currentHost: hostLabel(currentApiBaseUrl),
-    newHost: hostLabel(newApiBaseUrl),
+    currentHost: hostLabel(currentWebBaseUrl),
+    newHost: hostLabel(newWebBaseUrl),
   };
 }
 
@@ -260,6 +268,7 @@ export function DenAuthProvider({ children }: DenAuthProviderProps) {
     }
 
     if (!token) {
+      noteStartupDenSession(null);
       setUser(null);
       setVerifiedIdentity(null);
       setError(null);
@@ -276,6 +285,7 @@ export function DenAuthProvider({ children }: DenAuthProviderProps) {
       updateStatus("checking");
     }
 
+    noteStartupDenSession({ baseUrl: settings.baseUrl, organizationId: organizationId || null });
     const diagnostics = diagnosticsRef.current;
     diagnostics?.attempt("den_session_retry");
     try {
@@ -294,6 +304,7 @@ export function DenAuthProvider({ children }: DenAuthProviderProps) {
           ensureDenActiveOrganization({
             forceServerSync:
               !settings.activeOrgId?.trim() || !settings.activeOrgSlug?.trim(),
+            verifiedSession: { userId: nextUser.id, token, baseUrl: settings.baseUrl },
           })
         );
       }
@@ -316,11 +327,13 @@ export function DenAuthProvider({ children }: DenAuthProviderProps) {
       lastSignalRetryAtRef.current = null;
       diagnostics?.recovered("den_session_recovered");
       updateStatus("signed_in");
+      markStartupStep("signed_in", { organizationId: confirmedOrganizationId || null });
       syncDesktopSentrySession(nextUser);
     } catch (nextError) {
       if (currentRun !== refreshTokenRef.current) return;
 
       diagnostics?.failed();
+      failStartup("signed_in", classifyStartupError(nextError));
       const failureStatus = resolveDenAuthFailureStatus(nextError);
       if (failureStatus === "signed_out") {
         clearDenSession();

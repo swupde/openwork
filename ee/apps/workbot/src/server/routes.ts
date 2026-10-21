@@ -1,4 +1,4 @@
-import { createHeadlessRunnerClient } from "@openwork-ee/headless-protocol"
+import { createHeadlessRunnerClient, type RunnerLiveEvent } from "@openwork-ee/headless-protocol"
 import {
   createWorkbot,
   toWorkbotPageEvent,
@@ -13,9 +13,11 @@ import type { Context, Hono, MiddlewareHandler } from "hono"
 import { bodyLimit } from "hono/body-limit"
 import { streamSSE } from "hono/streaming"
 import { z } from "zod"
+import { workbotContextPrompt, workbotViewContextSchema, WORKBOT_MAX_MESSAGE_CHARS } from "@openwork/types/workbot-context"
 import type { AppEnv, Member } from "./auth.js"
 import type { Config } from "./config.js"
 import type { Den } from "./den.js"
+import { observedRunnerFetch, reportError } from "./error-reporting.js"
 
 /**
  * The Workbot API the page talks to (`/v1/workbot/...`). Every route needs a signed-in member, and Den's answer
@@ -25,13 +27,14 @@ import type { Den } from "./den.js"
 
 const fileIdSchema = z.string().regex(/^fl_[a-f0-9]{32}$/)
 /** The runner's own limit on one message; anything longer goes as a file. */
-const MAX_MESSAGE_CHARS = 100_000
+const MAX_MESSAGE_CHARS = WORKBOT_MAX_MESSAGE_CHARS
 const sendSchema = z
   .object({
     id: z.string().regex(/^[A-Za-z0-9_-]{8,64}$/),
     text: z.string().trim().max(MAX_MESSAGE_CHARS),
     timeZone: z.string().max(64).optional(),
     attachments: z.array(fileIdSchema).max(20).optional(),
+    context: workbotViewContextSchema.optional(),
   })
   .strict()
 const editSchema = z
@@ -40,6 +43,7 @@ const editSchema = z
     text: z.string().trim().max(MAX_MESSAGE_CHARS),
     timeZone: z.string().max(64).optional(),
     attachments: z.array(fileIdSchema).max(20).optional(),
+    context: workbotViewContextSchema.optional(),
   })
   .strict()
 const messageTooLong = { error: "message_too_long", message: "That's too long for one message. Send it as a file instead." } as const
@@ -50,6 +54,15 @@ const threadQuerySchema = z.object({ turns: z.coerce.number().int().min(1).max(2
 const INLINE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"])
 /** The stream ends after this and the page reopens it, so a held-open stream notices a revoked membership. */
 const EVENTS_MAX_MS = 170_000
+/** A comment this often keeps idle proxies from closing the page's stream (as the runner's SSE does). */
+const KEEP_ALIVE_MS = 15_000
+/**
+ * A live socket from the runner (`headlessStepTurns`) that couldn't open, or ended within `SOCKET_MIN_MS`, rests the
+ * person's sockets for `SOCKET_REST_MS`: their streams use SSE meanwhile. Remembered for at most this many people.
+ */
+const SOCKET_MIN_MS = 10_000
+const SOCKET_REST_MS = 60_000
+const SOCKET_REST_MAX = 10_000
 /** Matches the runner's per-file limit; a bigger upload is refused before it is read. */
 const MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 /** Plenty for a person typing; stops a runaway script from spending the organization's model budget. */
@@ -73,6 +86,7 @@ function actorOf(member: Member): WorkbotActor {
 export function registerWorkbotRoutes(app: Hono<AppEnv>, input: { config: Config; den: Den; member: MiddlewareHandler<AppEnv>; sameOrigin: MiddlewareHandler }) {
   const { config, den } = input
   const sent = new Map<string, number[]>()
+  const runnerFetch = observedRunnerFetch()
 
   /**
    * The runner, told whose conversations these are: on celld that is the person's own cell (all their chats and
@@ -80,17 +94,32 @@ export function registerWorkbotRoutes(app: Hono<AppEnv>, input: { config: Config
    */
   const runnerFor = (member: Member) => ({ ...config.runner, owner: workbotOwner(member.den.organization.id, member.den.memberId) })
 
+  /**
+   * The runner client for this person: their cell, and turn tokens Den mints for them (with Gateway model access where
+   * `gatewayModels` is on). Turns and live updates (`openEventsSocket`) share it.
+   */
+  const runnerClientFor = (member: Member) =>
+    createHeadlessRunnerClient({
+      config: runnerFor(member),
+      fetch: runnerFetch,
+      modelAccessRequired: () => member.den.gatewayModels,
+      mintToken: ({ readOnly, sessionId, messageId, model, modelAccessRequired }) => den.runToken(member.accessToken, { readOnly, sessionId, messageId, model, modelAccessRequired, gatewayModels: member.den.gatewayModels }),
+      maxTokenTtlMs: RUN_TOKEN_TTL_MS,
+    })
+
   /** Workbot bound to this person: their runner conversation, and turn tokens Den mints for them. */
   const workbotFor = (member: Member) =>
     createWorkbot({
-      client: createHeadlessRunnerClient({
-        config: runnerFor(member),
-        fetch,
-        mintToken: async ({ readOnly }) => ({ token: await den.runToken(member.accessToken, { readOnly }) }),
-        maxTokenTtlMs: RUN_TOKEN_TTL_MS,
-      }),
+      client: runnerClientFor(member),
       canSchedule: async () => member.den.canSchedule,
       model: async () => member.den.model,
+      // Gateway access is validated for this actor and model by Den when minting each turn, not by the runner catalog.
+      verifyModel: !member.den.gatewayModels && member.den.verifyModel,
+      workspaceAssistant: async () => member.den.workspaceAssistant,
+      // `headlessStepTurns`: turns run one step at a time; off (or an older Den) sends them as before.
+      stepTurns: member.den.stepTurns,
+      // `headlessSessionCells`: new chats in their own session cells; off (or an older Den) creates them as before.
+      sessionCells: member.den.sessionCells,
     })
 
   const enabled = (c: Context<AppEnv>) => c.get("member").den.enabled
@@ -128,10 +157,16 @@ export function registerWorkbotRoutes(app: Hono<AppEnv>, input: { config: Config
       email: who.user.email,
       organizationName: who.organization.name,
       enabled: who.enabled,
+      firstRun: who.firstRun === true,
+      canEnableWorkbot: who.canEnableWorkbot === true,
       calendar: who.enabled && who.calendar === true,
+      documents: who.enabled && who.documents === true,
+      documentEditing: who.enabled && who.documents === true && who.documentEditing,
+      workspaceAssistant: who.enabled && who.workspaceAssistant,
+      guidedNavigation: who.enabled && who.workspaceAssistant && who.guidedNavigation,
+      teamLinks: who.enabled ? who.teamLinks : undefined,
       canSchedule: who.enabled && who.canSchedule,
       sideChats: who.enabled && who.sideChats,
-      calendarPolish: who.enabled && who.calendarPolish,
       denUrl: config.denWebUrl ?? (await den.webUrl().catch(() => null)),
     })
   })
@@ -156,6 +191,26 @@ export function registerWorkbotRoutes(app: Hono<AppEnv>, input: { config: Config
     const { status, payload } = await den.calendar(member.accessToken, { method, path: `${path}${url.search}`, body })
     return new Response(JSON.stringify(payload), { status, headers: { "content-type": "application/json" } })
   }
+  app.on(["GET", "POST"], "/v1/workbot/documents/*", bodyLimit({ maxSize: 2 * 1024 * 1024 }), async (c) => {
+    const member = c.get("member")
+    if (!member.den.enabled || member.den.documents !== true) return c.json({ error: "workbot_documents_not_enabled" }, 403)
+    const url = new URL(c.req.url)
+    const path = url.pathname.slice("/v1/workbot/documents".length)
+    const editor = /^\/v1\/documents\/google-drive\/files\/[A-Za-z0-9_-]{1,512}\/(editor|content|metadata)$/.exec(path)
+    if (editor?.[1] === "metadata" && !member.den.workspaceAssistant) return c.json({ error: "feature_disabled" }, 403)
+    const office = /^\/v1\/documents\/google-drive\/files\/[A-Za-z0-9_-]{1,512}\/office(?:\/[0-9a-f-]{36}(?:\/(save|close))?)?$/.exec(path)
+    const method = c.req.method === "POST" ? "POST" : "GET"
+    if (!(method === "GET" && path === "/v1/capabilities/google-workspace/drive-files") && !(editor && (method === "GET" || editor[1] === "editor")) && !(office && (method === "GET" ? !office[1] && /\/[0-9a-f-]{36}$/.test(path) : path.endsWith("/office") || !!office[1]))) return c.json({ error: "not_found" }, 404)
+    if (method === "POST" && !path.endsWith("/close") && !member.den.documentEditing) return c.json({ error: "feature_disabled", message: "Document editing is off for this workspace." }, 403)
+    if (editor?.[1] === "content") {
+      const response = await den.documentContent(member.accessToken, `${path}${url.search}`)
+      return new Response(response.body, { status: response.status, headers: { "content-type": response.headers.get("content-type") ?? "application/octet-stream", "cache-control": "no-store", "x-content-type-options": "nosniff", "content-security-policy": "default-src 'none'; sandbox" } })
+    }
+    const body: unknown = method === "POST" ? await c.req.json().catch(() => null) : undefined
+    const { status, payload } = await den.documents(member.accessToken, `${path}${url.search}`, method, body)
+    return new Response(JSON.stringify(payload), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } })
+  })
+
   app.get("/v1/workbot/calendar/*", calendarRoute)
   app.post("/v1/workbot/calendar/*", calendarRoute)
   app.patch("/v1/workbot/calendar/*", calendarRoute)
@@ -202,12 +257,20 @@ export function registerWorkbotRoutes(app: Hono<AppEnv>, input: { config: Config
     }
   })
 
-  /** The everyday apps to connect on the welcome screen; connecting happens in Den, in a new tab. */
+  /** Provider consent starts server-to-server; browser requests keep Workbot's same-origin/CSRF guard. */
+  app.post("/v1/workbot/connections/:connectionId/connect/start", bodyLimit({ maxSize: 4096 }), async (c) => {
+    if (!enabled(c)) return c.json({ error: "workbot_not_enabled" }, 409)
+    const member = c.get("member")
+    const { status, payload } = await den.connect(member.accessToken, c.req.param("connectionId"), await c.req.json().catch(() => null))
+    return new Response(JSON.stringify(payload), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } })
+  })
+
+  /** The everyday apps to connect on the welcome screen and workspace recovery actions. */
   app.get("/v1/workbot/connections", async (c) => {
     if (!enabled(c)) return c.json({ error: "workbot_not_enabled" }, 409)
     const member = c.get("member")
     const connections = await den.connections(member.accessToken).catch(() => null)
-    if (!connections) return c.json({ connections: [] })
+    if (!connections) return c.json({ error: "connections_unavailable", message: "Couldn't verify your connections. Try again." }, 502)
     const denWeb = config.denWebUrl ?? (await den.webUrl().catch(() => null))
     return c.json({
       connections: connections.map((connection) => ({
@@ -241,10 +304,13 @@ export function registerWorkbotRoutes(app: Hono<AppEnv>, input: { config: Config
     const scope = chatOf(c)
     if (scope.refused) return scope.refused
     const member = c.get("member")
+    if (body.data.context && (!member.den.workspaceAssistant || (body.data.context.kind === "calendar" ? !member.den.calendar : !member.den.documents))) return c.json({ error: "feature_disabled", message: "Contextual chat is off for this workspace." }, 403)
+    if (workbotContextPrompt(body.data.text, body.data.context).length > MAX_MESSAGE_CHARS) return c.json(messageTooLong, 400)
     const retryAfter = rateLimited(member.den.memberId)
     if (retryAfter !== null) return c.json({ error: "rate_limited" as const, retryAfter }, 429)
     try {
       const result = await workbotFor(member).send(actorOf(member), { ...body.data, chat: scope.chat })
+      if (!result.ok && result.code === "message_too_long") return c.json(messageTooLong, 400)
       if (!result.ok) return c.json({ error: result.code }, result.code === "unknown_file" ? 400 : 429)
       return c.json({ ok: true as const }, 202)
     } catch (error) {
@@ -302,7 +368,7 @@ export function registerWorkbotRoutes(app: Hono<AppEnv>, input: { config: Config
     }
   })
 
-  /** Edits one of the person's messages: what came after it is replaced by Workbot's answer to the edit. */
+  /** Appends a correction with an authoritative reference to the original message; earlier turns stay. */
   app.post("/v1/workbot/messages/:id/edit", async (c) => {
     const body = editSchema.safeParse(await c.req.json().catch(() => null))
     if (!body.success) return c.json(tooLong(body.error) ? messageTooLong : { error: "invalid_request" }, 400)
@@ -311,12 +377,15 @@ export function registerWorkbotRoutes(app: Hono<AppEnv>, input: { config: Config
     const scope = chatOf(c)
     if (scope.refused) return scope.refused
     const member = c.get("member")
+    if (body.data.context && (!member.den.workspaceAssistant || (body.data.context.kind === "calendar" ? !member.den.calendar : !member.den.documents))) return c.json({ error: "feature_disabled", message: "Contextual chat is off for this workspace." }, 403)
+    if (workbotContextPrompt(body.data.text, body.data.context).length > MAX_MESSAGE_CHARS) return c.json(messageTooLong, 400)
     const retryAfter = rateLimited(member.den.memberId)
     if (retryAfter !== null) return c.json({ error: "rate_limited" as const, retryAfter }, 429)
     try {
       const result = await workbotFor(member).editMessage(actorOf(member), { id: c.req.param("id"), ...body.data, chat: scope.chat })
+      if (!result.ok && result.code === "message_too_long") return c.json(messageTooLong, 400)
       if (!result.ok) {
-        const status = result.code === "busy" ? 409 : result.code === "unknown_message" ? 404 : result.code === "unknown_file" ? 400 : 429
+        const status = result.code === "unknown_message" ? 404 : result.code === "unknown_file" ? 400 : 429
         return c.json({ error: result.code }, status)
       }
       return c.json({ ok: true as const }, 202)
@@ -339,12 +408,70 @@ export function registerWorkbotRoutes(app: Hono<AppEnv>, input: { config: Config
     }
   })
 
+  /** When each person's live sockets may be tried again (see SOCKET_REST_MS). */
+  const socketRest = new Map<string, number>()
+  const rest = (owner: string) => {
+    const now = Date.now()
+    if (socketRest.size >= SOCKET_REST_MAX) for (const [key, until] of socketRest) if (until <= now) socketRest.delete(key)
+    if (socketRest.size < SOCKET_REST_MAX) socketRest.set(owner, now + SOCKET_REST_MS)
+  }
+
+  /**
+   * `headlessStepTurns`: the runner's live events over a WebSocket, which on celld keeps going while the runner's
+   * code is switched under it. Null (use SSE) when the runner doesn't upgrade, or while this person's socket is resting
+   * after one that couldn't open or ended early, so a runner that can't keep one isn't tried on every stream.
+   */
+  const openLiveSocket = async (member: Member, chat: WorkbotChat, signal: AbortSignal) => {
+    const owner = workbotOwner(member.den.organization.id, member.den.memberId)
+    const now = Date.now()
+    const resting = socketRest.get(owner)
+    if (resting !== undefined && resting > now) return null
+    socketRest.delete(owner)
+    const sessionId = await workbotFor(member).sessionIdOf(actorOf(member), chat).catch(() => null)
+    const socket = sessionId ? await runnerClientFor(member).openEventsSocket(sessionId, signal).catch(() => null) : null
+    if (!socket) rest(owner)
+    return socket ? { owner, events: socket, openedAt: now } : null
+  }
+
+  /**
+   * The page still gets SSE, in the same format and the same window. A socket that ends on its own (the runner moved
+   * the person's cell or restarted) ends the page's stream: the page reconnects and re-reads, so nothing is missed.
+   */
+  const relayLiveSocket = (c: Context<AppEnv>, socket: { owner: string; events: AsyncIterableIterator<RunnerLiveEvent>; openedAt: number }, upstream: AbortController) => {
+    c.header("Cache-Control", "no-cache, no-transform")
+    c.header("X-Accel-Buffering", "no")
+    return streamSSE(c, async (stream) => {
+      stream.onAbort(() => upstream.abort())
+      const deadline = setTimeout(() => upstream.abort(), EVENTS_MAX_MS)
+      // The socket's own keep-alives stay between Workbot and the runner; the page's stream gets the runner SSE's comment.
+      const keepAlive = setInterval(() => void stream.write(": keep-alive\n\n").catch(() => undefined), KEEP_ALIVE_MS)
+      try {
+        await stream.writeSSE({ event: "ready", data: "{}" })
+        for await (const raw of socket.events) {
+          if (stream.aborted) break
+          // Only this person's Workbot turns, under the page's own ids (the socket's `ready` is not one).
+          const event = toWorkbotPageEvent(raw)
+          if (event) await stream.writeSSE({ data: JSON.stringify(event) })
+        }
+        if (!upstream.signal.aborted && Date.now() - socket.openedAt < SOCKET_MIN_MS) rest(socket.owner)
+      } catch (error) {
+        if (!upstream.signal.aborted && !stream.aborted) reportError("events_relay_failed", error)
+      } finally {
+        clearTimeout(deadline)
+        clearInterval(keepAlive)
+        upstream.abort()
+      }
+    })
+  }
+
   app.get("/v1/workbot/events", async (c) => {
     if (!enabled(c)) return c.json({ error: "workbot_not_enabled" }, 409)
     const scope = chatOf(c)
     if (scope.refused) return scope.refused
     const member = c.get("member")
     const upstream = new AbortController()
+    const socket = member.den.stepTurns ? await openLiveSocket(member, scope.chat, upstream.signal) : null
+    if (socket) return relayLiveSocket(c, socket, upstream)
     const opened = await workbotFor(member).openEvents(actorOf(member), upstream.signal, scope.chat).catch(() => null)
     if (!opened?.body) return c.json({ error: "workbot_runner_unavailable" }, 409)
     const body = opened.body
@@ -386,8 +513,9 @@ export function registerWorkbotRoutes(app: Hono<AppEnv>, input: { config: Config
             if (event) await stream.writeSSE({ data: JSON.stringify(event) })
           }
         }
-      } catch {
-        // The page reconnects; nothing to report.
+      } catch (error) {
+        // The page reconnects. Only a break Workbot didn't cause itself (the page leaving, the time limit) is a fault.
+        if (!upstream.signal.aborted && !stream.aborted) reportError("events_relay_failed", error)
       } finally {
         clearTimeout(deadline)
         upstream.abort()

@@ -23,8 +23,23 @@ test('deployed 122-migration prefix keeps its original SQL and receipt identitie
   assert.equal(sha256(JSON.stringify(rows)), 'c44203541ba6d63bb5bb46528be82ba094702ab4353c19eef6664b42f914a1a6')
 })
 
+test('deployed 142-migration prefix keeps its original SQL and receipt identities', () => {
+  const rows = journal.entries.slice(0, 142).map((entry) => [
+    entry.idx, entry.tag, entry.when,
+    sha256(readFileSync(new URL(`${entry.tag}.sql`, folder))),
+  ])
+  assert.equal(sha256(JSON.stringify(rows)), '2e6a99a62716d2066c4d91715ce788276187b80f23570bc608bbc6558c470438')
+})
+
+test('v0.18.59 migrations follow the deployed 142 receipts', () => {
+  assert.equal(journal.entries.length, 152)
+  assert.equal(journal.entries[142].tag, '0143_secret_bruce_banner')
+  assert.equal(journal.entries[151].tag, '0152_desktop_startup_report')
+  assert.equal(journal.entries.filter((entry) => entry.when > journal.entries[141].when).length, 10)
+})
+
 test('new release migrations follow the deployed 122 receipts', () => {
-  assert.equal(journal.entries.length, 142)
+  assert.equal(journal.entries.slice(0, 142).length, 142)
   assert.equal(journal.entries[122].tag, '0123_remote_session_targets')
   assert.equal(journal.entries[141].tag, '0142_salty_captain_midlands')
   assert.ok(journal.entries[122].when > journal.entries[121].when)

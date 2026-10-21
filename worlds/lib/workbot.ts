@@ -63,7 +63,7 @@ export type WorkbotWorldOptions = {
   runnerProxy?: (runnerUrl: string) => Promise<string>;
   /** Extra runner settings, for example a small HEADLESS_CONTEXT_CHAR_BUDGET so a short journey outgrows the context. */
   runnerEnv?: Record<string, string>;
-  /** Features turned on for the seeded organization besides Workbot itself, for example `workbotSideChats`. */
+  /** Features turned on for the seeded organization besides Workbot itself, for example `slackAssistant`. */
   features?: Record<string, boolean>;
 };
 
@@ -193,14 +193,14 @@ async function startService(stack: AsyncDisposableStack, input: {
   throw new Error(`${input.label} did not become healthy: ${logs}`);
 }
 
-/** Turns Workbot (and headless Automations, and any `features`) on for the seeded organization, as a platform admin does. */
+/** Turns Workbot (and any `features`) on for the seeded organization, as a platform admin does. */
 export async function enableWorkbot(den: Den, features: Record<string, boolean> = {}): Promise<string> {
   const headers = { authorization: `Bearer ${den.admin.token}` };
   const orgs = await denFetch(den.admin, "/v1/me/orgs", { headers });
   const org = record(orgs.body) && Array.isArray(orgs.body.orgs) ? orgs.body.orgs.find(record) : undefined;
   if (!orgs.response.ok || !org || typeof org.id !== "string") throw new Error("Acme organization missing.");
   const updated = await denFetch(den.admin, `/v1/admin/organizations/${org.id}/capabilities`, {
-    method: "PUT", headers, body: JSON.stringify({ capabilities: { workbot: true, headlessAutomations: true, ...features } }),
+    method: "PUT", headers, body: JSON.stringify({ capabilities: { workbot: true, ...features } }),
   });
   if (!updated.response.ok) throw new Error(`Could not turn Workbot on: HTTP ${updated.response.status} ${updated.text.slice(0, 200)}`);
   return org.id;
@@ -282,8 +282,8 @@ export async function bootWorkbot(stack: AsyncDisposableStack, preview?: { den: 
       } : {}),
     },
   });
-  // --calendar turns on both Calendars (desktop and Workbot), each behind its own feature.
-  const orgId = await enableWorkbot(den, { ...options.features, ...(options.calendar ? { automationCalendar: true, workbotCalendar: true } : {}) });
+  // --calendar also turns on the desktop Calendar; Workbot's Calendar comes with Workbot.
+  const orgId = await enableWorkbot(den, { ...options.features, ...(options.calendar ? { automationCalendar: true } : {}) });
   // --calendar: a real provider (Anthropic, fixture key) so the Calendar's model pickers show logos and choices.
   if (options.calendar) await publishCalendarModels(den.admin, orgId);
   // The Acme team's apps (in memory), so Workbot has a real-looking calendar, inbox and Slack to read.
@@ -426,7 +426,7 @@ export function workbotOutputs(world: WorkbotWorld, extra: Record<string, WorldO
       ...(world.demo.stateUrl ? { demoState: output(world.demo.stateUrl, { group: "Demo apps", note: "Live demo data; POST /reset restores the seed" }) } : {}),
     } : {}),
     ...(world.app ? { mcpApp: output(world.app.title, { group: "Demo apps", note: `MCP App in the Acme library: ${world.app.pluginPage}` }) } : {}),
-    capabilities: output("workbot, headlessAutomations", { group: "Org", note: "Turned on for Acme Robotics" }),
+    capabilities: output("workbot", { group: "Org", note: "Turned on for Acme Robotics" }),
     alexEmail: output(world.den.admin.email, { group: "Accounts", note: "org owner and platform admin" }),
     alexPassword: secret(world.den.admin.password, { group: "Accounts" }),
     runnerToken: secret(world.secrets.runnerToken, { group: "Headless runner" }),

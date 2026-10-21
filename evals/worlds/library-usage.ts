@@ -2,9 +2,7 @@ import type { DenSession } from "@openwork/behaviors";
 import { evaluateOnSurface } from "@openwork/cdp";
 import type { Seed } from "@openwork/env";
 import type { MockMcpTool } from "@openwork/labs";
-import { activityTransportFaults } from "./den-dashboard-activity-faults.ts";
-import { enableOrganizationCapabilities } from "./dashboards.ts";
-import { isRecord, records } from "./den-dashboard-activity.ts";
+import { isRecord, records } from "./library.ts";
 
 function field(value: unknown, key: string): string {
   const result = isRecord(value) ? value[key] : undefined;
@@ -41,13 +39,6 @@ export async function libraryUsage(seed: Seed) {
     },
     mocks: { tracker: seed.mock({ allowUnauthenticatedMcp: true, tools: trackerTools }) },
   });
-  const orgId = await enableOrganizationCapabilities(seed, den.admin, { libraryUsage: true, denFlatPageHeaders: true });
-  const setAnalyticsIntegrated = async (enabled: boolean) => {
-    const result = await seed.api(den.admin, `/v1/admin/organizations/${orgId}/capabilities`, {
-      method: "PUT", body: JSON.stringify({ capabilities: { analyticsIntegrated: enabled } }),
-    });
-    if (!result.response.ok) throw new Error(`Analytics presentation rollout: HTTP ${result.response.status}`);
-  };
   const api = async (path: string, init: RequestInit = {}) => {
     const result = await seed.api(den.admin, path, init);
     if (!result.response.ok) throw new Error(`Library usage arrangement ${path}: HTTP ${result.response.status}: ${result.text.slice(0, 300)}`);
@@ -83,7 +74,7 @@ export async function libraryUsage(seed: Seed) {
   for (const [key, name] of Object.entries(connectors) as [keyof typeof connectors, string][]) {
     const created = await api("/v1/mcp-connections", {
       method: "POST",
-      body: JSON.stringify({ name, url: den.mocks.tracker.mcpUrl, authType: "none", credentialMode: "shared", access: { orgWide: true } }),
+      body: JSON.stringify({ name, url: den.mocks.tracker.mcpUrl, authType: "none", credentialMode: "shared", exposeDirectly: true, access: { orgWide: true } }),
     });
     connectionIds[key] = field(created, "id");
   }
@@ -132,11 +123,8 @@ export async function libraryUsage(seed: Seed) {
   const viewport = { width: 1280, height: 1000 };
   const web = await seed.web({ den, signedInAs: den.admin, startPath: "/dashboard/analytics", headless: true, viewport });
   const memberWeb = await seed.web({ den, signedInAs: den.members.alice, startPath: "/dashboard", headless: true, viewport });
-  const faults = await activityTransportFaults(web, new URL(den.ref.webUrl).origin, "/api/browser/v1/library-usage/");
   return {
-    faults,
-    async [Symbol.asyncDispose]() { await faults[Symbol.asyncDispose](); },
-    den, web, memberWeb, orgId, skills: capabilities, connectors, loadSkill, callConnector, setAnalyticsIntegrated, baseUrl: den.ref.webUrl,
+    den, web, memberWeb, skills: capabilities, connectors, loadSkill, callConnector, baseUrl: den.ref.webUrl,
     // Read-only layout witness: probe.dom reports document width and rectangles,
     // but not body scrollWidth or whether sideways scrolling stays in the table.
     usageLayout: () => evaluateOnSurface(web, () => {
