@@ -31,17 +31,6 @@ export function useAutomationRunsInRange(
   return useRunsInRangeQuery({ keyPrefix: context.queryRoot, source, range, automations, enabled: enabled && context.ready })
 }
 
-/** Whether the organization turned the Calendar on (`automationCalendar` in `/v1/org` features). */
-export function useCalendarFeature(context: AutomationsDenContext, feature: "automationCalendar" | "calendarPolish" = "automationCalendar") {
-  return useQuery({
-    queryKey: ["den", "org-features", context.organizationId],
-    queryFn: () => context.client!.getOrgFeatures(context.organizationId!),
-    enabled: context.ready,
-    staleTime: 5 * 60_000,
-    select: (features) => features[feature] === true,
-  })
-}
-
 export function useCalendarDefaultModelName(context: AutomationsDenContext, enabled: boolean) {
   const auth = useDenAuth()
   const identity = auth.verifiedIdentity

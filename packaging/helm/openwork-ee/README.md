@@ -158,8 +158,41 @@ Set service enablement as well (`gateway.enabled` or legacy `inference.enabled`)
 Retention's reference is authoritative for **both** `GATEWAY_ADMIN_TOKEN` and
 `INFERENCE_ADMIN_TOKEN` on the Gateway and CronJob, even if the shared Secret
 contains different tokens. It enables admin access without requiring
-`gateway.admin.enabled`. Do not set token env overrides. The retained CronJob
-name, schedule and internal Service target do not change automatically.
+`gateway.admin.enabled`. Do not set token env overrides. Moving from legacy
+`inference.*` to canonical `gateway.*` values does not rename the CronJob or
+change its internal Service target.
+
+The CronJob runs hourly, like the hosted deployment. Each run calls the Gateway's
+`POST /internal/rollups/run`, folds closed request-log hours older than two days
+into hourly usage rollups, and deletes the raw rows it folded in the same
+transaction. Hourly rollups older than 90 days fold into daily rollups the same
+way. The usage dashboard reads raw rows and rollups together, so totals are
+correct whether or not a run has happened yet.
+
+| Setting | Default | Notes |
+| --- | --- | --- |
+| `schedule` | `5 * * * *` | Five minutes past every hour. Older charts defaulted to nightly `0 3 * * *`; an install that set `schedule` explicitly keeps its value. |
+| `timeZone` | `Etc/UTC` | |
+| `maxBucketsPerRun` | `48` | Hours (and days) handled per run. Gateway accepts 1 to 1000. |
+| `maxSourceRowsPerBucket` | `5000` | Rows consumed per hour per run, in one transaction. Gateway accepts 1 to 5000. |
+
+One run consumes at most `maxBucketsPerRun x maxSourceRowsPerBucket` rows
+(240,000 by default). An hour with more rows than `maxSourceRowsPerBucket` is
+finished over the following runs, so hourly runs keep up with up to about
+240,000 requests per hour. The previous defaults (nightly, 1,000 rows) kept up
+with only about 48,000 requests per day. The job logs a summary such as
+`{"hourBuckets":1,"dayBuckets":0,"rawRowsDeleted":1253,...}`. `hourBuckets`
+staying above 1 for several runs means the job is catching up; raise
+`maxSourceRowsPerBucket` toward 5000 before running it more often.
+
+Non-Helm deployments need their own hourly caller with the same body:
+
+```sh
+curl -fsS -X POST -H "Authorization: Bearer $GATEWAY_ADMIN_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"maxBucketsPerRun":48,"maxSourceRowsPerBucket":5000}' \
+  http://<gateway>:8791/internal/rollups/run
+```
 
 Render-only verification: `bash packaging/helm/openwork-ee/tests/gateway.sh`.
 This does not deploy resources, run migrations, or invoke the retention endpoint.
@@ -310,8 +343,8 @@ you can also lock a feature for the whole install under `config.features`:
 ```yaml
 config:
   features:
-    orgManagedDashboards: "true"   # on for everyone on this install
-    installLinks: "false"          # off for everyone on this install
+    permissions: "true"            # on for everyone on this install
+    automationCalendar: "false"    # off for everyone on this install
 ```
 
 - `""` (the default) follows `/admin`, which starts from the default listed
@@ -329,39 +362,30 @@ OpenWork Cloud. Don't change it on a customer install.
 <!-- BEGIN GENERATED features (pnpm features:sync) -->
 | `config.features.*` | Environment variable | Default | What it does |
 | --- | --- | --- | --- |
-| `simplifiedOnboarding` | `DEN_FEATURE_SIMPLIFIED_ONBOARDING` | default off (cloud only) | People enter their name, create a workspace, and optionally invite teammates before going straight to the dashboard. |
-| `managedDeployments` | `DEN_FEATURE_MANAGED_DEPLOYMENTS` | default off (cloud only) | Organization admins install OpenWork in their own cloud account (AWS first) and see its health and updates in OpenWork. |
-| `installLinks` | `DEN_FEATURE_INSTALL_LINKS` | default on | Workspace admins can create desktop install links for their organization. |
-| `mcpConnections` | `DEN_FEATURE_MCP_CONNECTIONS` | default on | Members see the organization's connections, marketplace capabilities on the agent rail, and the desktop Connect tab. |
-| `connectorReadiness` | `DEN_FEATURE_CONNECTOR_READINESS` | default off | Members see when a connection was checked, and admins can check it again. |
-| `driveResumableUploads` | `DEN_FEATURE_DRIVE_RESUMABLE_UPLOADS` | default off | Members upload larger workspace files to Google Drive and prepare upload sessions for external clients. |
-| `implicitCloudSkills` | `DEN_FEATURE_IMPLICIT_CLOUD_SKILLS` | default off | Agents discover organization skills automatically without waiting for Cloud before starting a task. |
-| `denFlatPageHeaders` | `DEN_FEATURE_DEN_FLAT_PAGE_HEADERS` | default off | Members see compact, readable page headings in Den instead of decorative gradient banners. |
-| `analyticsIntegrated` | `DEN_FEATURE_ANALYTICS_INTEGRATED` | default off | Admins see analytics in the same style as Library and Connectors, with links to manage the items they use. |
-| `dashboardActivity` | `DEN_FEATURE_DASHBOARD_ACTIVITY` | default off | Organization admins see recent additions and skill updates on their dashboard instead of Quick add. |
-| `libraryIntegrated` | `DEN_FEATURE_LIBRARY_INTEGRATED` | default off | Members see Library lists, details and add flows that match the rest of Den and the desktop app. |
-| `libraryUsage` | `DEN_FEATURE_LIBRARY_USAGE` | default off | Organization admins see in Analytics how often each skill, plugin and connector is used, by how many people, which calls fail, and what nobody uses, so they can decide what to keep. |
-| `modelsAnalytics` | `DEN_FEATURE_MODELS_ANALYTICS` | default off | Organization admins can opt in to task analytics for OpenWork Models. |
-| `auditLogs` | `DEN_FEATURE_AUDIT_LOGS` | default off | Organization admins can read and configure audit logs. Capture still needs an audit entitlement. |
-| `auditLogsCompact` | `DEN_FEATURE_AUDIT_LOGS_COMPACT` | default off | Organization admins read audit operations and capture settings in compact Den rows, with changes and technical details expanded on demand. |
-| `orgManagedDashboards` | `DEN_FEATURE_ORG_MANAGED_DASHBOARDS` | default off | Organization admins publish dashboards to members in Den and the desktop app. |
+| `cloudAgentGateway` | `DEN_FEATURE_CLOUD_AGENT_GATEWAY` | default off | Choose and run cloud-agent models through the organization's AI Gateway access instead of the runner's shared model credentials. |
+| `liveProviderSync` | `DEN_FEATURE_LIVE_PROVIDER_SYNC` | default off | Keep desktop OpenCode v2 models up to date with the organization's AI Gateway in real time. |
+| `offlineRecovery` | `DEN_FEATURE_OFFLINE_RECOVERY` | default off | Show compact App connection failures and a discreet offline indicator in OpenCode v2 conversations. |
+| `secureSecretFields` | `DEN_FEATURE_SECURE_SECRET_FIELDS` | default off | When an agent sets up a connection, plugin or AI Gateway provider that needs keys, people enter them in private fields in the chat and the agent continues once they are saved. Key fields across OpenWork and OpenWork Cloud can be shown while typing and show saved keys as Replace rows. |
+| `modelsAnalyticsUi` | `DEN_FEATURE_MODELS_ANALYTICS_UI` | default off | Organization admins can view Models & usage analytics and shared model usage limits. Deprecated 2026-10-14: UI hidden behind modelsAnalyticsUi (default off). Most likely delete within 4 weeks (by 2026-11-11) unless an org depends on it. |
+| `taskAnalyticsUi` | `DEN_FEATURE_TASK_ANALYTICS_UI` | default off | Members with analytics access can view task activity and consumption, and admins can configure analytics integrations. Deprecated 2026-10-14: UI hidden behind taskAnalyticsUi (default off). Most likely delete within 4 weeks (by 2026-11-11) unless an org depends on it. |
+| `managedDeployments` | `DEN_FEATURE_MANAGED_DEPLOYMENTS` | default off (cloud only) | Organization admins install OpenWork in their own AWS account or Google Cloud project and see its health and updates in OpenWork, and agents connected to OpenWork can create and follow those deployments. |
 | `slackAssistant` | `DEN_FEATURE_SLACK_ASSISTANT` | default off | Answers Slack mentions and DMs for the organization after the Slack connector is set up. |
-| `slackWorkbotReplies` | `DEN_FEATURE_SLACK_WORKBOT_REPLIES` | default off | OpenWork in Slack writes its reply as it works, reacts to messages with an emoji, and takes bigger jobs into the background, posting the result in the thread when done. |
-| `headlessAutomations` | `DEN_FEATURE_HEADLESS_AUTOMATIONS` | default off | Runs the organization's cloud Automations on the shared headless runner. Needs the deployment's headless runner and a plan that includes it. |
-| `workbot` | `DEN_FEATURE_WORKBOT` | default off | Members can use Workbot. Needs the deployment's Workbot app. |
-| `calendarPolish` | `DEN_FEATURE_CALENDAR_POLISH` | default off | Members recognize their organization's default model and meeting providers, and can run stopped Workbot tasks again. |
+| `workbotTeamLinks` | `DEN_FEATURE_WORKBOT_TEAM_LINKS` | default off | Members with team management access can open their organization's Workbot settings and app connections from Workbot. |
+| `workbotFirstRun` | `DEN_FEATURE_WORKBOT_FIRST_RUN` | default off | People signing in to Workbot choose or create their workspace without leaving sign-in, with a clear next action when Workbot is unavailable. |
+| `workbotInlineConnect` | `DEN_FEATURE_WORKBOT_INLINE_CONNECT` | default off | Members connect their assigned apps directly from Workbot and return to the same view after consent. |
+| `workbotDocuments` | `DEN_FEATURE_WORKBOT_DOCUMENTS` | default off | Members browse recent Google Drive files and folders in Workbot, open documents in tabs, and save supported text and spreadsheet edits to Drive. |
+| `workbotDocumentEditing` | `DEN_FEATURE_WORKBOT_DOCUMENT_EDITING` | default off | Members choose Edit from a document preview. Full Office editing starts their Cloud workspace only when requested. Requires Workbot Documents. |
+| `workbotWorkspaceAssistant` | `DEN_FEATURE_WORKBOT_WORKSPACE_ASSISTANT` | default off | Members ask Workbot about the document or calendar view they have open, chat without leaving their work, and navigate from a compact sidebar. |
+| `workbotGuidedNavigation` | `DEN_FEATURE_WORKBOT_GUIDED_NAVIGATION` | default off | Workbot offers to open the documents it mentions, and the conversation stays open beside the document. Needs the workspace assistant. |
 | `automationCalendar` | `DEN_FEATURE_AUTOMATION_CALENDAR` | default off | Members see a Calendar in the desktop app with their Automations next to meetings from their connected Google or Outlook calendar. |
-| `workbotCalendar` | `DEN_FEATURE_WORKBOT_CALENDAR` | default off | Workbot members see a Calendar tab with Workbot's scheduled work next to meetings from their connected Google or Outlook calendar. Needs Workbot. |
-| `workbotSideChats` | `DEN_FEATURE_WORKBOT_SIDE_CHATS` | default off | Members can start side chats in Workbot next to their main chat, for one topic at a time. Needs Workbot. |
-| `workbotDefaultModel` | `DEN_FEATURE_WORKBOT_DEFAULT_MODEL` | default off | Organization admins choose, in Manage › Workbot, the model Workbot, the Slack assistant and cloud Automations set to the cloud default answer with. Needs Workbot. |
-| `litellm` | `DEN_FEATURE_LITELLM` | default off | Organization admins can connect their own LiteLLM proxy to AI Gateway, with one shared key, each person's own key, or keys OpenWork creates for each person. |
-| `permissions` | `DEN_FEATURE_PERMISSIONS` | default off | Organization admins choose what members, admins and each team can do, instead of the fixed Member and Admin defaults. |
-| `gatewayCloudSignIn` | `DEN_FEATURE_GATEWAY_CLOUD_SIGN_IN` | default off | Organization admins can add Microsoft Foundry, and let each person sign in to Amazon Bedrock with AWS IAM Identity Center or to Microsoft Foundry with Microsoft Entra ID instead of sharing one key. |
+| `engineV2ForceUpgrade` | `DEN_FEATURE_ENGINE_V2_FORCE_UPGRADE` | default off | Desktop and web instances copy chats with a backup and switch to OpenCode v2 automatically when idle, without asking for consent. |
 | `engineV2Upgrade` | `DEN_FEATURE_ENGINE_V2_UPGRADE` | default off | Desktop members still on OpenCode v1 see a short notice offering to upgrade: their chats are copied to v2 with a backup, then OpenWork switches engines. |
-| `remoteSessionTargets` | `DEN_FEATURE_REMOTE_SESSION_TARGETS` | default off | Members can register OpenWork and OpenCode clients as computers for remote sessions from MCP, Slack, and chat. |
 | `remoteSessionEvents` | `DEN_FEATURE_REMOTE_SESSION_EVENTS` | default off | MCP clients can subscribe to changes in their remote session receipts and read the current state after reconnecting. |
-| `opencodePlugin` | `DEN_FEATURE_OPENCODE_PLUGIN` | default off | People can sign in to OpenWork from the OpenCode plugin, approve it as "OpenWork - OpenCode Plugin", and land back on OpenCode afterwards. Applies to the whole deployment; organization overrides have no effect. |
-| `platformAuditReads` | `DEN_FEATURE_PLATFORM_AUDIT_READS` | default off | Platform administrators also get evidence of successful read-only platform requests (session reads, discovery documents). Applies to the whole deployment; organization overrides have no effect. |
+| `remoteSessionSubagents` | `DEN_FEATURE_REMOTE_SESSION_SUBAGENTS` | default off | A task the agent starts on the cloud or another computer shows in the chat like a sub-agent: whether it is working, needs an answer or finished, and its conversation, which people can open, follow up on and stop. |
+| `headlessDurableTurns` | `DEN_FEATURE_HEADLESS_DURABLE_TURNS` | default off | Workbot, Slack and Automations answers keep going after a restart, deploy or server failure, without waiting for someone to reopen the chat. |
+| `headlessStepTurns` | `DEN_FEATURE_HEADLESS_STEP_TURNS` | default off | Workbot, Slack and Automations answers keep going through OpenWork updates instead of restarting their current step. |
+| `headlessSessionCells` | `DEN_FEATURE_HEADLESS_SESSION_CELLS` | default off | Each Workbot chat is stored on its own, so long histories stay fast to open and move during updates. |
+| `headlessSessionIndex` | `DEN_FEATURE_HEADLESS_SESSION_INDEX` | default off | OpenWork keeps a content-free list of Workbot, Slack and Automation chats (sizes, activity, state) for admin views and retention. |
 <!-- END GENERATED features -->
 
 The table and the `config.features` block are generated: run `pnpm features:sync`
@@ -420,7 +444,7 @@ immediately by setting both values to false.
 
 ### Dashboards rollout
 
-The organization-managed Dashboard is unavailable by default. Enable it for a
+The personal desktop Dashboard is unavailable by default. Enable it for a
 self-hosted or customer-managed deployment with:
 
 ```yaml
@@ -1254,48 +1278,20 @@ installerArtifacts:
 Use either `installerArtifacts.existingClaim` or `installerArtifacts.hostPath`,
 not both.
 
-### Guided desktop setup
+### Desktop downloads
 
-The organization download page hands the normal OpenWork app its Den
-configuration in an explicit second step. The default is a short-lived,
-single-use HTTPS exchange and needs no key configuration:
-
-```yaml
-config:
-  public:
-    connectLinkMode: exchange
-```
-
-Den validates the install token and then either:
+The install page (`/install`) asks people to sign in, then downloads the
+standard OpenWork app approved for their organization. Den either:
 
 - streams the standard installer already mounted at
   `installerArtifacts.mountPath`; or
 - redirects the browser directly to the exact configured GitHub release asset.
 
-Den does not download, cache, wrap, or ZIP GitHub artifacts. The organization
-setup stays in the **Open OpenWork** deep-link step after installation.
-
-For an optional signed handoff, explicitly select signed mode and configure a
-dedicated Ed25519 key whose public key is already trusted by the desktop build:
-
-```yaml
-config:
-  public:
-    connectLinkMode: signed
-    connectLinkKeyId: "owc-2026-07"
-
-secret:
-  values:
-    connectLinkPrivateKey: |-
-      -----BEGIN PRIVATE KEY-----
-      ...
-      -----END PRIVATE KEY-----
-```
-
-For an existing Secret, put the private key under the key named by
-`secret.keys.connectLinkPrivateKey` (default `DEN_CONNECT_LINK_PRIVATE_KEY`).
-`scripts/generate-connect-link-keypair.mjs` can generate a pair, but a standard
-desktop build will reject it until the matching public key ships in that build.
+Den does not download, cache, wrap, or ZIP GitHub artifacts. After installing,
+people sign in to the desktop app with the same account. Older
+`/install?token=…` links still open the install page; the token is ignored.
+The former `connectLinkMode`, `connectLinkKeyId` and `connectLinkPrivateKey`
+values are no longer used and can be removed.
 
 For a semi-air-gapped deployment, mount these normal release filenames (where
 `<version>` is `installerReleaseTag` without its leading `v`):

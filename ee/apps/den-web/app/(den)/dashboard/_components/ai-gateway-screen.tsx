@@ -131,8 +131,7 @@ export function AiGatewayScreen({ providerContent, pageContent, pageTab }: { pro
   return (
     <DashboardPageTemplate
       title="AI Gateway"
-      description="Manage Providers, Models, Usage Limits and LLM Controls for your team"
-      colors={["#F1F5FF", "#1D4ED8", "#60A5FA", "#A7F3D0"]}
+      description={null}
     >
       <div data-testid="ai-gateway-tabs" className="mb-6">
         <UnderlineTabs tabs={AI_GATEWAY_TABS} activeTab={tab} onChange={setTab} />
@@ -161,6 +160,7 @@ export function AiGatewayScreen({ providerContent, pageContent, pageTab }: { pro
                           orgSlug={orgSlug}
                           teams={orgContext.teams}
                           members={orgContext.members}
+
                         />
                       </>
                     ) : null}

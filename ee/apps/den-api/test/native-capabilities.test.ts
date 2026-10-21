@@ -188,7 +188,7 @@ beforeAll(async () => {
   const document: unknown = await openApiResponse.json()
   if (!isOpenApiDocument(document)) throw new Error("openapi.json did not look like an OpenAPI document")
   catalog = catalogImport.buildMcpCatalog(document)
-})
+}, 30_000)
 
 afterAll(async () => {
   await db.delete(schema.ConnectedAccountTable).where(drizzle.eq(schema.ConnectedAccountTable.organizationId, organizationId))

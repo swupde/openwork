@@ -673,7 +673,11 @@ export function createDaytonaHost(options: DaytonaHostOptions): DaytonaHost {
       // caller opts in with OPENWORK_AUTOMATION_RUNNER=on.
       env.set("OPENWORK_AUTOMATION_RUNNER", "off");
       if (opts.profile !== "blank") {
+        // Always explicit: a fresh eval profile looks like a new install, which
+        // would otherwise start on OpenCode v2 instead of the selected engine.
+        // A selected `--env OPENWORK_ENGINE_V2_PREVIEW` still wins.
         if (resolveEvalEngineValue(process.env.OPENWORK_EVAL_ENGINE) === "v2") env.set("OPENWORK_ENGINE_V2_PREVIEW", "1");
+        else if (!env.has("OPENWORK_ENGINE_V2_PREVIEW")) env.set("OPENWORK_ENGINE_V2_PREVIEW", "0");
         appendExtraEnv(env, opts.env);
       }
       env.set("DAYTONA_ELECTRON_LOG", logPath);
@@ -850,6 +854,7 @@ PYEOF`;
   }
 
   async function spawnChrome(name: string, opts: ChromeSurfaceOptions = {}): Promise<SurfaceHandle> {
+    if (opts.hostRules) throw new Error("hostRules is supported for local Chrome only.");
     const sandbox = requireSandbox();
     const safeName = sanitizeName(name);
     const port = await allocateSandboxPort(chromePorts, exec, sandbox);

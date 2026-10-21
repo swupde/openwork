@@ -27,6 +27,7 @@ jobs:
   clearance:
     if: >-
       github.repository == 'different-ai/openwork' &&
+      github.repository == 'different-ai/openwork' &&
       github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.path == '.github/workflows/warden.yml' &&
       github.event.workflow_run.head_repository.full_name == github.repository &&

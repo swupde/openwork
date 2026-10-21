@@ -1,6 +1,7 @@
 import "./load-env.js"
 import { registerSlackAssistantRoutes } from "./slack-assistant/routes.js"
 import { registerWorkbotRoutes } from "./workbot/routes.js"
+import { registerHeadlessRunnerRoutes } from "./headless-runner/routes.js"
 import { createDenTypeId, normalizeDenTypeId } from "@openwork-ee/utils/typeid"
 import { swaggerUI } from "@hono/swagger-ui"
 import { and, eq, isNull, sql } from "@openwork-ee/den-db/drizzle"
@@ -20,7 +21,7 @@ import { registerAgentMcpRoutes } from "./mcp/agent.js"
 import { registerExternalConnectionProxyRoutes } from "./mcp/external-connection-proxy.js"
 import { registerMcpRoutes } from "./mcp/index.js"
 import type { MemberTeamsContext, OrganizationContextVariables, UserOrganizationsContext } from "./middleware/index.js"
-import { buildOperationId, emptyResponse, htmlResponse, jsonResponse } from "./openapi.js"
+import { buildOperationId, htmlResponse, jsonResponse } from "./openapi.js"
 import { appLogger } from "./observability/logger.js"
 import { isWebOriginApprovedByAnyOrganization } from "./organization-web-origins.js"
 import { createRequestAccessLogMiddleware, createTelemetryErrorSanitizerMiddleware, registerAppErrorHandler, registerObservabilityMiddleware } from "./observability/hono.js"
@@ -36,6 +37,7 @@ import { registerInternalRoutes } from "./routes/internal/index.js"
 import { registerMcpTokenRoutes } from "./routes/mcp/index.js"
 import { registerAutomationRoutes } from "./routes/automations/index.js"
 import { registerSessionRunnerRoutes } from "./routes/session-runners/index.js"
+import { registerRemoteSessionRoutes } from "./routes/remote-sessions/index.js"
 import { automationService, configureCloudAgentExecutor, configureCloudWorkflowExecutor, configureHeadlessAgentExecutor } from "./automations/service.js"
 import { cloudAgentRuntimeAvailable, executeCloudAgent } from "./automations/cloud-agent-executor.js"
 import { executeHeadlessAgent } from "./automations/headless-agent-executor.js"
@@ -53,10 +55,12 @@ import { registerWebhookRoutes } from "./routes/webhooks/index.js"
 import { registerWorkerRoutes } from "./routes/workers/index.js"
 import type { AuthContextVariables } from "./session.js"
 import { sessionMiddleware } from "./session.js"
+import { inventoryRevisionMiddleware } from "./middleware/inventory-revision.js"
 import { preclaimScopeMiddleware } from "./middleware/preclaim-scope.js"
 import { auditRequestMiddleware } from "./audit/request-capture.js"
 import { isOperationalErrorPath, normalizeOperationalErrorResponse, operationalErrorResponse } from "./operational-errors.js"
 import { sanitizePublicResponseHeaders } from "./public-response-headers.js"
+import { AUTOMATION_MODEL_ATTENTION_CAPABILITY_HEADER } from "@openwork/types/automations"
 
 type AppVariables = RequestIdVariables & AuthContextVariables & Partial<UserOrganizationsContext> & Partial<OrganizationContextVariables> & Partial<MemberTeamsContext>
 
@@ -130,6 +134,7 @@ app.use("*", async (c, next) => {
   c.res = await normalizeOperationalErrorResponse(c.req.path, c.res, c.get("requestId"))
 })
 app.use("*", createRequestAccessLogMiddleware())
+app.use("*", inventoryRevisionMiddleware)
 registerAppErrorHandler(app, (error, c, requestId) => {
   if (!isOperationalErrorPath(c.req.path)) {
     return undefined
@@ -188,7 +193,9 @@ if (!env.corsHandledByEdge) {
     cors({
       origin: resolveStrictCorsOrigin,
       credentials: true,
-      allowHeaders: ["Content-Type", "Authorization", "X-Api-Key", "X-Request-Id", "X-OpenWork-Legacy-Org-Id", "X-OpenWork-Org-Id", "X-OpenWork-Audit-Correlation"],
+      // Browser clients (app-web) send the Automation model-attention capability header on create/update/run;
+      // without it here the preflight fails and the request never reaches Den ("Failed to fetch").
+      allowHeaders: ["Content-Type", "Authorization", "X-Api-Key", "X-Request-Id", "X-OpenWork-Legacy-Org-Id", "X-OpenWork-Org-Id", "X-OpenWork-Audit-Correlation", AUTOMATION_MODEL_ATTENTION_CAPABILITY_HEADER],
       allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
       exposeHeaders: ["Content-Length", "Content-Disposition", "X-Audit-Next-Cursor", "X-Audit-Snapshot-Sequence", "X-Audit-Resource-Scope"],
       maxAge: 600,
@@ -210,19 +217,17 @@ app.get(
     tags: ["System"],
     security: [],
     hide: true,
-    summary: "Redirect API root",
-    description: "Redirects the API root when DEN_MARKETING_URL is configured; otherwise returns a lightweight service payload.",
+    summary: "Check API origin reachability",
+    description: "Returns a lightweight public service payload directly so MCP hosts can verify the API origin without following a cross-origin redirect.",
     responses: {
       200: jsonResponse("API root service payload.", healthResponseSchema),
-      302: emptyResponse("Redirect to the configured marketing site."),
     },
   }),
   publicRoute,
   (c) => {
-    if (env.marketingUrl) {
-      return c.redirect(env.marketingUrl, 302)
-    }
-    return c.json({ ok: true, service: "den-api" })
+    // MCP view-domain probes need a direct success response even when this
+    // deployment also has a marketing or web app URL configured.
+    return c.json({ ok: true, service: "den-api", version: env.serviceVersion })
   },
 )
 
@@ -287,9 +292,11 @@ registerMeRoutes(app)
 // inventory and receipts stay available when the Automation runtime is off.
 registerSessionRunnerRoutes(app, { automationService: env.automations.runtimeEnabled ? automationService : undefined })
 registerAutomationRoutes(app, { enabled: env.automations.runtimeEnabled, sessionRunners: false })
+registerRemoteSessionRoutes(app)
 registerOrgRoutes(app)
 registerSlackAssistantRoutes(app)
 registerWorkbotRoutes(app)
+registerHeadlessRunnerRoutes(app)
 registerVersionRoutes(app)
 registerFeatureRoutes(app)
 registerWebhookRoutes(app)
@@ -330,6 +337,7 @@ configureCloudWorkflowExecutor(async ({ organizationId, ownerMemberId, automatio
     redirectUriBase: env.apiPublicUrl ?? "http://127.0.0.1",
     generatedArtifactViewsEnabled: env.generatedArtifactViewsEnabled,
     organizationFeatures,
+    usageSource: "automation",
   })
   const result = await executeMarketplaceCapability({
     organizationId,
@@ -413,6 +421,7 @@ const openApiOptions: Parameters<typeof generateSpecs>[1] = {
       { name: "Permissions", description: "Organization permissions: the permission catalog, Member, Admin and team permission sets, their history, and each member's effective permissions." },
       { name: "API Keys", description: "Organization API key management routes." },
       { name: "Desktop Policies", description: "Desktop app policies applied to the organization, members, or teams." },
+      { name: "Agent Permissions", description: "What agents may do on members' computers, set for everyone and per team." },
       { name: "LLM Providers", description: "Organization LLM provider catalog, configuration, and access routes." },
       { name: "Inference", description: "Organization inference settings." },
       { name: "Inference Providers", description: "Organization inference Gateway providers, model groups, credential sets, access grants, member connections, and usage." },
@@ -422,6 +431,7 @@ const openApiOptions: Parameters<typeof generateSpecs>[1] = {
       { name: "Worker Activity", description: "Worker heartbeat and activity reporting routes." },
       { name: "Managed deployments", description: "OpenWork installations in an organization's own cloud account: launch approval, installer milestones and health reports." },
       { name: "Automations", description: "Scheduled Automations, their runs, and desktop runner presence." },
+      { name: "Documents", description: "Connected Drive documents, inline editing and file-bound temporary Office sessions." },
       { name: "Workbot", description: "The signed-in member's single Workbot conversation." },
       { name: "Workflows", description: "Saved Workflows (Code Mode scripts), their versions, snapshots, and views." },
       { name: "Workflow Runs", description: "Durable Workflow run history." },
@@ -431,7 +441,6 @@ const openApiOptions: Parameters<typeof generateSpecs>[1] = {
       { name: "Plugins", description: "Plugin packages, access grants, and imports." },
       { name: "Marketplaces", description: "Marketplaces that distribute plugins to members and teams." },
       { name: "Resources", description: "Aggregated snapshot of the resources and marketplace capabilities available to the caller." },
-      { name: "Dashboards", description: "Shared dashboards and their access grants." },
       { name: "Capability Sources", description: "Native provider capabilities (Google Workspace, Microsoft 365) and external MCP connections executed as the calling member." },
       { name: "Direct uploads", description: "Multipart uploads that stream workspace files straight to a provider." },
       { name: "Connectors", description: "Connector accounts and instances (GitHub and other sources) and their sync state." },
@@ -477,6 +486,11 @@ const openApiOptions: Parameters<typeof generateSpecs>[1] = {
           type: "http",
           scheme: "bearer",
           description: "Deployment maintenance token (DEN_MAINTENANCE_TOKEN) used by scheduled jobs, passed as `Authorization: Bearer <token>`.",
+        },
+        headlessRunnerCallbackToken: {
+          type: "http",
+          scheme: "bearer",
+          description: "Headless runner callback token (DEN_HEADLESS_RUNNER_CALLBACK_TOKEN) the runner presents to exchange a turn's resume grant, passed as `Authorization: Bearer <token>`.",
         },
         workerHeartbeatToken: {
           type: "http",

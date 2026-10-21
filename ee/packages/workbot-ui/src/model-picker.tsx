@@ -5,10 +5,10 @@ import { Select } from "@base-ui/react/select";
 import type { AutomationModelOption } from "@openwork/types/automation-models";
 import type { AutomationModel } from "@openwork/types/automations";
 import { ProviderIcon } from "@openwork/ui/provider-icon";
-import { Check, ChevronDown, Cloud, Search } from "lucide-react";
-import { useMemo } from "react";
+import { Check, ChevronDown, Search } from "lucide-react";
+import { useMemo, useState } from "react";
+import { useRetainedSurface } from "./host";
 import { OpenWorkMark } from "./mark";
-import { workbotHost } from "./host";
 
 /**
  * Which model an Automation uses, in Workbot's style: the current model with its provider's logo, and a list
@@ -35,25 +35,25 @@ export function ModelLogo({ option, size = 14 }: { option: Pick<AutomationModelO
     <span className="grid shrink-0 place-items-center rounded-md bg-[var(--wb-surface)] text-[var(--wb-ink)] shadow-[0_0_0_1px_var(--wb-ring)]" style={{ width: size + 8, height: size + 8 }}>
       {/* The organization's choice uses OpenWork's mark, not the resolved model's vendor mark. */}
       {option.accessKind === "cloud_default"
-        ? workbotHost().calendarPolish === true ? <OpenWorkMark width={size} height={size} /> : <Cloud size={size} strokeWidth={1.75} aria-hidden />
+        ? <OpenWorkMark width={size} height={size} />
         : <ProviderIcon providerId={option.logoProviderId ?? option.providerId} providerName={option.providerName} size={size} />}
     </span>
   );
 }
 
-/** One line for a model: logo, name and provider. Shows the raw ID when the model is no longer offered. */
+/** One line for a model: logo, name and provider. Says so when the model is no longer offered. */
 export function ModelSummary({ model, options }: { model: AutomationModel; options: readonly AutomationModelOption[] }) {
   const option = options.find((candidate) => same(candidate, model));
-  if (!option) return <span className="truncate text-[var(--wb-muted)]">{workbotHost().calendarPolish === true ? "Model no longer available" : `${model.providerId}/${model.modelId} · no longer available`}</span>;
+  if (!option) return <span className="truncate text-[var(--wb-muted)]">Model no longer available</span>;
   return (
     <span className="flex min-w-0 items-center gap-2" data-automation-model={modelKey(option)}>
       <ModelLogo option={option} size={12} />
-      {workbotHost().calendarPolish === true && option.accessKind === "cloud_default" ? (
+      {option.accessKind === "cloud_default" ? (
         <span className="min-w-0 truncate font-medium text-[var(--wb-text)]">{option.modelName}</span>
       ) : (
         <span className="min-w-0 truncate">
           <span className="font-medium text-[var(--wb-text)]">{option.modelName}</span>
-          <span className="text-[var(--wb-muted)]">{workbotHost().calendarPolish === true ? ` (${option.providerName})` : ` · ${option.providerName}`}</span>
+          <span className="text-[var(--wb-muted)]">{` (${option.providerName})`}</span>
         </span>
       )}
     </span>
@@ -81,6 +81,8 @@ export function ModelPicker({ value, options, loading, onChange, label = "Model"
   /** Preferred opening side; the list flips or shrinks to fit the viewport. */
   side?: "top" | "bottom";
 }) {
+  const [open, setOpen] = useState(false);
+  const surface = useRetainedSurface(open);
   const groups = useMemo(() => {
     const byProvider = new Map<string, AutomationModelOption[]>();
     for (const option of options) byProvider.set(option.providerName, [...(byProvider.get(option.providerName) ?? []), option]);
@@ -89,7 +91,7 @@ export function ModelPicker({ value, options, loading, onChange, label = "Model"
   const current = options.find((option) => same(option, value)) ?? null;
   const disabled = loading && options.length === 0;
   const changeModel = (option: AutomationModelOption | null) => {
-    if (option) onChange({ providerId: option.providerId, modelId: option.modelId, variant: null });
+    if (option && !surface.blocked) onChange({ providerId: option.providerId, modelId: option.modelId, variant: null });
   };
   const triggerContent = (
     <>
@@ -114,16 +116,17 @@ export function ModelPicker({ value, options, loading, onChange, label = "Model"
       <Select.Root<AutomationModelOption>
         items={options.map((option) => ({ value: option, label: option.modelName }))}
         value={current}
-        disabled={disabled}
+        disabled={disabled || surface.blocked}
         modal={false}
         itemToStringLabel={(option) => option.modelName}
         itemToStringValue={modelKey}
         isItemEqualToValue={(option, selected) => same(option, selected)}
         onValueChange={changeModel}
-        onOpenChange={(_open, details) => { if (details.reason === "escape-key") details.event.stopPropagation(); }}
+        open={surface.open}
+        onOpenChange={(next, details) => { if (surface.blocked) return; setOpen(next); if (details.reason === "escape-key") details.event.stopPropagation(); }}
       >
         <Select.Trigger aria-label={label} className={triggerClass}>{triggerContent}</Select.Trigger>
-        <Select.Portal>
+        <Select.Portal {...surface.portal}>
           {/* The standalone headless primitive needs the same overlay layer as Workbot's dialogs. */}
           <Select.Positioner {...positioning} alignItemWithTrigger={false} className="z-50">
             <Select.Popup data-workbot-model-popup className={popupClass}>
@@ -152,17 +155,18 @@ export function ModelPicker({ value, options, loading, onChange, label = "Model"
     <Combobox.Root<AutomationModelOption>
       items={groups}
       value={current}
-      disabled={disabled}
+      disabled={disabled || surface.blocked}
       autoHighlight
       itemToStringLabel={(option) => option.modelName}
       itemToStringValue={modelKey}
       isItemEqualToValue={(option, selected) => same(option, selected)}
       filter={(option, query) => `${option.modelName} ${option.providerName}`.toLowerCase().includes(query.trim().toLowerCase())}
       onValueChange={changeModel}
-      onOpenChange={(_open, details) => { if (details.reason === "escape-key") details.event.stopPropagation(); }}
+      open={surface.open}
+      onOpenChange={(next, details) => { if (surface.blocked) return; setOpen(next); if (details.reason === "escape-key") details.event.stopPropagation(); }}
     >
       <Combobox.Trigger aria-label={label} className={triggerClass}>{triggerContent}</Combobox.Trigger>
-      <Combobox.Portal>
+      <Combobox.Portal {...surface.portal}>
         <Combobox.Positioner {...positioning} className="z-50">
           <Combobox.Popup data-workbot-model-popup aria-label={label} className={popupClass}>
             <div className="flex shrink-0 items-center gap-2 border-b border-[var(--wb-hairline)] px-2.5 focus-within:shadow-[inset_0_-1px_0_0_var(--wb-ink)]">

@@ -382,7 +382,7 @@ describe("Provider grants and honest receipts", () => {
   test.each([401, 403, 404, 429])("provider HTTP %s remains a failure and is not retried", async (status) => {
     const h = harness({ respond: () => Response.json({ error: "do not leak provider details" }, { status }) })
     const response = await h.request("/drive-folders", "POST", { name: "Folder" })
-    expect(response.status).toBe(status === 401 || status === 403 ? 409 : 502)
+    expect(response.status).toBe(status === 401 ? 409 : 502)
     expect(await response.text()).not.toContain("do not leak provider details")
     expect(h.calls).toHaveLength(1)
   })

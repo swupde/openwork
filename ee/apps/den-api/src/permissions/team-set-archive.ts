@@ -8,8 +8,8 @@ type MemberId = typeof MemberTable.$inferSelect.id
 
 /**
  * Stops the teams' permission sets applying (overview section 10): soft-removes
- * their active permission set links and archives each linked team set that no
- * other team still uses. Default sets are never archived. Nothing is deleted.
+ * their active permission set links. Roles outlive the teams using them; sets
+ * are only archived when explicitly deleted. Nothing is deleted.
  * Used when a team is deleted, and when a SCIM provider is deleted or changes
  * how it maps groups, alongside clearing those teams' Admin designation: the
  * retained teams keep their members but grant nothing until the owner sets
@@ -53,26 +53,4 @@ export async function archiveTeamPermissionSets(tx: TeamMutationTransaction, inp
     .set({ removedAt: input.at, removedByOrgMembershipId: input.actorMemberId })
     .where(inArray(PermissionSetTeamTable.id, links.map((link) => link.id)))
 
-  const setIds = [...new Set(links.map((link) => link.permissionSetId))]
-  const stillLinked = new Set((await tx
-    .select({ permissionSetId: PermissionSetTeamTable.permissionSetId })
-    .from(PermissionSetTeamTable)
-    .where(and(
-      eq(PermissionSetTeamTable.organizationId, input.organizationId),
-      inArray(PermissionSetTeamTable.permissionSetId, setIds),
-      isNull(PermissionSetTeamTable.removedAt),
-    )))
-    .map((row) => row.permissionSetId))
-  const archiveIds = setIds.filter((setId) => !stillLinked.has(setId))
-  if (archiveIds.length === 0) return
-
-  await tx
-    .update(PermissionSetTable)
-    .set({ archivedAt: input.at, archivedByOrgMembershipId: input.actorMemberId })
-    .where(and(
-      eq(PermissionSetTable.organizationId, input.organizationId),
-      inArray(PermissionSetTable.id, archiveIds),
-      isNull(PermissionSetTable.defaultKey),
-      isNull(PermissionSetTable.archivedAt),
-    ))
 }

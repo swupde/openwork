@@ -35,6 +35,7 @@ jobs:
   deploy:
     if: >-
       github.repository == 'different-ai/openwork' &&
+      github.repository == 'different-ai/openwork' &&
       vars.OPENWORK_REVIEW_URL != '' &&
       vars.OPENWORK_REVIEW_VERCEL_ORG_ID != '' &&
       vars.OPENWORK_REVIEW_VERCEL_PROJECT_ID != ''

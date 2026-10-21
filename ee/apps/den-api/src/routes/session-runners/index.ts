@@ -29,7 +29,6 @@ import type { AutomationService } from "../../automations/service.js"
 import { automationRunnerComputerIds } from "../../automations/repository.js"
 import { automationRunnerAudienceFromRequest, automationRunnerAuth } from "../../automations/runner-auth.js"
 import { env } from "../../env.js"
-import { organizationFeatureEnabled, requireFeature } from "../../features.js"
 import { databaseRemoteSessionCommandStore, type RemoteSessionCommandStore } from "../../remote-sessions/commands.js"
 import { databaseRemoteSessionRequestStore, type RemoteSessionRequestStore } from "../../remote-sessions/requests.js"
 import { createRunnerProtocol, runnerRoute, runnerErrorSchema, runnerConflictResponse } from "./protocol.js"
@@ -41,6 +40,7 @@ import {
   nextRunnerNotificationPollDelay,
 } from "../../automations/runner-notification-poll.js"
 import { appLogger } from "../../observability/logger.js"
+import { readOrganizationEnginePolicy } from "../engine-policy.js"
 
 const idParamsSchema = z.object({ id: z.string().min(1).max(160) })
 
@@ -51,17 +51,15 @@ export function registerSessionRunnerRoutes<T extends { Variables: Partial<Organ
     automationService?: Pick<AutomationService, "discoverDesktopRunnerWork" | "runnerNotifications">
     commandStore?: RemoteSessionCommandStore
     requestStore?: RemoteSessionRequestStore
-    featureEnabled?: (organizationId: string) => Promise<boolean>
+    readEnginePolicy?: typeof readOrganizationEnginePolicy
   } = {},
 ) {
   const service = options.service ?? sessionRunnerService
   const commandStore = options.commandStore ?? databaseRemoteSessionCommandStore
   const requestStore = options.requestStore ?? databaseRemoteSessionRequestStore
-  const featureEnabled = options.featureEnabled ?? ((organizationId) => organizationFeatureEnabled(organizationId, "remoteSessionTargets"))
   const { authenticateRunner, attributeRunner } = createRunnerProtocol(service)
 
   const describeTokenRoute = (input: DescribeRouteOptions & { "x-mcp": false }) => describeRoute(input)
-  const ungatedRegistration: ReturnType<typeof requireFeature> = async (_c, next) => { await next() }
   const registerTokenRoute = (path: string, sessionOnly: boolean) => app.post(
     path,
     describeTokenRoute({
@@ -75,7 +73,6 @@ export function registerSessionRunnerRoutes<T extends { Variables: Partial<Organ
       },
     }),
     orgMemberRoute(),
-    sessionOnly ? requireFeature("remoteSessionTargets") : ungatedRegistration,
     jsonValidator(automationDesktopRunnerRegistrationSchema),
     async (c) => {
       const context = c.get("organizationContext")
@@ -202,13 +199,15 @@ export function registerSessionRunnerRoutes<T extends { Variables: Partial<Organ
           runnerId: identity.runnerId, now: Date.now(), limit: 5 }
         const recoverable = identity.capabilities.includes(REMOTE_SESSION_RECOVERY_RUNNER_CAPABILITY)
           ? await commandStore.listRecoverableForRunner(input) : []
-        const pending = recoverable.length < 5 && await featureEnabled(identity.organizationId)
+        const pending = recoverable.length < 5
           ? await commandStore.listPendingForRunner({ ...input, computerIds: automationRunnerComputerIds(identity), limit: 5 - recoverable.length }) : []
         for (const command of [...recoverable, ...pending]) {
           items.push({ kind: "remote_session_create", commandId: command.id })
         }
       }
-      return c.json(automationRunnerWorkResponseSchema.parse({ items }))
+      const enginePolicy = await (options.readEnginePolicy ?? readOrganizationEnginePolicy)(identity.organizationId)
+      c.header("Cache-Control", "no-store")
+      return c.json(automationRunnerWorkResponseSchema.parse({ items, enginePolicy }))
     },
   )
   registerWorkRoute("/v1/session-runners/work", false)
@@ -233,7 +232,9 @@ export function registerSessionRunnerRoutes<T extends { Variables: Partial<Organ
       if (!audited.ok) return audited.response
       const stored = await service.saveDesktopRunnerInventory(identity, c.req.valid("json"))
       if (!stored) return c.json({ error: "runner_not_registered" }, 404)
-      return c.json(desktopRunnerInventoryResponseSchema.parse({ ok: true, updatedAt: Date.now() }))
+      const enginePolicy = await (options.readEnginePolicy ?? readOrganizationEnginePolicy)(identity.organizationId)
+      c.header("Cache-Control", "no-store")
+      return c.json(desktopRunnerInventoryResponseSchema.parse({ ok: true, updatedAt: Date.now(), enginePolicy }))
     },
   )
   registerInventoryRoute("/v1/session-runners/inventory")
@@ -266,7 +267,6 @@ export function registerSessionRunnerRoutes<T extends { Variables: Partial<Organ
         computerIds: automationRunnerComputerIds(identity),
         now: Date.now(),
         recoverClaimed: identity.capabilities.includes(REMOTE_SESSION_RECOVERY_RUNNER_CAPABILITY),
-        allowPending: await featureEnabled(identity.organizationId),
       })
       if (!command) return c.json({ error: "command_claim_conflict" }, 409)
       return c.json(remoteSessionCommandClaimResponseSchema.parse({

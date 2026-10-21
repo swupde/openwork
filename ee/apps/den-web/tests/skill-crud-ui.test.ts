@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const dashboardComponents = join(import.meta.dir, "../app/(den)/dashboard/_components");
+const itemList = readFileSync(join(dashboardComponents, "item-list.tsx"), "utf8");
 const editor = readFileSync(join(dashboardComponents, "skill-editor-screen.tsx"), "utf8");
 const detail = readFileSync(join(dashboardComponents, "skill-detail-screen.tsx"), "utf8");
 const data = readFileSync(join(dashboardComponents, "skill-data.tsx"), "utf8");
@@ -23,20 +24,19 @@ describe("Den plugin skill CRUD UI contract", () => {
   });
 
   test("shows the owning plugin's skills with an empty state and add action", () => {
-    expect(pluginDetail).toContain("No skills in this plugin yet.");
+    expect(pluginDetail).toContain("No skills yet.");
     expect(pluginDetail).toContain("Add skill");
     expect(pluginDetail).toContain("getNewPluginSkillRoute(orgSlug, plugin.id)");
-    expect(pluginDetail).toContain("getPluginSkillRoute(orgSlug, pluginId, skill.id)");
+    expect(pluginDetail).toContain("getPluginSkillRoute(orgSlug, plugin.id, skill.id)");
   });
 
   test("shows the complete body and returns to the plugin after confirmed deletion", () => {
-    expect(detail).toContain("Complete skill body");
-    expect(detail).not.toContain("font-semibold uppercase tracking-[0.14em]");
-    expect(detail).toContain("<pre");
-    expect(detail).toContain("border-gray-200 bg-gray-50");
-    expect(detail).not.toContain("rounded-xl bg-gray-950");
-    expect(detail).toContain("Delete “{skill.name}”?");
-    expect(detail).toContain("Delete “{skill.name}”");
+    expect(detail).toContain("Skill steps");
+    expect(detail).toContain("{skill.body}");
+    expect(detail).toContain("removeEntry(skillTitle(skill.name)");
+    expect(detail).toContain("await deleteSkill.mutateAsync(skill.id)");
+    expect(itemList).toContain("confirm: { title: `Remove ${name}?`");
+    expect(itemList).toContain("<ConfirmDialog");
     expect(detail).toContain("getPluginRoute(orgSlug, pluginId)");
   });
 
@@ -59,12 +59,12 @@ describe("Den plugin skill CRUD UI contract", () => {
   });
 
   test("lets administrators edit and safely archive the owning plugin", () => {
-    expect(pluginDetail).toContain('data-testid="plugin-actions-trigger"');
-    expect(pluginDetail).toContain("Edit plugin");
-    expect(pluginDetail).toContain('data-testid="plugin-edit-save"');
-    expect(pluginDetail).toContain("Archive “{pluginName}”?");
-    expect(pluginDetail).toContain("without deleting its historical skills");
-    expect(pluginDetail).toContain('data-testid="archive-plugin-confirm"');
+    expect(pluginDetail).toContain('label: "Edit"');
+    expect(pluginDetail).toContain("setEditPlugin");
+    expect(pluginDetail).toContain("removeEntry(plugin.name");
+    expect(pluginDetail).toContain("await archivePlugin.mutateAsync(pluginId)");
+    expect(itemList).toContain("destructive: true");
+    expect(itemList).toContain("<ConfirmDialog");
     expect(pluginData).toContain('runReauthableAction("update-plugin"');
     expect(pluginData).toContain('method: "PATCH"');
     expect(pluginData).toContain('runReauthableAction("archive-plugin"');

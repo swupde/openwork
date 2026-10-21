@@ -4,6 +4,9 @@ This is SwitchUp's deployment fork, **swupde/openwork**. Start with
 [the fork maintenance guide](docs/SWUP-FORK.md) for our CI, update, and Dokploy
 release process. Product documentation below is retained from upstream;
 its hosted services and release automation are not SwitchUp infrastructure.
+<p align="center">
+  <img src="./docs/images/model-picker.png" width="560" alt="The OpenWork composer with its model picker open: pinned, recent and per-provider models from Anthropic, OpenAI, Google and a local Ollama model" />
+</p>
 
 OpenWork is the free, open-source alternative to Claude Cowork and Codex: a desktop app for macOS, Windows, and Linux where AI agents do real work on your own files. It is built on [OpenCode](https://opencode.ai), works with any model — 50+ providers, your own API keys, or local models via Ollama — and lets teams share skills and MCP servers.
 
@@ -126,6 +129,10 @@ pnpm install
 pnpm dev   # launches the Electron desktop app with hot reload
 ```
 
+Coding agents and tests should not open that window on your screen: they use
+the app in headless Chrome instead (see [Headless web](#headless-web-no-electron)
+and `AGENTS.md`).
+
 ### Repository layout
 
 | Path | What lives there |
@@ -180,6 +187,7 @@ To run the OpenWork UI in a browser against a local `openwork-server` (no deskto
 
 ```bash
 pnpm world up dev-app-web --detach
+pnpm world up dev-app-web --detach -- --browser   # also opens it in headless Chrome and prints a cdp address
 ```
 
 `pnpm dev:headless-web` is a compatibility alias for the same script. The alias

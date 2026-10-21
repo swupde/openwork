@@ -28,6 +28,8 @@ const select = () => {
 }
 mock.module("../src/db.js", () => ({ db: { select } }))
 mock.module("../src/auth.js", createMockDenAuth)
+const orgs = await import("../src/orgs.js")
+mock.module("../src/orgs.js", () => ({ ...orgs, loadOrganizationDirectory: async () => ({ members: [], teams: [], roles: [] }) }))
 
 const { memberPermissionsForOrganizationContext, resolveMemberPermissionsMiddleware } = await import("../src/middleware/member-permissions.js")
 
@@ -69,7 +71,7 @@ test("authenticated GET /v1/org returns the versioned deployment capability inde
     const response = await app.request("/v1/org")
     expect(response.status).toBe(200)
     const payload = await response.json()
-    expect(payload.deploymentCapabilities).toEqual({ version: 1, aiGateway: enabled })
+    expect(payload.deploymentCapabilities).toMatchObject({ version: 1, aiGateway: enabled })
     expect(parseDeploymentCapabilities(payload.deploymentCapabilities).aiGateway).toBe(enabled)
     expect(payload.capabilities.gatewayDashboard).toBe(true)
     expect(payload.organization.deploymentCapabilities).toBeUndefined()

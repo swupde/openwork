@@ -1,6 +1,9 @@
 import type { Hono } from "hono"
 import type { RequestIdVariables } from "hono/request-id"
 import { delegatedRoute } from "../../middleware/index.js"
+import { registerOrgActivityRoutes } from "./activity.js"
+import { registerOrgAgentPermissionRoutes } from "./agent-permissions.js"
+import { registerOrgDefaultModelRoutes } from "./default-model.js"
 import { registerOrgApiKeyRoutes } from "./api-keys.js"
 import { registerManagedDeploymentRoutes } from "./managed-deployments.js"
 import { registerOrgAuditRoutes } from "./audit.js"
@@ -11,11 +14,13 @@ import { registerOrgWorkflowRoutes } from "./codemode-scripts.js"
 import { LEGACY_ORG_PROXY_HEADER } from "../../middleware/user-organizations.js"
 import type { OrgRouteVariables } from "./shared.js"
 import { registerOrgCoreRoutes } from "./core.js"
-import { registerOrgDashboardRoutes } from "./dashboards.js"
+import { registerOrgServiceReadinessRoutes } from "./service-readiness.js"
 import { registerOrgMcpAppCatalogRoutes } from "./mcp-app-catalog.js"
 import { registerDeleteOrganizationRoutes } from "./delete-organization.js"
+import { registerOrgDiagnosticsRoutes } from "./diagnostics.js"
 import { registerOrgDesktopPolicyRoutes } from "./desktop-policies.js"
 import { registerOrgEgressDiagnosticRoutes } from "./egress-diagnostics.js"
+import { registerOrgInventoryRevisionRoutes } from "./inventory-revision.js"
 import { registerOrgInvitationRoutes } from "./invitations.js"
 import { registerGoogleWorkspaceRoutes } from "./google-workspace.js"
 import { registerOrgInstallLinkRoutes } from "./install-links.js"
@@ -23,6 +28,7 @@ import { registerOrgInferenceProviderRoutes } from "./inference-providers.js"
 import { registerOrgInferenceRoutes } from "./inference.js"
 import { registerModelsAnalyticsRoutes } from "./models-analytics.js"
 import { registerLibraryUsageRoutes } from "./library-usage.js"
+import { registerOrgHeadlessSessionRoutes } from "./headless-sessions.js"
 import { registerModelsAnalyticsExportRoutes } from "../../models-analytics-export.js"
 import { registerOrgLlmProviderRoutes } from "./llm-providers.js"
 import { registerOrgMemberRoutes } from "./members.js"
@@ -36,6 +42,7 @@ import { registerOrgSsoRoutes } from "./sso.js"
 import { registerOrgResourceRoutes } from "./resources.js"
 import { registerOrgTeamRoutes } from "./teams.js"
 import { registerOrgWebOriginRoutes } from "./web-origins.js"
+import { registerOrgWorkbotReadinessRoutes } from "./workbot-readiness.js"
 import { registerOrgWorkbotSettingsRoutes } from "./workbot-settings.js"
 
 const LEGACY_ORG_PATH_PREFIX = "/v1/orgs/"
@@ -66,6 +73,10 @@ function extractLegacyOrgProxyTarget(pathname: string) {
 
 export function registerOrgRoutes<T extends { Variables: OrgRouteVariables & RequestIdVariables }>(app: Hono<T>) {
   registerOrgCoreRoutes(app)
+  registerOrgServiceReadinessRoutes(app)
+  registerOrgDiagnosticsRoutes(app)
+  registerOrgActivityRoutes(app)
+  registerOrgInventoryRevisionRoutes(app)
   registerManagedDeploymentRoutes(app)
   registerDeleteOrganizationRoutes(app)
   registerOrgApiKeyRoutes(app)
@@ -74,13 +85,14 @@ export function registerOrgRoutes<T extends { Variables: OrgRouteVariables & Req
   registerOrgBrandAssetRoutes(app)
   registerOrgWorkflowRunRoutes(app)
   registerOrgWorkflowRoutes(app)
-  registerOrgDashboardRoutes(app)
   registerOrgMcpAppCatalogRoutes(app)
   registerOrgDesktopPolicyRoutes(app)
+  registerOrgAgentPermissionRoutes(app)
   registerOrgEgressDiagnosticRoutes(app)
   registerOrgInferenceRoutes(app)
   registerModelsAnalyticsRoutes(app)
   registerLibraryUsageRoutes(app)
+  registerOrgHeadlessSessionRoutes(app)
   registerModelsAnalyticsExportRoutes(app)
   registerOrgScimRoutes(app)
   registerOrgSsoRoutes(app)
@@ -99,6 +111,8 @@ export function registerOrgRoutes<T extends { Variables: OrgRouteVariables & Req
   registerOrgTeamRoutes(app)
   registerOrgWebOriginRoutes(app)
   registerOrgWorkbotSettingsRoutes(app)
+  registerOrgWorkbotReadinessRoutes(app)
+  registerOrgDefaultModelRoutes(app)
 
   app.all("/v1/orgs/:orgId/*", delegatedRoute, async (c) => {
     const url = new URL(c.req.raw.url)

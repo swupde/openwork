@@ -1,4 +1,5 @@
 import * as crypto from "node:crypto";
+import { recordFreeAutoSignIn } from "@openwork-ee/den-db";
 import { readOrganizationMetadata } from "@openwork/types/den/managed-models-policy";
 import { invalidateTeamInferenceOAuth, revokeMemberGatewayCredentials } from "./llm/inference-provider-lifecycle.js";
 import { ensureMemberGatewayKey } from "./gateway-keys.js";
@@ -114,12 +115,13 @@ import {
   DEN_DEVICE_CODE_EXPIRES_IN,
   DEN_DEVICE_CODE_POLL_INTERVAL,
   clearDeviceSessionOrganization,
-  isEnabledDenDeviceClientId,
+  isDenDeviceClientId,
   stageDeviceSessionOrganization,
   takeDeviceSessionOrganization,
 } from "./device-authorization.js";
-import { deploymentFeatureEnabled } from "./features.js";
 import { WORKBOT_OAUTH_CLIENT_ID } from "./workbot/config.js";
+import { DEN_LIMITED_BETTER_AUTH_PATHS } from "./auth-rate-limits.js";
+import { CLIENT_IP_IPV6_SUBNET, RESOLVED_CLIENT_IP_HEADER } from "./client-ip.js";
 import { ensureWorkbotOAuthClient } from "./workbot/oauth-client.js";
 
 const logger = appLogger.child({ component: "auth" });
@@ -444,6 +446,46 @@ async function hasPendingInvitationForEmail(input: { invitationIdOrToken: string
   return Boolean(invitation);
 }
 
+/** The invitation a sign-up names: `?invite=` on the request, then the query or body field. */
+function readSignUpInvite(ctx: { request?: Request; query?: unknown; body?: unknown } | null | undefined) {
+  if (!ctx) return null;
+  return readRequestQueryParam(ctx.request, "invite") ?? readStringProperty(ctx.query, "invite") ?? readStringProperty(ctx.body, "invite");
+}
+
+/**
+ * Whether signing up from an invitation link counts as verifying the email
+ * for every organization. Only the join token proves it, never the
+ * invitation id, which every member can see; the invitation must be pending,
+ * unexpired and addressed to this email.
+ */
+async function invitationLinkVerifiesEmail(input: { inviteToken: string | null; email: string }) {
+  if (!input.inviteToken) {
+    return false;
+  }
+
+  const [invitation] = await db
+    .select({ organizationId: schema.InvitationTable.organizationId })
+    .from(schema.InvitationTable)
+    .where(and(
+      eq(schema.InvitationTable.inviteToken, input.inviteToken),
+      eq(schema.InvitationTable.status, "pending"),
+      gt(schema.InvitationTable.expiresAt, new Date()),
+      sql`lower(${schema.InvitationTable.email}) = ${input.email.trim().toLowerCase()}`,
+    ))
+    .limit(1);
+
+  return Boolean(invitation);
+}
+
+async function isEmailAlreadyVerified(email: string) {
+  const [user] = await db
+    .select({ emailVerified: schema.AuthUserTable.emailVerified })
+    .from(schema.AuthUserTable)
+    .where(eq(schema.AuthUserTable.email, normalizeLoginEmail(email)))
+    .limit(1);
+  return user?.emailVerified === true;
+}
+
 function normalizeRawRoleValue(roleValue: string) {
   return splitOrganizationRoles(roleValue)
     .map((role) => normalizeOrganizationRoleName(role))
@@ -748,10 +790,13 @@ export const auth = betterAuth({
           if (ssoProviderId && await isScimDeprovisionedEmailForSsoProvider({ ssoProviderId, email })) {
             throw new APIError("FORBIDDEN", { message: SCIM_DEPROVISIONED_SIGN_IN_MESSAGE });
           }
+          const verifiedByInvitation = context?.path === "/sign-up/email"
+            && await invitationLinkVerifiesEmail({ inviteToken: readSignUpInvite(context), email });
           return {
             data: {
               ...user,
               email,
+              ...(verifiedByInvitation ? { emailVerified: true } : {}),
             },
           };
         },
@@ -879,6 +924,8 @@ export const auth = betterAuth({
         // Every sign-in path that creates a session row: session.created in
         // the session's organization (src/audit/domain/sessions.ts).
         after: async (session, context) => {
+          await recordFreeAutoSignIn(db, { userId: normalizeDenTypeId("user", session.userId), now: session.createdAt })
+            .catch(() => logger.warn("Free Auto sign-in behavior could not be recorded."));
           await runAuditHook("session.create", () => recordSessionCreated(session, auditSessionMethod(context)));
         },
       },
@@ -1098,7 +1145,7 @@ export const auth = betterAuth({
       const email = getAuthBodyEmail(ctx.body);
       if (ctx.path === "/sign-up/email") {
         const invitationAllowsSignup = await hasPendingInvitationForEmail({
-          invitationIdOrToken: readRequestQueryParam(ctx.request, "invite") ?? readStringProperty(ctx.query, "invite") ?? readStringProperty(ctx.body, "invite"),
+          invitationIdOrToken: readSignUpInvite(ctx),
           email,
         });
         const bootstrapGrant = readInitialAdminBootstrapGrantFromBody(ctx.body);
@@ -1222,10 +1269,11 @@ export const auth = betterAuth({
         },
       }
       : {}),
+    // Den resolves the client address once (request-client-ip.ts) and hands
+    // it over in this header, so Better Auth and Den's own limits agree.
     ipAddress: {
-      ipAddressHeaders: ["x-forwarded-for", "x-real-ip", "cf-connecting-ip"],
-      trustedProxies: env.trustedProxies,
-      ipv6Subnet: 64,
+      ipAddressHeaders: [RESOLVED_CLIENT_IP_HEADER],
+      ipv6Subnet: CLIENT_IP_IPV6_SUBNET,
     },
     database: {
       generateId: (options) => {
@@ -1302,26 +1350,15 @@ export const auth = betterAuth({
     window: 60,
     max: 20,
     customRules: {
-      "/sign-in/email": {
-        window: 300,
-        max: 5,
-      },
-      "/sign-up/email": {
-        window: 3600,
-        max: env.devMode ? 100 : 5,
-      },
-      "/email-otp/send-verification-otp": {
-        window: 3600,
-        max: 5,
-      },
-      "/email-otp/verify-email": {
-        window: 300,
-        max: 10,
-      },
+      // Limited per email, per invitation and per address in
+      // auth-rate-limits.ts; an address-only limit here would make everyone
+      // behind one office router share a handful of sign-ups.
+      ...Object.fromEntries(DEN_LIMITED_BETTER_AUTH_PATHS.map((path) => [path, false] as const)),
       "/oauth2/token": false,
-      "/request-password-reset": {
-        window: 3600,
-        max: 5,
+      // Read on every page load and session check; one office shares an address.
+      "/get-session": {
+        window: 60,
+        max: 120,
       },
     },
   },
@@ -1356,6 +1393,11 @@ export const auth = betterAuth({
       expiresIn: 600,
       allowedAttempts: 5,
       async sendVerificationOTP({ email, otp, type }) {
+        // better-auth sends a sign-up code even when the new user is already
+        // verified (an invitation link verified it); there is nothing to verify.
+        if (type === "email-verification" && await isEmailAlreadyVerified(email)) {
+          return;
+        }
         await sendEmail({
           to: email,
           template: "verification",
@@ -1769,7 +1811,7 @@ export const auth = betterAuth({
       expiresIn: DEN_DEVICE_CODE_EXPIRES_IN,
       interval: DEN_DEVICE_CODE_POLL_INTERVAL,
       verificationUri: `${env.betterAuthUrl}/device`,
-      validateClient: (clientId) => isEnabledDenDeviceClientId(clientId, deploymentFeatureEnabled),
+      validateClient: (clientId) => isDenDeviceClientId(clientId),
     }),
     apiKey({
       defaultPrefix: DEN_API_KEY_DEFAULT_PREFIX,

@@ -1,8 +1,9 @@
+import { createMockDenAuth } from "./fork-auth-fixture.js"
 import { createDenTypeId } from "@openwork-ee/utils/typeid"
 import { afterAll, beforeAll, beforeEach, expect, mock, test } from "bun:test"
 import { Hono } from "hono"
 import { resolveFeatures } from "@openwork/features"
-import { MemberTable } from "@openwork-ee/den-db/schema"
+import { MemberTable, OrganizationTable } from "@openwork-ee/den-db/schema"
 
 function seedRequiredEnv() {
   process.env.DEN_APP_MCP_SERVERS_ENABLED = "false"
@@ -18,6 +19,8 @@ const organizationId = createDenTypeId("organization")
 const memberId = createDenTypeId("member")
 let recordedRows: unknown[] = []
 let memberActive = true
+let auditOrganizationAvailable = true
+let workerReads = 0
 let registerAgentMcpRoutes: typeof import("../src/mcp/agent.js")["registerAgentMcpRoutes"]
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -25,9 +28,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function installMocks() {
+  mock.module("../src/auth.js", createMockDenAuth)
   const select = () => {
     let table: unknown
-    const rows = () => table === MemberTable && memberActive ? [{ id: memberId, userId, organizationId, role: "member", removedAt: null }] : []
+    const rows = () => {
+      if (table === MemberTable && memberActive) return [{ id: memberId, userId, organizationId, role: "member", removedAt: null }]
+      // This free-plan fixture has no audit entitlement; still exercise the real policy lookup.
+      if (table === OrganizationTable && auditOrganizationAvailable) return [{ metadata: null }]
+      return []
+    }
     const query = {
       from: (source: unknown) => { table = source; return query },
       where: () => query,
@@ -39,19 +48,20 @@ function installMocks() {
     }
     return query
   }
-  mock.module("../src/db.js", () => ({
-    db: {
-      insert: () => ({
-        values: (row: unknown) => {
-          recordedRows.push(row)
-          return { execute: () => Promise.resolve() }
-        },
-      }),
-      select,
-      selectDistinct: select,
-      transaction: () => Promise.resolve(null),
-    },
-  }))
+  const transactionDb = {
+    insert: () => ({
+      values: (row: unknown) => {
+        recordedRows.push(row)
+        return { execute: () => Promise.resolve() }
+      },
+    }),
+    select,
+    selectDistinct: select,
+  }
+  mock.module("../src/db.js", () => ({ db: {
+    ...transactionDb,
+    transaction: async <T>(run: (tx: typeof transactionDb) => Promise<T>): Promise<T> => run(transactionDb),
+  } }))
   mock.module("../src/mcp/auth.js", () => ({ mcpPrincipalCredentialId: () => null, verifyMcpSubscriptionRequest: async () => null,
     getMcpResourceContext: (_request: Request, _route: string, requestId?: string) => ({
       route: "agent",
@@ -94,6 +104,10 @@ function buildApp() {
       },
     },
   }))
+  app.get("/v1/workers", (c) => {
+    workerReads += 1
+    return c.json({ workers: [] })
+  })
   registerAgentMcpRoutes(app)
   return app
 }
@@ -159,11 +173,13 @@ beforeAll(async () => {
     },
   }))
   registerAgentMcpRoutes = (await import("../src/mcp/agent.js")).registerAgentMcpRoutes
-})
+}, 30_000)
 
 beforeEach(() => {
   recordedRows = []
   memberActive = true
+  auditOrganizationAvailable = true
+  workerReads = 0
 })
 
 afterAll(() => {
@@ -197,18 +213,26 @@ test("rejects guessed generated-view tool calls while keeping Workflows enabled"
 })
 
 test("advertises standard Workflow discovery and execution instructions", async () => {
-  const initialized = resultRecord(await rpc(buildApp(), "initialize", {
+  const app = buildApp()
+  const initialized = resultRecord(await rpc(app, "initialize", {
     protocolVersion: "2025-11-25",
     capabilities: {},
     clientInfo: { name: "agent-codemode-test", version: "1.0.0" },
   }))
-  expect(initialized.instructions).toContain("Workflows are saved procedures discovered through search_capabilities")
-  expect(initialized.instructions).toContain("Use execute_capability only with exact names returned by search_capabilities")
-  expect(initialized.instructions).toContain("For an app, dashboard, or artifact view of Workflow results")
-  expect(initialized.instructions).toContain("Direct MCP tools are not capability search results")
-  expect(initialized.instructions).not.toContain("Always call search_capabilities first")
-  expect(initialized.instructions).toContain("Workflow runs produce artifacts rendered by render_workflow_artifact")
-  expect(initialized.instructions).not.toContain("search/selection tools")
+  const uri = "openwork://agent/guidance.md"
+  expect(initialized.instructions).toContain(`Read ${uri} with resources/read`)
+  const resource = resultRecord(await rpc(app, "resources/read", { uri }))
+  if (!Array.isArray(resource.contents)) throw new Error("Missing guidance resource contents")
+  const guidance = resource.contents.find((item) => isRecord(item) && item.uri === uri)
+  if (!isRecord(guidance) || typeof guidance.text !== "string") throw new Error("Missing guidance text")
+  expect(guidance.mimeType).toBe("text/markdown")
+  expect(guidance.text).toContain("Workflows are saved procedures discovered through search_capabilities")
+  expect(guidance.text).toContain("Use execute_capability only with exact names returned by search_capabilities")
+  expect(guidance.text).toContain("For an app, dashboard, or artifact view of Workflow results")
+  expect(guidance.text).toContain("Builder tools and other direct MCP tools are outside capability search; call them directly")
+  expect(guidance.text).not.toContain("Always call search_capabilities first")
+  expect(guidance.text).toContain("Workflow runs produce artifacts rendered by render_workflow_artifact")
+  expect(guidance.text).not.toContain("search/selection tools")
 })
 
 test("executes a confined script by default", async () => {
@@ -227,6 +251,17 @@ test("denies authoring after the caller's organization membership is removed", a
   expect(resultRecord(payload).isError).toBe(true)
   expect(JSON.parse(firstText(payload))).toMatchObject({ error: "membership_required" })
   expect(recordedRows).toEqual([])
+})
+
+test("refuses authoring when audit availability cannot be verified", async () => {
+  auditOrganizationAvailable = false
+  const payload = await rpc(buildApp(), "tools/call", {
+    name: "execute_capability_script", arguments: { code: "return await tools.den.getWorkers({})" },
+  })
+  expect(resultRecord(payload).isError).toBe(true)
+  expect(JSON.parse(firstText(payload))).toMatchObject({ error: "audit_unavailable" })
+  expect(recordedRows).toEqual([])
+  expect(workerReads).toBe(0)
 })
 
 test("default App-server authoring keeps the live write restriction", async () => {

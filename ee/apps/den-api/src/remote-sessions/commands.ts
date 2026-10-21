@@ -86,8 +86,6 @@ type ClaimInput = {
   now: number
   /** Recovery clients may re-read their own sticky claim, never another runner's. */
   recoverClaimed?: boolean
-  /** A killed feature can drain claims without assigning new commands. */
-  allowPending?: boolean
 }
 
 type CompleteInput = RemoteSessionCommandCompleteRequest & {
@@ -130,6 +128,8 @@ export interface RemoteSessionCommandStore {
    */
   report(input: ReportInput): Promise<RemoteSessionReportResult>
   get(input: { commandId: string; organizationId: string; createdByUserId: string }): Promise<RemoteSessionCommand | null>
+  /** Several of the caller's commands in one read, for status checks; unknown ids are left out. */
+  getMany(input: { commandIds: readonly string[]; organizationId: string; createdByUserId: string }): Promise<RemoteSessionCommand[]>
   /** The owner's command that most recently delivered or failed after `since`, or null. */
   latestSettled(input: { organizationId: string; ownerMemberId: string; since: number }): Promise<RemoteSessionCommand | null>
   listPendingForRunner(input: {
@@ -396,7 +396,7 @@ export const databaseRemoteSessionCommandStore: RemoteSessionCommandStore = {
       const existing = rows[0] ? mapCommand(rows[0]) : null
       if (!existing || existing.expiresAt <= input.now) return null
       if (input.recoverClaimed && remoteSessionCommandRecoverable(existing, input)) return existing
-      if (input.allowPending === false || existing.status !== "pending") return null
+      if (existing.status !== "pending") return null
       if (existing.targetComputerId && !input.computerIds.includes(existing.targetComputerId)) return null
       const now = new Date(input.now)
       await tx.update(RemoteSessionCommandTable).set({
@@ -523,6 +523,27 @@ export const databaseRemoteSessionCommandStore: RemoteSessionCommandStore = {
       eq(RemoteSessionCommandTable.created_by_user_id, createdByUserId),
     )).limit(1)
     return updated[0] ? mapCommand(updated[0]) : null
+  },
+
+  async getMany(input) {
+    const commandIds = [...new Set(input.commandIds.flatMap((id) => commandIdOrNull(id) ?? []))]
+    if (commandIds.length === 0) return []
+    const scope = {
+      organizationId: normalizeDenTypeId("organization", input.organizationId),
+      createdByUserId: normalizeDenTypeId("user", input.createdByUserId),
+    }
+    const rows = await db.select().from(RemoteSessionCommandTable).where(and(
+      inArray(RemoteSessionCommandTable.id, commandIds),
+      eq(RemoteSessionCommandTable.org_id, scope.organizationId),
+      eq(RemoteSessionCommandTable.created_by_user_id, scope.createdByUserId),
+    ))
+    const now = Date.now()
+    // An unclaimed command past its expiry reads through get(), which records the expiry.
+    return Promise.all(rows.map(mapCommand).map(async (command) => (
+      ["pending", "claimed"].includes(command.status) && command.expiresAt <= now
+        ? await databaseRemoteSessionCommandStore.get({ commandId: command.id, ...scope }) ?? command
+        : command
+    )))
   },
 
   async listPendingForRunner(input) {
