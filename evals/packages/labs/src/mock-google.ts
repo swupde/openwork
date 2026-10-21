@@ -67,6 +67,8 @@ export interface MockGoogleHandle {
 }
 
 export interface StartMockGoogleOptions {
+  /** Exercise native file create/update against one mutable store instead of the fixed service-action witness. */
+  nativeFileLifecycle?: boolean;
   accounts: string[];
   port?: number;
   publicUrl?: string;
@@ -84,7 +86,7 @@ export async function startMockGoogle(options: StartMockGoogleOptions): Promise<
   const externalUrl = options.publicUrl ? trimTrailingSlashes(options.publicUrl.trim()) || undefined : undefined;
   const local = externalUrl
     ? null
-    : await startMockGoogleServer({ accounts, port: options.port ?? 3980, autoApprove: options.autoApprove ?? true, threads: options.threads, accessTokenTtlSeconds: options.accessTokenTtlSeconds, driveFiles: options.driveFiles, tokenScopes: options.tokenScopes });
+    : await startMockGoogleServer({ accounts, port: options.port ?? 3980, autoApprove: options.autoApprove ?? true, threads: options.threads, accessTokenTtlSeconds: options.accessTokenTtlSeconds, driveFiles: options.driveFiles, tokenScopes: options.tokenScopes, nativeFileLifecycle: options.nativeFileLifecycle });
   const url = externalUrl ?? local?.baseUrl;
   if (!url) throw new Error("Mock Google did not expose a URL.");
   const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));

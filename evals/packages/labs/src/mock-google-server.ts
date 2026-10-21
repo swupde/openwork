@@ -8,6 +8,7 @@ import { mockDrive, type MockDriveFileSeed } from "./mock-google-drive.ts";
 import { serviceActionsWitness } from "./mock-service-actions.ts";
 
 interface MockGoogleServerOptions {
+  nativeFileLifecycle?: boolean;
   accounts: string[];
   port: number;
   autoApprove: boolean;
@@ -142,6 +143,7 @@ interface SigningKeys {
 }
 
 interface MockGoogleState {
+  nativeFileLifecycle: boolean;
   accounts: Account[];
   autoApprove: boolean;
   accessTokenTtlSeconds: number;
@@ -903,6 +905,9 @@ async function handleRequest(state: MockGoogleState, request: IncomingMessage, r
     return;
   }
   const accessToken = bearerToken(request);
+  // Native lifecycle proofs need every operation on a created file to reach
+  // the same store; the default action witness deliberately owns fixed IDs.
+  if (state.nativeFileLifecycle && await handleNativeGoogle(state, request, response, url)) return;
   if (await state.actions.handle(request, response, url, accountForRequest(state, request)?.email ?? null, accessToken ? tokenId(accessToken) : null)) return;
   if (state.drive.handle(request, response, url, accountForRequest(state, request)?.email ?? null)) return;
   if (requestMethod === "GET" && url.pathname === "/__mock-google/pending-authorizations") {
@@ -1015,6 +1020,7 @@ function close(server: Server): Promise<void> {
 
 export async function startMockGoogleServer(options: MockGoogleServerOptions): Promise<StartedMockGoogleServer> {
   const state: MockGoogleState = {
+    nativeFileLifecycle: options.nativeFileLifecycle === true,
     accounts: normalizeAccounts(options.accounts),
     autoApprove: options.autoApprove,
     accessTokenTtlSeconds: options.accessTokenTtlSeconds ?? 3600,

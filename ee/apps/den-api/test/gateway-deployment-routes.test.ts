@@ -17,14 +17,20 @@ mock.module("../src/db.js", () => ({ db: { select: storageReached, transaction: 
 // Better Auth's startup seeding away from the deliberately throwing DB sentinel;
 // inference-provider-oauth.test.ts covers the real signed-cookie boundary.
 mock.module("../src/auth.js", createMockDenAuth)
-  // Authentication/deployment fixtures use catalog defaults; permission-set persistence has its own suite.
-  const effective = await import("../src/permissions/effective.js")
-  mock.module("../src/permissions/resolve.js", () => ({
-    resolveMemberPermissionsFromContext: async (context: { currentMember: { isOwner: boolean; role: string } }) => effective.memberPermissionsFromGrants({
-      isOwner: context.currentMember.isOwner, isAdmin: context.currentMember.role === "admin",
-      grants: effective.codeDefaultPermissionGrants({ isAdmin: context.currentMember.role === "admin" }),
-    }),
-  }))
+// Authentication/deployment fixtures use catalog defaults; permission-set persistence has its own suite.
+const effective = await import("../src/permissions/effective.js")
+const unexpectedPermissionRead = () => { throw new Error("Permission persistence is outside this authentication/deployment fixture") }
+mock.module("../src/permissions/resolve.js", () => ({
+  resolveMemberPermissions: unexpectedPermissionRead,
+  explainMemberPermissions: unexpectedPermissionRead,
+  loadPermissionSubject: unexpectedPermissionRead,
+  resolvePermissionsForMember: unexpectedPermissionRead,
+  explainPermissionsForMember: unexpectedPermissionRead,
+  resolveMemberPermissionsFromContext: async (context: { currentMember: { isOwner: boolean; role: string } }) => effective.memberPermissionsFromGrants({
+    isOwner: context.currentMember.isOwner, isAdmin: context.currentMember.role === "admin",
+    grants: effective.codeDefaultPermissionGrants({ isAdmin: context.currentMember.role === "admin" }),
+  }),
+}))
 
 mock.module("../src/session.js", () => ({ readSignedSessionCookieToken: async () => null, readInternalMcpPrincipalCredentialId: () => null, readInternalCapabilityConnectorId: () => null }))
 
@@ -55,6 +61,9 @@ const memberRoute: MiddlewareHandler = async (c, next) => {
     currentMember: { id: memberId, userId: createDenTypeId("user"), role, directRole: role, adminTeams: [], isOwner: role === "owner" },
     features: resolveFeatures({ deployment: "self_hosted", locks: {}, rollouts: {}, overrides: {} }),
   })
+  c.set("memberTeams", [])
+  // Seed the same per-request resolution used by conditional in-handler checks.
+  await memberPermissionsForOrganizationContext(c.get("organizationContext"), [])
   c.set("session", { createdAt: new Date(Date.now() - (fresh ? 0 : PRIVILEGED_SESSION_MAX_AGE_MS + 60_000)) })
   await next()
 }

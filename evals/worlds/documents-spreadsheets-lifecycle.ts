@@ -75,7 +75,7 @@ export async function nativeDocumentLifecycle(seed: Seed) {
   if (!await localMysqlIsRunning()) throw new SkipError("MySQL at OPENWORK_EVAL_MYSQL_URL or 127.0.0.1:3306");
   if (!await localRedisIsRunning()) throw new SkipError("Redis at DATABASE_REDIS_URL or 127.0.0.1:6379");
   const account = "native-files@openwork.test";
-  const google = await startMockGoogle({ accounts: [account], port: 0, autoApprove: false });
+  const google = await startMockGoogle({ accounts: [account], port: 0, autoApprove: false, nativeFileLifecycle: true });
   try {
     const den = await seed.den({ web: false, env: {
       DEN_GOOGLE_API_BASE_URL: google.apiUrl,
@@ -99,6 +99,7 @@ export async function nativeDocumentLifecycle(seed: Seed) {
       den,
       request: async (path: string, method: "POST" | "PATCH", body: unknown) => {
         const result = await seed.api(den.admin, path, { method, body: JSON.stringify(body) });
+        if (!result.response.ok) throw new Error(`Native file ${method} ${path}: HTTP ${result.response.status} ${result.text.slice(0, 500)}`);
         return { status: result.response.status, body: result.body };
       },
       operations: (since: string) => google.nativeOperationsFor(account, { since, atLeast: 12, timeoutMs: 10_000 }),

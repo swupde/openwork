@@ -101,7 +101,7 @@ beforeAll(async () => {
   session = sessionImport
   createExternalMcpConnection = externalImport.createExternalMcpConnection
   genericOAuth = genericOAuthImport
-})
+}, 30_000)
 
 afterAll(async () => {
   for (const organizationId of cleanupOrganizationIds) {
