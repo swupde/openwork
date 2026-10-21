@@ -83,7 +83,7 @@ jobs:
           MYSQL_ROOT_PASSWORD: password
           MYSQL_DATABASE: openwork_den_fork_ci
         ports:
-          - 3306:3306
+          - 33068:3306
         options: >-
           --health-cmd="mysqladmin ping -h 127.0.0.1 -ppassword"
           --health-interval=5s
@@ -100,13 +100,13 @@ jobs:
       - name: Prepare the throwaway fork-test database
         run: pnpm --filter @openwork-ee/den-db exec node --import tsx ./node_modules/drizzle-kit/bin.cjs push --force
         env:
-          DATABASE_URL: mysql://root:password@127.0.0.1:3306/openwork_den_fork_ci
+          DATABASE_URL: mysql://root:password@127.0.0.1:33068/openwork_den_fork_ci
           DEN_DB_ENCRYPTION_KEY: local-dev-db-encryption-key-please-change-1234567890
           NODE_OPTIONS: --conditions=development
       - name: Run retained fork regressions
         run: pnpm test:fork
         env:
-          DATABASE_URL: mysql://root:password@127.0.0.1:3306/openwork_den_fork_ci
+          DATABASE_URL: mysql://root:password@127.0.0.1:33068/openwork_den_fork_ci
           DEN_DB_ENCRYPTION_KEY: local-dev-db-encryption-key-please-change-1234567890
       - name: Check Den web hook order
         run: pnpm --filter @openwork-ee/den-web lint

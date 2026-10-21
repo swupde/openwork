@@ -61,3 +61,25 @@ test("only retained fork workflows can run; optional job guards remain valid YAM
     }
   }
 })
+
+
+test("fork-test MySQL does not occupy the native security suite's port", async () => {
+  const require = createRequire(path.join(repoRoot, "apps/server/package.json"))
+  const { parse } = require("yaml")
+  const workflow = parse(await readFile(path.join(repoRoot, ".github/workflows/ci-tests.yml"), "utf8"))
+  const native = parse(await readFile(path.join(repoRoot, "packaging/docker/docker-compose.web-local.yml"), "utf8"))
+  const unit = workflow.jobs["openwork-tests-core"]
+  const hostPorts = (ports) => ports.map((port) => String(port).split(":").at(-2))
+  const forkPorts = hostPorts(unit.services.mysql.ports)
+  const nativePorts = hostPorts(native.services.mysql.ports)
+  for (const [name, job] of Object.entries(workflow.jobs)) {
+    if (!job.services?.mysql || !job.env?.DATABASE_URL) continue
+    assert.ok(hostPorts(job.services.mysql.ports).includes(new URL(job.env.DATABASE_URL).port), `${name} must use its own MySQL service port`)
+  }
+  for (const port of forkPorts) assert.ok(!nativePorts.includes(port), `Both MySQL fixtures bind ${port}`)
+  for (const name of ["Prepare the throwaway fork-test database", "Run retained fork regressions"]) {
+    const step = unit.steps.find((entry) => entry.name === name)
+    assert.ok(step, `Missing ${name}`)
+    assert.ok(forkPorts.includes(new URL(step.env.DATABASE_URL).port), `${name} must use its isolated service port`)
+  }
+})
