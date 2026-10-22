@@ -9,6 +9,9 @@ on:
       - "pnpm-lock.yaml"
       - "pnpm-workspace.yaml"
       - ".github/workflows/ci-enterprise-mcp-mock.yml"
+      - ".github/actions/setup-test-runtimes/**"
+      - "scripts/ci/test-environment.*"
+      - "constants.json"
   push:
     branches: [dev]
     paths:
@@ -18,6 +21,9 @@ on:
       - "pnpm-lock.yaml"
       - "pnpm-workspace.yaml"
       - ".github/workflows/ci-enterprise-mcp-mock.yml"
+      - ".github/actions/setup-test-runtimes/**"
+      - "scripts/ci/test-environment.*"
+      - "constants.json"
   workflow_dispatch:
 
 permissions:
@@ -36,20 +42,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Setup Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: 24
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 11.4.0
-
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.3.10
+      - name: Setup canonical test runtimes
+        uses: ./.github/actions/setup-test-runtimes
 
       - name: Install focused dependencies
         run: >-

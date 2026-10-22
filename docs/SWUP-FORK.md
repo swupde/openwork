@@ -270,3 +270,87 @@ Google Drive reads additionally require the connector's administrator-enabled
 read scope, even when the account still carries a previously granted token.
 Retained fixtures use the native permission, audit, and MCP resource contracts.
 The six-workflow, standard-runner and four-image release boundaries still apply.
+
+## Repeatable fork maintenance checks
+
+The test environment is machine-readable in
+[`scripts/ci/test-environment.json`](../scripts/ci/test-environment.json):
+Node 24.7.0, Bun 1.3.14 and UTC. `package.json#packageManager` remains the
+single pnpm pin, and `constants.json#opencodeVersion` remains the single
+OpenCode test-engine pin. Resolve all versions with
+`node scripts/ci/test-environment.mjs`. Select these tools through your normal
+version manager or an isolated operator directory; do not replace an installed
+personal engine just to run a fork check.
+
+The existing `.github/actions/setup-tests` uses the shared runtime setup action
+and retains its engine installation, dependency cache and workspace installs.
+Focused CI jobs use the same runtime contract. Runtime setup actions retain
+immutable action revisions. The image workflow's existing cache and scoped
+four-image matrix are unchanged.
+
+Run from the repository root:
+
+```sh
+pnpm test:env
+pnpm test:verified -- node --test scripts/ci/test-environment.test.mjs scripts/ci/fork-patches.test.mjs
+pnpm fork:audit
+# When the changed runtime scope requires the full retained fork suite:
+pnpm test:verified -- pnpm test:fork
+```
+
+`test:verified` checks the actual invoking Node and each tool on PATH before
+executing anything, forces UTC, preserves argument boundaries and returns the
+child exit status. A mismatch fails immediately. It does not install tools,
+start Docker, download credentials, or substitute mocked success for a test.
+Use the existing scoped test/build commands after `--`; no second test runner
+or duplicate suite is introduced.
+
+Every invocation records **local command evidence**, including failure, under
+that checkout's Git metadata. An explicit `--evidence <file>` destination must
+be Git metadata or ignored operator output. Receipts contain exact commit and
+commit-tree IDs, dirty state, a digest of working changes, before/after source
+identity, tool versions, timezone, command digest and exit status. They omit raw
+arguments, environment values and working-directory paths. They never assert
+that CI, a deployment or an entire suite passed. Dirty or source-changing runs
+are evidence about that working tree, not validation of the named commit.
+
+Run focused checks while editing. Before merge, parent/operator must wait for
+required native CI on the **exact final source commit**. Reuse successful checks
+on that exact commit without repeatedly running the same full suites locally.
+For a merge commit, verify its Git tree equals the reviewed tested tree, then
+check the required merge/publication jobs and immutable image revision labels
+separately. A previous SHA, a queued job, a successful image build, or a local
+receipt is not a green CI claim for another source revision. Changes after
+validation require checks appropriate to the changed scope and final native CI.
+
+## Current logical patch inventory
+
+[`docs/swup-fork-patches.json`](swup-fork-patches.json) is the reviewed inventory
+against official v0.18.59 at `0c60c8a6dd22db83a6c68552c00cabe601ec1f77`.
+Every logical group has an ID, purpose, exact paths/behavior, regression checks,
+upstream equivalence assessment, retirement condition and status. It includes
+runtime policy, attachment storage, OAuth timestamps, Google compatibility,
+bootstrap repair, release automation, retained regressions and actual eval
+fixtures, generated contracts, formatting residue, and immutable migrations.
+Test retention is a patch to coverage, not a claim that every tested upstream
+feature is a custom product implementation.
+
+`pnpm fork:audit` compares the actual Git diff (with rename detection disabled,
+so both sides of migration renames/deletions are accounted for) and untracked
+nonignored source against that pinned upstream commit. It fails on unclassified
+paths, stale declarations or duplicate classification. CI fetches the manifest's
+pin if its shallow checkout lacks it, then runs this same command. Classifying
+a file does not approve future behavior changes inside it: reviewers still
+inspect the semantic diff and relevant negative tests. This is explicit path
+coverage, not a brittle per-line hash registry or proof of upstream equivalence.
+
+The native organization/team default-model modules are declared upstream-native
+and the audit rejects fork drift in those modules. Configure the supported
+native setting; do not introduce client forks or custom model routing. Essential
+pending-OAuth nullability, deployed migration offsets and first-party read-only
+unattended guards remain retained. This audit found no runtime patch with proven
+upstream equivalence that could safely be removed; it does not manufacture a
+reduction by deleting tests or protections. Retire a patch only after tracing its
+consumers, proving the stated equivalent upstream contract, running its regression
+checks and updating the inventory. Historical SQL, journal receipts and snapshots
+must never be rewritten during that process.
