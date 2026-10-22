@@ -5,6 +5,9 @@ on:
   pull_request:
     paths:
       - ".github/workflows/den-db-check.yml"
+      - ".github/actions/setup-test-runtimes/**"
+      - "scripts/ci/test-environment.*"
+      - "constants.json"
       - ".github/workflows/den-db-migrate.yml"
       - ".github/workflows/publish-ee-images.yml"
       - "ee/apps/den-api/package.json"
@@ -46,20 +49,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Setup Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: 24
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 11.4.0
-
-      - name: Setup Bun for analytics migration regressions
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.3.14
+      - name: Setup canonical test runtimes
+        uses: ./.github/actions/setup-test-runtimes
 
       - name: Install dependencies
         run: pnpm install --filter "@openwork-ee/den-db..."

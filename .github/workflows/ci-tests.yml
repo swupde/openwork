@@ -103,8 +103,16 @@ jobs:
           DATABASE_URL: mysql://root:password@127.0.0.1:33068/openwork_den_fork_ci
           DEN_DB_ENCRYPTION_KEY: local-dev-db-encryption-key-please-change-1234567890
           NODE_OPTIONS: --conditions=development
+      - name: Fetch pinned upstream for fork audit
+        run: |
+          upstream_sha="$(node -p 'require("./docs/swup-fork-patches.json").upstream')"
+          git cat-file -e "$upstream_sha^{commit}" 2>/dev/null || git fetch --no-tags --depth=1 origin "$upstream_sha"
+
+      - name: Audit declared fork patches
+        run: pnpm fork:audit
+
       - name: Run retained fork regressions
-        run: pnpm test:fork
+        run: pnpm test:verified -- pnpm test:fork
         env:
           DATABASE_URL: mysql://root:password@127.0.0.1:33068/openwork_den_fork_ci
           DEN_DB_ENCRYPTION_KEY: local-dev-db-encryption-key-please-change-1234567890
@@ -480,10 +488,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Setup Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: 24
+      - name: Setup canonical test runtimes
+        uses: ./.github/actions/setup-test-runtimes
 
       - name: Validate models snapshot
         run: |
@@ -548,10 +554,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-      - name: Setup Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: 24
+      - name: Setup canonical test runtimes
+        uses: ./.github/actions/setup-test-runtimes
       - name: Validate the docs build
         run: npx -y mint@4.2.868 validate
       - name: Check for broken links and images
@@ -588,14 +592,8 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
-      - name: Setup Node
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
-        with:
-          node-version: 24
-      - name: Setup pnpm
-        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
-        with:
-          version: 11.4.0
+      - name: Setup canonical test runtimes
+        uses: ./.github/actions/setup-test-runtimes
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Build den-api workspace dependencies

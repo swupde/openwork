@@ -71,7 +71,10 @@
     "release:cut:watch": "node scripts/release/cut.mjs --watch",
     "evals:check-browser": "pnpm --dir evals check:browser",
     "evals:check": "pnpm --dir evals run check",
-    "test:fork": "test_status=0; for scope in @openwork/app openwork-server @openwork-ee/den-web @openwork-ee/den-api; do pnpm --filter \"$scope\" test:fork || test_status=1; done; node --test scripts/ci/ci-capacity-contract.test.mjs scripts/ci/select-ee-images.test.mjs scripts/ci/workflow-authoring-gate.test.mjs || test_status=1; exit \"$test_status\""
+    "test:fork": "test_status=0; for scope in @openwork/app openwork-server @openwork-ee/den-web @openwork-ee/den-api; do pnpm --filter \"$scope\" test:fork || test_status=1; done; node --test scripts/ci/test-environment.test.mjs scripts/ci/fork-patches.test.mjs scripts/ci/ci-capacity-contract.test.mjs scripts/ci/select-ee-images.test.mjs scripts/ci/workflow-authoring-gate.test.mjs || test_status=1; exit \"$test_status\"",
+    "test:env": "node scripts/ci/run-tests.mjs --check",
+    "test:verified": "node scripts/ci/run-tests.mjs",
+    "fork:audit": "node scripts/ci/fork-patches.mjs"
   },
   "devDependencies": {
     "@stoplight/spectral-cli": "6.16.3",
