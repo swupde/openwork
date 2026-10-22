@@ -22,9 +22,13 @@ function fixture(t, mismatch = {}) {
   assert.equal(git('init', '-q').status, 0)
   git('add', '.')
   assert.equal(git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-qm', 'fixture').status, 0)
-  const receipt = path.join(root, '.git', 'receipt.json')
-  const run = (...args) => spawnSync(process.execPath, [entry, '--evidence', receipt, '--', ...args], { cwd: root, encoding: 'utf8', env: { ...process.env, PATH: `${root}/bin:${process.env.PATH}`, TZ: 'Europe/Berlin' } })
-  return { root, run, git, receipt }
+  let receipt
+  let sequence = 0
+  const run = (...args) => {
+    receipt = path.join(root, '.git', `receipt-${++sequence}.json`)
+    return spawnSync(process.execPath, [entry, '--evidence', receipt, '--', ...args], { cwd: root, encoding: 'utf8', env: { ...process.env, PATH: `${root}/bin:${process.env.PATH}`, TZ: 'Europe/Berlin' } })
+  }
+  return { root, run, git, get receipt() { return receipt } }
 }
 
 test('verified entry refuses mismatched tools before dispatching a test', (t) => {
@@ -115,4 +119,27 @@ test('retained CI consumers share the contract and immutable runtime setup actio
     assert.ok(steps.some((step) => ['./.github/actions/setup-tests', './.github/actions/setup-test-runtimes'].includes(step.uses)), target)
     assert.ok(!steps.some((step) => [...expectedOutputs.keys()].some((name) => step.uses?.startsWith(name + '@'))), `${target} duplicates runtime installation`)
   }
+})
+
+test('existing ignored secrets and Git metadata are never overwritten or dispatched', (t) => {
+  const f = fixture(t)
+  writeFileSync(path.join(f.root, '.gitignore'), '.env\n')
+  writeFileSync(path.join(f.root, '.env'), 'SYNTHETIC_SECRET=keep\n')
+  for (const relative of ['.env', '.git/config']) {
+    const destination = path.join(f.root, relative)
+    const before = readFileSync(destination, 'utf8')
+    const result = spawnSync(process.execPath, [entry, '--evidence', destination, '--', process.execPath, '-e', 'console.log("MUST_NOT_DISPATCH")'], { cwd: f.root, encoding: 'utf8' })
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /Evidence destination already exists/)
+    assert.doesNotMatch(result.stdout, /MUST_NOT_DISPATCH/)
+    assert.equal(readFileSync(destination, 'utf8'), before)
+  }
+})
+
+test('an evidence file created after preflight is preserved by exclusive final creation', (t) => {
+  const f = fixture(t)
+  const destination = path.join(f.root, '.git', 'race.json')
+  const result = spawnSync(process.execPath, [entry, '--evidence', destination, '--', process.execPath, '-e', 'require("node:fs").writeFileSync(process.argv[1], "competing receipt")', destination], { cwd: f.root, encoding: 'utf8', env: { ...process.env, PATH: `${f.root}/bin:${process.env.PATH}` } })
+  assert.notEqual(result.status, 0)
+  assert.equal(readFileSync(destination, 'utf8'), 'competing receipt')
 })

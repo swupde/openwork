@@ -307,7 +307,9 @@ or duplicate suite is introduced.
 
 Every invocation records **local command evidence**, including failure, under
 that checkout's Git metadata. An explicit `--evidence <file>` destination must
-be Git metadata or ignored operator output. Receipts contain exact commit and
+be a new file in Git metadata or ignored operator output. Existing files are
+refused before command dispatch; exclusive final creation also prevents a racing
+writer from being overwritten. Receipts contain exact commit and
 commit-tree IDs, dirty state, a digest of working changes, before/after source
 identity, tool versions, timezone, command digest and exit status. They omit raw
 arguments, environment values and working-directory paths. They never assert

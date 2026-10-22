@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createHash, randomUUID } from 'node:crypto'
-import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, lstatSync, readlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, realpathSync, lstatSync, readlinkSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { constants } from 'node:os'
@@ -38,6 +38,12 @@ function canonicalPath(input) {
   while (!existsSync(parent)) { suffix.unshift(path.basename(parent)); parent = path.dirname(parent) }
   return path.join(realpathSync(parent), ...suffix)
 }
+try {
+  lstatSync(destination)
+  throw new Error('Evidence destination already exists; choose a new file')
+} catch (error) {
+  if (error.code !== 'ENOENT') throw error
+}
 const absoluteDestination = canonicalPath(destination)
 const gitDirectory = canonicalPath(git('rev-parse', '--absolute-git-dir').trim())
 const relativeToGit = path.relative(gitDirectory, absoluteDestination)
@@ -70,8 +76,7 @@ try {
   receipt.sourceAfter = sourceIdentity()
   receipt.sourceUnchanged = JSON.stringify(source) === JSON.stringify(receipt.sourceAfter)
   mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 })
-  writeFileSync(destination, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 })
-  chmodSync(destination, 0o600)
+  writeFileSync(destination, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600, flag: 'wx' })
   console.error(`Local test evidence recorded (${receipt.outcome}, exit ${exitCode}); this is not CI evidence.`)
 }
 process.exitCode = exitCode
